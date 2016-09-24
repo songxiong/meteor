@@ -1,7 +1,4 @@
 Package.describe({
-<<<<<<< 4c2ba4ff4bae1d5503b19ce9497fa6a09069b053
-  summary: "Facebook OAuth flow",
-  version: "1.2.10-beta.5"
   summary: "DEPRECATED - Facebook OAuth flow",
   version: "1.3.0"
 });
