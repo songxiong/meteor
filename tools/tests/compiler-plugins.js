@@ -12,9 +12,10 @@ var MONGO_LISTENING =
 function startRun(sandbox) {
   var run = sandbox.run();
   run.match("myapp");
-  run.match("proxy");
+  run.matchBeforeExit("Started proxy");
   run.tellMongo(MONGO_LISTENING);
-  run.match("MongoDB");
+  run.matchBeforeExit("Started MongoDB");
+  run.waitSecs(15);
   return run;
 };
 
@@ -114,6 +115,7 @@ selftest.define("compiler plugin caching - coffee", () => {
     // archMatching:'web'.  We'll see this more clearly when the next call later
     // is "#2" --- we didn't miss a call!
     // App prints this:
+    run.waitSecs(15);
     run.match("Hello world");
 
     // Check that the CSS is what we expect.
@@ -142,6 +144,7 @@ selftest.define("compiler plugin caching - coffee", () => {
     // preprocessor file in it. This should not require us to render anything.
     s.append("packages/local-pack/package.js", "\n// foo\n");
     cacheMatch('Ran (#2) on: []');
+    run.waitSecs(15);
     run.match("Hello world");
 
     function setVariable(variableName, value) {
@@ -204,6 +207,7 @@ selftest.define("compiler plugin caching - coffee", () => {
     cacheMatch('Loaded {}/top.' + extension);
     cacheMatch('Loaded {}/yet-another-root.' + extension);
     cacheMatch(`Ran (#1) on: ["/top.${ extension }"]`);
+    run.waitSecs(15);
     run.match('Hello world');
     checkCSS(expectedBorderStyles);
 
@@ -287,6 +291,7 @@ selftest.define("compiler plugins - duplicate extension", () => {
   s.write('packages/local-plugin/plugin.js',
           s.read('packages/local-plugin/plugin.js').replace('myext', 'xext'));
   run.match('Modified -- restarting');
+  run.waitSecs(30);
 
   run.stop();
 });
@@ -307,11 +312,12 @@ selftest.define("compiler plugins - inactive source", () => {
   s.createApp('myapp', 'uses-published-package-with-inactive-source');
   s.cd('myapp');
 
-  let run = startRun(s);
+  const run = s.run();
+  run.match('myapp');
+  run.matchBeforeExit('Started proxy');
   run.match('Errors prevented startup');
   run.match('no plugin found for foo.sourcish in glasser:use-sourcish');
   run.match('none is now');
-
   run.stop();
 });
 

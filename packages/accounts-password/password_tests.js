@@ -2,7 +2,7 @@ Accounts._noConnectionCloseDelayForTest = true;
 
 if (Meteor.isServer) {
   Accounts.removeDefaultRateLimit();
-  
+
   Meteor.methods({
     getResetToken: function () {
       var token = Meteor.users.findOne(this.userId).services.password.reset;
@@ -557,8 +557,8 @@ if (Meteor.isClient) (function () {
       }, 10 * 1000, 100);
     }
   ]);
-  
-  
+
+
   testAsyncMulti("passwords - forgotPassword client return error when empty email", [
     function (test, expect) {
       // setup
@@ -578,7 +578,36 @@ if (Meteor.isClient) (function () {
       }, /Must pass options\.email/);
     },
   ]);
- 
+
+  Tinytest.add(
+    'passwords - forgotPassword only passes callback value to forgotPassword '
+    + 'Method if callback is defined (to address issue #5676)',
+    function (test) {
+      let methodCallArgumentCount = 0;
+      const originalMethodCall = Accounts.connection.call;
+      const stubMethodCall = (...args) => {
+        methodCallArgumentCount = args.length;
+      }
+      Accounts.connection.call = stubMethodCall;
+
+      Accounts.forgotPassword({ email: 'test@meteor.com' });
+      test.equal(
+        methodCallArgumentCount,
+        2,
+        'Method call should have 2 arguments since no callback is passed in'
+      );
+
+      Accounts.forgotPassword({ email: 'test@meteor.com' }, () => {});
+      test.equal(
+        methodCallArgumentCount,
+        3,
+        'Method call should have 3 arguments since a callback is passed in'
+      );
+
+      Accounts.connection.call = originalMethodCall;
+    }
+  );
+
   testAsyncMulti("passwords - verifyEmail client return error when empty token", [
     function (test, expect) {
       // setup
@@ -598,7 +627,7 @@ if (Meteor.isClient) (function () {
       }, /Need to pass token/);
     },
   ]);
- 
+
   testAsyncMulti("passwords - resetPassword errors", [
     function (test, expect) {
       // setup
@@ -1445,7 +1474,7 @@ if (Meteor.isServer) (function () {
   );
 
   Tinytest.add(
-    'passwords - reset password doesn\t work if email changed after email sent',
+    "passwords - reset password doesn't work if email changed after email sent",
     function (test) {
       var username = Random.id();
       var email = username + '-intercept@example.com';
@@ -1659,12 +1688,42 @@ if (Meteor.isServer) (function () {
     function (test) {
       var email = test.id + '-intercept@example.com';
       var userId = Accounts.createUser({email: email, password: 'password'});
+
       Accounts.sendEnrollmentEmail(userId, email);
       test.isTrue(!!Meteor.users.findOne(userId).services.password.reset);
 
       Accounts._expirePasswordEnrollTokens(new Date(), userId);
-
       test.isUndefined(Meteor.users.findOne(userId).services.password.reset);
+    }
+  )
+
+  Tinytest.add(
+    "passwords - enroll tokens don't get cleaned up when reset tokens are cleaned up",
+    function (test) {
+      var email = test.id + '-intercept@example.com';
+      var userId = Accounts.createUser({email: email, password: 'password'});
+
+      Accounts.sendEnrollmentEmail(userId, email);
+      var enrollToken = Meteor.users.findOne(userId).services.password.reset;
+      test.isTrue(enrollToken);
+
+      Accounts._expirePasswordResetTokens(new Date(), userId);
+      test.equal(enrollToken, Meteor.users.findOne(userId).services.password.reset);
+    }
+  )
+
+  Tinytest.add(
+    "passwords - reset tokens don't get cleaned up when enroll tokens are cleaned up",
+    function (test) {
+      var email = test.id + '-intercept@example.com';
+      var userId = Accounts.createUser({email: email, password: 'password'});
+
+      Accounts.sendResetPasswordEmail(userId, email);
+      var resetToken = Meteor.users.findOne(userId).services.password.reset;
+      test.isTrue(resetToken);
+
+      Accounts._expirePasswordEnrollTokens(new Date(), userId);
+      test.equal(resetToken,Meteor.users.findOne(userId).services.password.reset);
     }
   )
 

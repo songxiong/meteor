@@ -3,7 +3,6 @@ var path = require("path");
 var stream = require("stream");
 var fs = require("fs");
 var net = require("net");
-var tty = require("tty");
 var vm = require("vm");
 var _ = require("underscore");
 var INFO_FILE_MODE = parseInt("600", 8); // Only the owner can read or write.
@@ -119,10 +118,16 @@ class Server {
       }
       delete options.key;
 
+      // Set the columns to what is being requested by the client.
+      if (options.columns && socket) {
+        socket.columns = options.columns;
+      }
+      delete options.columns;
+
       if (options.evaluateAndExit) {
         evalCommand.call(
           Object.create(null), // Dummy repl object without ._RecoverableError.
-          "(" + options.evaluateAndExit.command + ")",
+          options.evaluateAndExit.command,
           null, // evalCommand ignores the context parameter, anyway
           options.evaluateAndExit.filename || "<meteor shell>",
           function (error, result) {
@@ -166,13 +171,6 @@ class Server {
   startREPL(options) {
     var self = this;
 
-    if (! options.output.columns) {
-      // The REPL's tab completion logic assumes process.stdout is a TTY,
-      // and while that isn't technically true here, we can get tab
-      // completion to behave correctly if we fake the .columns property.
-      options.output.columns = getTerminalWidth();
-    }
-
     // Make sure this function doesn't try to write anything to the output
     // stream after it has been closed.
     options.output.on("close", function() {
@@ -205,30 +203,7 @@ class Server {
       configurable: true
     });
 
-    if (Package.modules) {
-      // Use the same `require` function and `module` object visible to the
-      // application.
-      var toBeInstalled = {};
-      var shellModuleName = "meteor-shell-" +
-        Math.random().toString(36).slice(2) + ".js";
-
-      toBeInstalled[shellModuleName] = function (require, exports, module) {
-        repl.context.module = module;
-        repl.context.require = require;
-
-        // Tab completion sometimes uses require.extensions, but only for
-        // the keys.
-        require.extensions = {
-          ".js": true,
-          ".json": true,
-          ".node": true,
-        };
-      };
-
-      // This populates repl.context.{module,require} by evaluating the
-      // module defined above.
-      Package.modules.meteorInstall(toBeInstalled)("./" + shellModuleName);
-    }
+    setRequireAndModule(repl.context);
 
     repl.context.repl = repl;
 
@@ -269,6 +244,11 @@ class Server {
       }
     });
 
+    // TODO: Node 6: Revisit this as repl._RecoverableError is now exported.
+    //       as `Recoverable` from `repl`.  Maybe revisit this entirely
+    //       as the docs have been updated too:
+    //       https://nodejs.org/api/repl.html#repl_custom_evaluation_functions
+    //       https://github.com/nodejs/node/blob/v6.x/lib/repl.js#L1398
     // Trigger one recoverable error using the default eval function, just
     // to capture the Recoverable error constructor, so that our custom
     // evalCommand function can wrap recoverable errors properly.
@@ -384,19 +364,6 @@ function getHistoryFile(shellDir) {
   return path.join(shellDir, "history");
 }
 
-function getTerminalWidth() {
-  try {
-    // Inspired by https://github.com/TooTallNate/ttys/blob/master/index.js
-    var fd = fs.openSync("/dev/tty", "r");
-    assert.ok(tty.isatty(fd));
-    var ws = new tty.WriteStream(fd);
-    ws.end();
-    return ws.columns;
-  } catch (fancyApproachWasTooFancy) {
-    return 80;
-  }
-}
-
 // Shell commands need to be executed in a Fiber in case they call into
 // code that yields. Using a Promise is an even better idea, since it runs
 // its callbacks in Fibers drawn from a pool, so the Fibers are recycled.
@@ -405,16 +372,12 @@ var evalCommandPromise = Promise.resolve();
 function evalCommand(command, context, filename, callback) {
   var repl = this;
 
-  function finish(error, result) {
-    if (error) {
-      if (repl._RecoverableError &&
-          isRecoverableError(error, repl)) {
-        callback(new repl._RecoverableError(error));
-      } else {
-        callback(error);
-      }
+  function wrapErrorIfRecoverable(error) {
+    if (repl._RecoverableError &&
+        isRecoverableError(error, repl)) {
+      return new repl._RecoverableError(error);
     } else {
-      callback(null, result);
+      return error;
     }
   }
 
@@ -439,7 +402,7 @@ function evalCommand(command, context, filename, callback) {
     try {
       command = Package.ecmascript.ECMAScript.compileForShell(command);
     } catch (error) {
-      finish(error);
+      callback(wrapErrorIfRecoverable(error));
       return;
     }
   }
@@ -450,13 +413,20 @@ function evalCommand(command, context, filename, callback) {
       displayErrors: false
     });
   } catch (parseError) {
-    finish(parseError);
+    callback(wrapErrorIfRecoverable(parseError));
     return;
   }
 
   evalCommandPromise.then(function () {
-    finish(null, script.runInThisContext());
-  }).catch(finish);
+    if (repl.input) {
+      callback(null, script.runInThisContext());
+    } else {
+      // If repl didn't start, `require` and `module` are not visible
+      // in the vm context.
+      setRequireAndModule(global);
+      callback(null, script.runInThisContext());
+    }
+  }).catch(callback);
 }
 
 function stripParens(command) {
@@ -498,4 +468,31 @@ function isRecoverableError(e, repl) {
   }
 
   return false;
+}
+
+function setRequireAndModule(context) {
+  if (Package.modules) {
+    // Use the same `require` function and `module` object visible to the
+    // application.
+    var toBeInstalled = {};
+    var shellModuleName = "meteor-shell-" +
+      Math.random().toString(36).slice(2) + ".js";
+
+    toBeInstalled[shellModuleName] = function (require, exports, module) {
+      context.module = module;
+      context.require = require;
+
+      // Tab completion sometimes uses require.extensions, but only for
+      // the keys.
+      require.extensions = {
+        ".js": true,
+        ".json": true,
+        ".node": true,
+      };
+    };
+
+    // This populates repl.context.{module,require} by evaluating the
+    // module defined above.
+    Package.modules.meteorInstall(toBeInstalled)("./" + shellModuleName);
+  }
 }

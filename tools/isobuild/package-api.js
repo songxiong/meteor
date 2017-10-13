@@ -74,6 +74,7 @@ function forAllMatchingArchs (archs, f) {
  * @name  PackageAPI
  * @class PackageAPI
  * @instanceName api
+ * @showInstanceName true
  * @global
  * @summary Type of the API object passed into the `Package.onUse` function.
  */
@@ -126,9 +127,8 @@ _.extend(PackageAPI.prototype, {
   // options can include:
   //
   // - unordered: if true, don't require this package to load
-  //   before us -- just require it to be loaded anytime. Also
-  //   don't bring this package's imports into our
-  //   namespace. If false, override a true value specified in
+  //   before us -- just require it to be loaded anytime. If
+  //   false, override a true value specified in
   //   a previous call to use for this package name. (A
   //   limitation of the current implementation is that this
   //   flag is not tracked per-environment or per-role.)  This
@@ -345,13 +345,15 @@ _.extend(PackageAPI.prototype, {
     this._addFiles("sources", paths, arch, fileOptions);
   },
 
-  mainModule(path, arch) {
+  mainModule(path, arch, fileOptions = {}) {
     arch = toArchArray(arch);
+
     forAllMatchingArchs(arch, a => {
       const filesForArch = this.files[a];
       const source = {
         relPath: pathRelative(".", path),
         fileOptions: {
+          ...fileOptions,
           mainModule: true
         }
       };
@@ -365,7 +367,21 @@ _.extend(PackageAPI.prototype, {
 
       filesForArch.main = source;
       filesForArch.sources.push(source);
+
+      this._forbidExportWithLazyMain(a);
     });
+  },
+
+  _forbidExportWithLazyMain(arch) {
+    const filesForArch = this.files[arch];
+    if (filesForArch.main &&
+        filesForArch.main.fileOptions.lazy &&
+        this.exports[arch].length > 0) {
+      buildmessage.error(
+        "Architecture " + JSON.stringify(arch) + " cannot both " +
+          "export symbols and have a lazy main module"
+      );
+    }
   },
 
   /**
@@ -585,8 +601,14 @@ _.extend(PackageAPI.prototype, {
         // recover by ignoring
         return;
       }
+
       forAllMatchingArchs(arch, function (w) {
-        self.exports[w].push({name: symbol, testOnly: !!options.testOnly});
+        self.exports[w].push({
+          name: symbol,
+          testOnly: !! options.testOnly,
+        });
+
+        self._forbidExportWithLazyMain(w);
       });
     });
   }

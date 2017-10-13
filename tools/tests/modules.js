@@ -15,6 +15,27 @@ function startRun(sandbox) {
   return run;
 };
 
+selftest.define("modules - test app", function () {
+  const s = new Sandbox();
+
+  // Make sure we use the right "env" section of .babelrc.
+  s.set("NODE_ENV", "development");
+
+  s.createApp("modules-test-app", "modules");
+  s.cd("modules-test-app", function () {
+    const run = s.run(
+      "test", "--once", "--full-app",
+      "--driver-package", "dispatch:mocha-phantomjs"
+    );
+
+    run.waitSecs(60);
+    run.match("App running at");
+    run.match("SERVER FAILURES: 0");
+    run.match("CLIENT FAILURES: 0");
+    run.expectExit(0);
+  });
+});
+
 selftest.define("modules - unimported lazy files", function() {
   const s = new Sandbox();
   s.createApp("myapp", "app-with-unimported-lazy-file");
@@ -34,17 +55,27 @@ selftest.define("modules - import chain for packages", () => {
 
   s.createApp("myapp", "package-tests");
   s.cd("myapp");
-  s.write(".meteor/packages",
-    "meteor-base \n modules \n with-add-files \n with-main-module");
-  s.write("main.js", `
-    var packageNameA = require('meteor/with-add-files').name;
-    var packageNameB = require('meteor/with-main-module').name;
 
-    console.log('with-add-files: ' + packageNameA);
-    console.log('with-main-module: ' + packageNameB);
-  `);
+  s.write(".meteor/packages", [
+    "meteor-base",
+    "modules",
+    "with-add-files",
+    "with-main-module",
+    ""
+  ].join("\n"));
+
+  s.write("main.js", [
+    "var packageNameA = require('meteor/with-add-files').name;",
+    "var packageNameB = require('meteor/with-main-module').name;",
+    "",
+    "console.log('with-add-files: ' + packageNameA);",
+    "console.log('with-main-module: ' + packageNameB);",
+    ""
+  ].join("\n"));
 
   const run = startRun(s);
+
+  run.waitSecs(30);
 
   // On the server, we just check that importing *works*, not *how* it works
   run.match("with-add-files: with-add-files");

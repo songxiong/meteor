@@ -8,9 +8,12 @@ var sourcemap_support = require('source-map-support');
 var bootUtils = require('./boot-utils.js');
 var files = require('./mini-files.js');
 var npmRequire = require('./npm-require.js').require;
+var Profile = require('./profile.js').Profile;
 
 // This code is duplicated in tools/main.js.
 var MIN_NODE_VERSION = 'v0.10.41';
+
+var hasOwn = Object.prototype.hasOwnProperty;
 
 if (require('semver').lt(process.version, MIN_NODE_VERSION)) {
   process.stderr.write(
@@ -123,8 +126,35 @@ var startCheckForLiveParent = function (parentPid) {
   }
 };
 
+var specialArgPaths = {
+  "packages/modules-runtime.js": function () {
+    return {
+      npmRequire: npmRequire,
+      Profile: Profile
+    };
+  },
 
-Fiber(function () {
+  "packages/dynamic-import.js": function (file) {
+    var dynamicImportInfo = {};
+
+    Object.keys(configJson.clientPaths).map(function (key) {
+      var programJsonPath = path.resolve(configJson.clientPaths[key]);
+      var programJson = require(programJsonPath);
+
+      dynamicImportInfo[key] = {
+        dynamicRoot: path.join(path.dirname(programJsonPath), "dynamic")
+      };
+    });
+
+    dynamicImportInfo.server = {
+      dynamicRoot: path.join(serverDir, "dynamic")
+    };
+
+    return { dynamicImportInfo: dynamicImportInfo };
+  }
+};
+
+var loadServerBundles = Profile("Load server bundles", function () {
   _.each(serverJson.load, function (fileInfo) {
     var code = fs.readFileSync(path.resolve(serverDir, fileInfo.path));
     var nonLocalNodeModulesPaths = [];
@@ -145,6 +175,9 @@ Fiber(function () {
       });
     }
 
+    // Add dev_bundle/server-lib/node_modules.
+    addNodeModulesPath("node_modules");
+
     function statOrNull(path) {
       try {
         return fs.statSync(path);
@@ -161,47 +194,47 @@ Fiber(function () {
        * @locus Server
        * @memberOf Npm
        */
-      require: function (name) {
-        if (nonLocalNodeModulesPaths.length === 0) {
-          return require(name);
+      require: Profile(function getBucketName(name) {
+        return "Npm.require(" + JSON.stringify(name) + ")";
+      }, function (name, error) {
+        if (nonLocalNodeModulesPaths.length > 0) {
+          var fullPath;
+
+          // Replace all backslashes with forward slashes, just in case
+          // someone passes a Windows-y module identifier.
+          name = name.split("\\").join("/");
+
+          nonLocalNodeModulesPaths.some(function (nodeModuleBase) {
+            var packageBase = files.convertToOSPath(files.pathResolve(
+              nodeModuleBase,
+              name.split("/", 1)[0]
+            ));
+
+            if (statOrNull(packageBase)) {
+              return fullPath = files.convertToOSPath(
+                files.pathResolve(nodeModuleBase, name)
+              );
+            }
+          });
+
+          if (fullPath) {
+            return require(fullPath);
+          }
         }
 
-        var fullPath;
-
-        nonLocalNodeModulesPaths.some(function (nodeModuleBase) {
-          var packageBase = files.convertToOSPath(files.pathResolve(
-            nodeModuleBase,
-            name.split("/", 1)[0]
-          ));
-
-          if (statOrNull(packageBase)) {
-            return fullPath = files.convertToOSPath(
-              files.pathResolve(nodeModuleBase, name)
-            );
-          }
-        });
-
-        if (fullPath) {
-          return require(fullPath);
+        var resolved = require.resolve(name);
+        if (resolved === name && ! path.isAbsolute(resolved)) {
+          // If require.resolve(id) === id and id is not an absolute
+          // identifier, it must be a built-in module like fs or http.
+          return require(resolved);
         }
 
-        try {
-          return require(name);
-        } catch (e) {
-          // Try to guess the package name so we can print a nice
-          // error message
-          // fileInfo.path is a standard path, use files.pathSep
-          var filePathParts = fileInfo.path.split(files.pathSep);
-          var packageName = filePathParts[1].replace(/\.js$/, '');
-
-          // XXX better message
-          throw new Error(
-            "Can't find npm module '" + name +
-              "'. Did you forget to call 'Npm.depends' in package.js " +
-              "within the '" + packageName + "' package?");
-          }
-      }
+        throw error || new Error(
+          "Cannot find module " + JSON.stringify(name)
+        );
+      })
     };
+
     var getAsset = function (assetPath, encoding, callback) {
       var fut;
       if (! callback) {
@@ -224,6 +257,10 @@ Fiber(function () {
       // Convert a DOS-style path to Unix-style in case the application code was
       // written on Windows.
       assetPath = files.convertToStandardPath(assetPath);
+
+      // Unicode normalize the asset path to prevent string mismatches when
+      // using this string elsewhere.
+      assetPath = files.unicodeNormalizePath(assetPath);
 
       if (!fileInfo.assets || !_.has(fileInfo.assets, assetPath)) {
         _callback(new Error("Unknown asset: " + assetPath));
@@ -249,6 +286,10 @@ Fiber(function () {
        * @param {String} assetPath The path of the asset, relative to the application's `private` subdirectory.
        */
       absoluteFilePath: function (assetPath) {
+        // Unicode normalize the asset path to prevent string mismatches when
+        // using this string elsewhere.
+        assetPath = files.unicodeNormalizePath(assetPath);
+
         if (!fileInfo.assets || !_.has(fileInfo.assets, assetPath)) {
           throw new Error("Unknown asset: " + assetPath);
         }
@@ -259,13 +300,17 @@ Fiber(function () {
       },
     };
 
-    var isModulesRuntime =
-      fileInfo.path === "packages/modules-runtime.js";
-
     var wrapParts = ["(function(Npm,Assets"];
-    if (isModulesRuntime) {
-      wrapParts.push(",npmRequire");
-    }
+
+    var specialArgs =
+      hasOwn.call(specialArgPaths, fileInfo.path) &&
+      specialArgPaths[fileInfo.path](fileInfo);
+
+    var specialKeys = Object.keys(specialArgs || {});
+    specialKeys.forEach(function (key) {
+      wrapParts.push("," + key);
+    });
+
     // \n is necessary in case final line is a //-comment
     wrapParts.push("){", code, "\n})");
     var wrapped = wrapParts.join("");
@@ -286,21 +331,27 @@ Fiber(function () {
     // what require() uses to generate its errors.
     var func = require('vm').runInThisContext(wrapped, scriptPath, true);
     var args = [Npm, Assets];
-    if (isModulesRuntime) {
-      args.push(npmRequire);
-    }
-    func.apply(global, args);
-  });
 
+    specialKeys.forEach(function (key) {
+      args.push(specialArgs[key]);
+    });
+
+    Profile(fileInfo.path, func).apply(global, args);
+  });
+});
+
+var callStartupHooks = Profile("Call Meteor.startup hooks", function () {
   // run the user startup hooks.  other calls to startup() during this can still
   // add hooks to the end.
   while (__meteor_bootstrap__.startupHooks.length) {
     var hook = __meteor_bootstrap__.startupHooks.shift();
-    hook();
+    Profile.time(hook.stack || "(unknown)", hook);
   }
   // Setting this to null tells Meteor.startup to call hooks immediately.
   __meteor_bootstrap__.startupHooks = null;
+});
 
+var runMain = Profile("Run main()", function () {
   // find and run main()
   // XXX hack. we should know the package that contains main.
   var mains = [];
@@ -330,4 +381,12 @@ Fiber(function () {
   if (process.env.METEOR_PARENT_PID) {
     startCheckForLiveParent(process.env.METEOR_PARENT_PID);
   }
+});
+
+Fiber(function () {
+  Profile.run("Server startup", function () {
+    loadServerBundles();
+    callStartupHooks();
+    runMain();
+  });
 }).run();

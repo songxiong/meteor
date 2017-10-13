@@ -44,7 +44,7 @@ export class AccountsCommon {
 
   /**
    * @summary Get the current user id, or `null` if no user is logged in. A reactive data source.
-   * @locus Anywhere but publish functions
+   * @locus Anywhere
    */
   userId() {
     throw new Error("userId method not implemented");
@@ -52,7 +52,7 @@ export class AccountsCommon {
 
   /**
    * @summary Get the current user record, or `null` if no user is logged in. A reactive data source.
-   * @locus Anywhere but publish functions
+   * @locus Anywhere
    */
   user() {
     var userId = this.userId();
@@ -86,6 +86,9 @@ export class AccountsCommon {
   // - passwordResetTokenExpirationInDays {Number}
   //     Number of days since password reset token creation until the
   //     token cannt be used any longer (password reset token expires).
+  // - ambiguousErrorMessages {Boolean}
+  //     Return ambiguous error messages from login failures to prevent
+  //     user enumeration.
 
   /**
    * @summary Set global accounts options.
@@ -98,6 +101,7 @@ export class AccountsCommon {
    * @param {String} options.oauthSecretKey When using the `oauth-encryption` package, the 16 byte key using to encrypt sensitive account credentials in the database, encoded in base64.  This option may only be specifed on the server.  See packages/oauth-encryption/README.md for details.
    * @param {Number} options.passwordResetTokenExpirationInDays The number of days from when a link to reset password is sent until token expires and user can't reset password with the link anymore. Defaults to 3.
    * @param {Number} options.passwordEnrollTokenExpirationInDays The number of days from when a link to set inital password is sent until token expires and user can't set password with the link anymore. Defaults to 30.
+   * @param {Boolean} options.ambiguousErrorMessages Return ambiguous error messages from login failures to prevent user enumeration. Defaults to false.
    */
   config(options) {
     var self = this;
@@ -130,7 +134,8 @@ export class AccountsCommon {
 
     // validate option keys
     var VALID_KEYS = ["sendVerificationEmail", "forbidClientAccountCreation", "passwordEnrollTokenExpirationInDays",
-                      "restrictCreationByEmailDomain", "loginExpirationInDays", "passwordResetTokenExpirationInDays"];
+                      "restrictCreationByEmailDomain", "loginExpirationInDays", "passwordResetTokenExpirationInDays",
+                      "ambiguousErrorMessages"];
     _.each(_.keys(options), function (key) {
       if (!_.contains(VALID_KEYS, key)) {
         throw new Error("Accounts.config: Invalid key: " + key);
@@ -209,12 +214,19 @@ export class AccountsCommon {
   }
 
   _getTokenLifetimeMs() {
-    return (this._options.loginExpirationInDays ||
-            DEFAULT_LOGIN_EXPIRATION_DAYS) * 24 * 60 * 60 * 1000;
+    // When loginExpirationInDays is set to null, we'll use a really high
+    // number of days (LOGIN_UNEXPIRABLE_TOKEN_DAYS) to simulate an
+    // unexpiring token.
+    const loginExpirationInDays =
+      (this._options.loginExpirationInDays === null)
+        ? LOGIN_UNEXPIRING_TOKEN_DAYS
+        : this._options.loginExpirationInDays;
+    return (loginExpirationInDays
+        || DEFAULT_LOGIN_EXPIRATION_DAYS) * 24 * 60 * 60 * 1000;
   }
 
   _getPasswordResetTokenLifetimeMs() {
-   return (this._options.passwordResetTokenExpirationInDays ||
+    return (this._options.passwordResetTokenExpirationInDays ||
             DEFAULT_PASSWORD_RESET_TOKEN_EXPIRATION_DAYS) * 24 * 60 * 60 * 1000;
   }
 
@@ -262,7 +274,10 @@ Meteor.user = function () {
 };
 
 // how long (in days) until a login token expires
-var DEFAULT_LOGIN_EXPIRATION_DAYS = 90;
+const DEFAULT_LOGIN_EXPIRATION_DAYS = 90;
+// Expose for testing.
+Ap.DEFAULT_LOGIN_EXPIRATION_DAYS = DEFAULT_LOGIN_EXPIRATION_DAYS;
+
 // how long (in days) until reset password token expires
 var DEFAULT_PASSWORD_RESET_TOKEN_EXPIRATION_DAYS = 3;
 // how long (in days) until enrol password token expires
@@ -276,6 +291,12 @@ EXPIRE_TOKENS_INTERVAL_MS = 600 * 1000; // 10 minutes
 // how long we wait before logging out clients when Meteor.logoutOtherClients is
 // called
 CONNECTION_CLOSE_DELAY_MS = 10 * 1000;
+
+// A large number of expiration days (approximately 100 years worth) that is
+// used when creating unexpiring tokens.
+const LOGIN_UNEXPIRING_TOKEN_DAYS = 365 * 100;
+// Expose for testing.
+Ap.LOGIN_UNEXPIRING_TOKEN_DAYS = LOGIN_UNEXPIRING_TOKEN_DAYS;
 
 // loginServiceConfiguration and ConfigError are maintained for backwards compatibility
 Meteor.startup(function () {

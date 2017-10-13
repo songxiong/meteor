@@ -1,7 +1,9 @@
+import { DDP, LivedataTest } from "./namespace.js";
+import { MongoIDMap } from "./id_map.js";
+
 if (Meteor.isServer) {
-  var path = Npm.require('path');
   var Fiber = Npm.require('fibers');
-  var Future = Npm.require(path.join('fibers', 'future'));
+  var Future = Npm.require('fibers/future');
 }
 
 // @param url {String|Object} URL to Meteor app,
@@ -46,8 +48,10 @@ var Connection = function (url, options) {
   }, options);
 
   // If set, called when we reconnect, queuing method calls _before_ the
-  // existing outstanding ones. This is the only data member that is part of the
-  // public API!
+  // existing outstanding ones.
+  // NOTE: This feature has been preserved for backwards compatibility. The
+  // preferred method of setting a callback on reconnect is to use
+  // DDP.onReconnect.
   self.onReconnect = null;
 
   // as a test hook, allow passing a stream instead of a url.
@@ -299,29 +303,22 @@ var Connection = function (url, options) {
     if (self._outstandingMethodBlocks.length > 0) {
       // If there is an outstanding method block, we only care about the first one as that is the
       // one that could have already sent messages with no response, that are not allowed to retry.
-      _.each(self._outstandingMethodBlocks[0].methods, function(methodInvoker) {
-        // If the message wasn't sent or it's allowed to retry, do nothing.
+      const currentMethodBlock = self._outstandingMethodBlocks[0].methods;
+      self._outstandingMethodBlocks[0].methods = currentMethodBlock.filter((methodInvoker) => {
+
+        // Methods with 'noRetry' option set are not allowed to re-send after
+        // recovering dropped connection.
         if (methodInvoker.sentMessage && methodInvoker.noRetry) {
-          // The next loop serves to get the index in the current method block of this method.
-          var currentMethodBlock = self._outstandingMethodBlocks[0].methods;
-          var loopMethod;
-          for (var i = 0; i < currentMethodBlock.length; i++) {
-            loopMethod = currentMethodBlock[i];
-            if (loopMethod.methodId === methodInvoker.methodId) {
-              break;
-            }
-          }
-
-          // Remove from current method block. This may leave the block empty, but we
-          // don't move on to the next block until the callback has been delivered, in
-          // _outstandingMethodFinished.
-          currentMethodBlock.splice(i, 1);
-
           // Make sure that the method is told that it failed.
           methodInvoker.receiveResult(new Meteor.Error('invocation-failed',
             'Method invocation might have failed due to dropped connection. ' +
             'Failing because `noRetry` option was passed to Meteor.apply.'));
         }
+
+        // Only keep a method if it wasn't sent or it's allowed to retry.
+        // This may leave the block empty, but we don't move on to the next
+        // block until the callback has been delivered, in _outstandingMethodFinished.
+        return !(methodInvoker.sentMessage && methodInvoker.noRetry);
       });
     }
 
@@ -352,10 +349,7 @@ var Connection = function (url, options) {
     // `onReconnect` get executed _before_ ones that were originally
     // outstanding (since `onReconnect` is used to re-establish auth
     // certificates)
-    if (self.onReconnect)
-      self._callOnReconnectAndSendAppropriateOutstandingMethods();
-    else
-      self._sendOutstandingMethods();
+    self._callOnReconnectAndSendAppropriateOutstandingMethods();
 
     // add new subscriptions at the end. this way they take effect after
     // the handlers and we don't see flicker.
@@ -586,8 +580,15 @@ _.extend(Connection.prototype, {
         // an onReady callback inside an autorun; the semantics we provide is
         // that at the time the sub first becomes ready, we call the last
         // onReady callback provided, if any.)
-        if (!existing.ready)
+        // If the sub is already ready, run the ready callback right away.
+        // It seems that users would expect an onReady callback inside an
+        // autorun to trigger once the the sub first becomes ready and also
+        // when re-subs happens.
+        if (existing.ready) {
+          callbacks.onReady();
+        } else {
           existing.readyCallback = callbacks.onReady;
+        }
       }
 
       // XXX COMPAT WITH 1.0.3.1 we used to have onError but now we call
@@ -761,6 +762,7 @@ _.extend(Connection.prototype, {
    * @param {Boolean} options.wait (Client only) If true, don't send this method until all previous method calls have completed, and don't send any subsequent method calls until this one is completed.
    * @param {Function} options.onResultReceived (Client only) This callback is invoked with the error or result of the method (just like `asyncCallback`) as soon as the error or result is available. The local cache may not yet reflect the writes performed by the method.
    * @param {Boolean} options.noRetry (Client only) if true, don't send this method again on reload, simply call the callback an error with the error code 'invocation-failed'.
+   * @param {Boolean} options.throwStubExceptions (Client only) If true, exceptions thrown by method stubs will be thrown instead of logged, and the method will not be invoked on the server.
    * @param {Function} [asyncCallback] Optional callback; same semantics as in [`Meteor.call`](#meteor_call).
    */
   apply: function (name, args, options, callback) {
@@ -798,7 +800,7 @@ _.extend(Connection.prototype, {
       };
     })();
 
-    var enclosing = DDP._CurrentInvocation.get();
+    var enclosing = DDP._CurrentMethodInvocation.get();
     var alreadyInSimulation = enclosing && enclosing.isSimulation;
 
     // Lazily generate a randomSeed, only if it is requested by the stub.
@@ -850,7 +852,7 @@ _.extend(Connection.prototype, {
       try {
         // Note that unlike in the corresponding server code, we never audit
         // that stubs check() their arguments.
-        var stubReturnValue = DDP._CurrentInvocation.withValue(invocation, function () {
+        var stubReturnValue = DDP._CurrentMethodInvocation.withValue(invocation, function () {
           if (Meteor.isServer) {
             // Because saveOriginals and retrieveOriginals aren't reentrant,
             // don't allow stubs to yield.
@@ -977,6 +979,8 @@ _.extend(Connection.prototype, {
   // documents.
   _saveOriginals: function () {
     var self = this;
+    if (!self._waitingForQuiescence())
+      self._flushBufferedWrites();
     _.each(self._stores, function (s) {
       s.saveOriginals();
     });
@@ -1680,7 +1684,11 @@ _.extend(Connection.prototype, {
     var oldOutstandingMethodBlocks = self._outstandingMethodBlocks;
     self._outstandingMethodBlocks = [];
 
-    self.onReconnect();
+    self.onReconnect && self.onReconnect();
+    DDP._reconnectHook.each(function (callback) {
+      callback(self);
+      return true;
+    });
 
     if (_.isEmpty(oldOutstandingMethodBlocks))
       return;
@@ -1751,6 +1759,21 @@ DDP.connect = function (url, options) {
   var ret = new Connection(url, options);
   allConnections.push(ret); // hack. see below.
   return ret;
+};
+
+DDP._reconnectHook = new Hook({ bindEnvironment: false });
+
+/**
+ * @summary Register a function to call as the first step of
+ * reconnecting. This function can call methods which will be executed before
+ * any other outstanding methods. For example, this can be used to re-establish
+ * the appropriate authentication context on the connection.
+ * @locus Anywhere
+ * @param {Function} callback The function to call. It will be called with a
+ * single argument, the [connection object](#ddp_connect) that is reconnecting.
+ */
+DDP.onReconnect = function (callback) {
+  return DDP._reconnectHook.register(callback);
 };
 
 // Hack for `spiderable` package: a way to see if the page is done

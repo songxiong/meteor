@@ -63,18 +63,14 @@ Mongo.Collection = function (name, options) {
   switch (options.idGeneration) {
   case 'MONGO':
     self._makeNewID = function () {
-      var src = name
-            ? DDP.randomStream('/collection/' + name)
-            : Random.insecure;
+      var src = name ? DDP.randomStream('/collection/' + name) : Random.insecure;
       return new Mongo.ObjectID(src.hexString(24));
     };
     break;
   case 'STRING':
   default:
     self._makeNewID = function () {
-      var src = name
-            ? DDP.randomStream('/collection/' + name)
-            : Random.insecure;
+      var src = name ? DDP.randomStream('/collection/' + name) : Random.insecure;
       return src.id();
     };
     break;
@@ -247,8 +243,7 @@ Mongo.Collection = function (name, options) {
   }
 
   // autopublish
-  if (Package.autopublish && !options._preventAutopublish && self._connection
-      && self._connection.publish) {
+  if (Package.autopublish && !options._preventAutopublish && self._connection && self._connection.publish) {
     self._connection.publish(null, function () {
       return self.find();
     }, {is_auto: true});
@@ -304,6 +299,8 @@ _.extend(Mongo.Collection.prototype, {
    * @param {Boolean} options.disableOplog (Server only) Pass true to disable oplog-tailing on this query. This affects the way server processes calls to `observe` on this query. Disabling the oplog can be useful when working with data that updates in large batches.
    * @param {Number} options.pollingIntervalMs (Server only) When oplog is disabled (through the use of `disableOplog` or when otherwise not available), the frequency (in milliseconds) of how often to poll this query when observing on the server. Defaults to 10000ms (10 seconds).
    * @param {Number} options.pollingThrottleMs (Server only) When oplog is disabled (through the use of `disableOplog` or when otherwise not available), the minimum time (in milliseconds) to allow between re-polling when observing on the server. Increasing this will save CPU and mongo load at the expense of slower updates to users. Decreasing this is not recommended. Defaults to 50ms.
+   * @param {Number} options.maxTimeMs (Server only) If set, instructs MongoDB to set a time limit for this cursor's operations. If the operation reaches the specified time limit (in milliseconds) without the having been completed, an exception will be thrown. Useful to prevent an (accidental or malicious) unoptimized query from causing a full collection scan that would disrupt other database users, at the expense of needing to handle the resulting error.
+   * @param {String|Object} options.hint (Server only) Overrides MongoDB's default index selection and query optimization process. Specify an index to force its use, either by its name or index specification. You can also specify `{ $natural : 1 }` to force a forwards collection scan, or `{ $natural : -1 }` for a reverse collection scan. Setting this is only recommended for advanced users.
    * @returns {Mongo.Cursor}
    */
   find: function (/* selector, options */) {
@@ -365,9 +362,10 @@ Mongo.Collection._publishCursor = function (cursor, sub, collection) {
 
 // protect against dangerous selectors.  falsey and {_id: falsey} are both
 // likely programmer error, and not what you want, particularly for destructive
-// operations.  JS regexps don't serialize over DDP but can be trivially
-// replaced by $regex.
-Mongo.Collection._rewriteSelector = function (selector) {
+// operations. If a falsey _id is sent in, a new string _id will be
+// generated and returned; if a fallbackId is provided, it will be returned
+// instead.
+Mongo.Collection._rewriteSelector = (selector, { fallbackId } = {}) => {
   // shorthand -- scalars match _id
   if (LocalCollection._selectorIsId(selector))
     selector = {_id: selector};
@@ -378,49 +376,10 @@ Mongo.Collection._rewriteSelector = function (selector) {
     throw new Error("Mongo selector can't be an array.");
   }
 
-  if (!selector || (('_id' in selector) && !selector._id))
+  if (!selector || (('_id' in selector) && !selector._id)) {
     // can't match anything
-    return {_id: Random.id()};
-
-  var ret = {};
-  _.each(selector, function (value, key) {
-    // Mongo supports both {field: /foo/} and {field: {$regex: /foo/}}
-    if (value instanceof RegExp) {
-      ret[key] = convertRegexpToMongoSelector(value);
-    } else if (value && value.$regex instanceof RegExp) {
-      ret[key] = convertRegexpToMongoSelector(value.$regex);
-      // if value is {$regex: /foo/, $options: ...} then $options
-      // override the ones set on $regex.
-      if (value.$options !== undefined)
-        ret[key].$options = value.$options;
-    }
-    else if (_.contains(['$or','$and','$nor'], key)) {
-      // Translate lower levels of $and/$or/$nor
-      ret[key] = _.map(value, function (v) {
-        return Mongo.Collection._rewriteSelector(v);
-      });
-    } else {
-      ret[key] = value;
-    }
-  });
-  return ret;
-};
-
-// convert a JS RegExp object to a Mongo {$regex: ..., $options: ...}
-// selector
-function convertRegexpToMongoSelector(regexp) {
-  check(regexp, RegExp); // safety belt
-
-  var selector = {$regex: regexp.source};
-  var regexOptions = '';
-  // JS RegExp objects support 'i', 'm', and 'g'. Mongo regex $options
-  // support 'i', 'm', 'x', and 's'. So we support 'i' and 'm' here.
-  if (regexp.ignoreCase)
-    regexOptions += 'i';
-  if (regexp.multiline)
-    regexOptions += 'm';
-  if (regexOptions)
-    selector.$options = regexOptions;
+    return { _id: fallbackId || Random.id() };
+  }
 
   return selector;
 };
@@ -474,8 +433,7 @@ Mongo.Collection.prototype.insert = function insert(doc, callback) {
   doc = _.extend({}, doc);
 
   if ('_id' in doc) {
-    if (!doc._id || !(typeof doc._id === 'string'
-          || doc._id instanceof Mongo.ObjectID)) {
+    if (!doc._id || !(typeof doc._id === 'string' || doc._id instanceof Mongo.ObjectID)) {
       throw new Error("Meteor requires document _id fields to be non-empty strings or ObjectIDs");
     }
   } else {
@@ -485,7 +443,7 @@ Mongo.Collection.prototype.insert = function insert(doc, callback) {
     // This optimization saves us passing both the randomSeed and the id
     // Passing both is redundant.
     if (this._isRemoteCollection()) {
-      const enclosing = DDP._CurrentInvocation.get();
+      const enclosing = DDP._CurrentMethodInvocation.get();
       if (!enclosing) {
         generateId = false;
       }
@@ -511,8 +469,7 @@ Mongo.Collection.prototype.insert = function insert(doc, callback) {
     return result;
   };
 
-  const wrappedCallback = wrapCallback(
-    callback, chooseReturnValueFromCollectionResult);
+  const wrappedCallback = wrapCallback(callback, chooseReturnValueFromCollectionResult);
 
   if (this._isRemoteCollection()) {
     const result = this._callMutatorMethod("insert", [doc], wrappedCallback);
@@ -534,7 +491,7 @@ Mongo.Collection.prototype.insert = function insert(doc, callback) {
     }
     throw e;
   }
-}
+};
 
 /**
  * @summary Modify one or more documents in the collection. Returns the number of matched documents.
@@ -552,21 +509,25 @@ Mongo.Collection.prototype.insert = function insert(doc, callback) {
 Mongo.Collection.prototype.update = function update(selector, modifier, ...optionsAndCallback) {
   const callback = popCallbackFromArgs(optionsAndCallback);
 
-  selector = Mongo.Collection._rewriteSelector(selector);
-
   // We've already popped off the callback, so we are left with an array
   // of one or zero items
   const options = _.clone(optionsAndCallback[0]) || {};
+  let insertedId;
   if (options && options.upsert) {
     // set `insertedId` if absent.  `insertedId` is a Meteor extension.
     if (options.insertedId) {
-      if (!(typeof options.insertedId === 'string'
-            || options.insertedId instanceof Mongo.ObjectID))
+      if (!(typeof options.insertedId === 'string' || options.insertedId instanceof Mongo.ObjectID))
         throw new Error("insertedId must be string or ObjectID");
-    } else if (! selector._id) {
-      options.insertedId = this._makeNewID();
+      insertedId = options.insertedId;
+    } else if (!selector || !selector._id) {
+      insertedId = this._makeNewID();
+      options.generatedId = true;
+      options.insertedId = insertedId;
     }
   }
+
+  selector =
+    Mongo.Collection._rewriteSelector(selector, { fallbackId: insertedId });
 
   const wrappedCallback = wrapCallback(callback);
 
@@ -595,7 +556,7 @@ Mongo.Collection.prototype.update = function update(selector, modifier, ...optio
     }
     throw e;
   }
-}
+};
 
 /**
  * @summary Remove documents from the collection
@@ -636,7 +597,7 @@ Mongo.Collection.prototype.remove = function remove(selector, callback) {
 Mongo.Collection.prototype._isRemoteCollection = function _isRemoteCollection() {
   // XXX see #MeteorServerNull
   return this._connection && this._connection !== Meteor.server;
-}
+};
 
 // Convert the callback to not return a result if there is an error
 function wrapCallback(callback, convertResult) {

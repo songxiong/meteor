@@ -302,6 +302,9 @@ var Session = function (server, version, socket, options) {
   }).run();
 
   if (version !== 'pre1' && options.heartbeatInterval !== 0) {
+    // We no longer need the low level timeout because we have heartbeating.
+    socket.setWebsocketTimeout(0);
+
     self.heartbeat = new DDPCommon.Heartbeat({
       heartbeatInterval: options.heartbeatInterval,
       heartbeatTimeout: options.heartbeatTimeout,
@@ -547,6 +550,11 @@ _.extend(Session.prototype, {
           processNext();
         };
 
+        self.server.onMessageHook.each(function (callback) {
+          callback(msg, self);
+          return true;
+        });
+
         if (_.has(self.protocol_handlers, msg.msg))
           self.protocol_handlers[msg.msg].call(self, msg, unblock);
         else
@@ -706,7 +714,7 @@ _.extend(Session.prototype, {
 
         resolve(DDPServer._CurrentWriteFence.withValue(
           fence,
-          () => DDP._CurrentInvocation.withValue(
+          () => DDP._CurrentMethodInvocation.withValue(
             invocation,
             () => maybeAuditArgumentChecks(
               handler, invocation, msg.params,
@@ -801,23 +809,29 @@ _.extend(Session.prototype, {
     self.collectionViews = {};
     self.userId = userId;
 
-    // Save the old named subs, and reset to having no subscriptions.
-    var oldNamedSubs = self._namedSubs;
-    self._namedSubs = {};
-    self._universalSubs = [];
+    // _setUserId is normally called from a Meteor method with
+    // DDP._CurrentMethodInvocation set. But DDP._CurrentMethodInvocation is not
+    // expected to be set inside a publish function, so we temporary unset it.
+    // Inside a publish function DDP._CurrentPublicationInvocation is set.
+    DDP._CurrentMethodInvocation.withValue(undefined, function () {
+      // Save the old named subs, and reset to having no subscriptions.
+      var oldNamedSubs = self._namedSubs;
+      self._namedSubs = {};
+      self._universalSubs = [];
 
-    _.each(oldNamedSubs, function (sub, subscriptionId) {
-      self._namedSubs[subscriptionId] = sub._recreate();
-      // nb: if the handler throws or calls this.error(), it will in fact
-      // immediately send its 'nosub'. This is OK, though.
-      self._namedSubs[subscriptionId]._runHandler();
+      _.each(oldNamedSubs, function (sub, subscriptionId) {
+        self._namedSubs[subscriptionId] = sub._recreate();
+        // nb: if the handler throws or calls this.error(), it will in fact
+        // immediately send its 'nosub'. This is OK, though.
+        self._namedSubs[subscriptionId]._runHandler();
+      });
+
+      // Allow newly-created universal subs to be started on our connection in
+      // parallel with the ones we're spinning up here, and spin up universal
+      // subs.
+      self._dontStartNewUniversalSubs = false;
+      self.startUniversalSubs();
     });
-
-    // Allow newly-created universal subs to be started on our connection in
-    // parallel with the ones we're spinning up here, and spin up universal
-    // subs.
-    self._dontStartNewUniversalSubs = false;
-    self.startUniversalSubs();
 
     // Start sending messages again, beginning with the diff from the previous
     // state of the world to the current state. No yields are allowed during
@@ -937,6 +951,7 @@ _.extend(Session.prototype, {
  * @summary The server's side of a subscription
  * @class Subscription
  * @instanceName this
+ * @showInstanceName true
  */
 var Subscription = function (
     session, handler, subscriptionId, params, name) {
@@ -1023,12 +1038,16 @@ _.extend(Subscription.prototype, {
 
     var self = this;
     try {
-      var res = maybeAuditArgumentChecks(
-        self._handler, self, EJSON.clone(self._params),
-        // It's OK that this would look weird for universal subscriptions,
-        // because they have no arguments so there can never be an
-        // audit-argument-checks failure.
-        "publisher '" + self._name + "'");
+      var res = DDP._CurrentPublicationInvocation.withValue(
+        self,
+        () => maybeAuditArgumentChecks(
+          self._handler, self, EJSON.clone(self._params),
+          // It's OK that this would look weird for universal subscriptions,
+          // because they have no arguments so there can never be an
+          // audit-argument-checks failure.
+          "publisher '" + self._name + "'"
+        )
+      );
     } catch (e) {
       self.error(e);
       return;
@@ -1204,6 +1223,7 @@ _.extend(Subscription.prototype, {
    */
   onStop: function (callback) {
     var self = this;
+    callback = Meteor.bindEnvironment(callback, 'onStop callback', self);
     if (self._isDeactivated())
       callback();
     else
@@ -1320,6 +1340,11 @@ Server = function (options) {
     debugPrintExceptions: "onConnection callback"
   });
 
+  // Map of callbacks to call when a new message comes in.
+  self.onMessageHook = new Hook({
+    debugPrintExceptions: "onMessage callback"
+  });
+
   self.publish_handlers = {};
   self.universal_publish_handlers = [];
 
@@ -1401,6 +1426,18 @@ _.extend(Server.prototype, {
   onConnection: function (fn) {
     var self = this;
     return self.onConnectionHook.register(fn);
+  },
+
+  /**
+   * @summary Register a callback to be called when a new DDP message is received.
+   * @locus Server
+   * @param {function} callback The function to call when a new DDP message is received.
+   * @memberOf Meteor
+   * @importFromPackage meteor
+   */
+  onMessage: function (fn) {
+    var self = this;
+    return self.onMessageHook.register(fn);
   },
 
   _handleConnect: function (socket, msg) {
@@ -1557,79 +1594,32 @@ _.extend(Server.prototype, {
     });
   },
 
-  call: function (name /*, arguments */) {
-    // if it's a function, the last argument is the result callback,
-    // not a parameter to the remote method.
-    var args = Array.prototype.slice.call(arguments, 1);
-    if (args.length && typeof args[args.length - 1] === "function")
+  call: function (name, ...args) {
+    if (args.length && typeof args[args.length - 1] === "function") {
+      // If it's a function, the last argument is the result callback, not
+      // a parameter to the remote method.
       var callback = args.pop();
+    }
+
     return this.apply(name, args, callback);
   },
 
-  // @param options {Optional Object}
-  // @param callback {Optional Function}
-  apply: function (name, args, options, callback) {
-    var self = this;
+  // A version of the call method that always returns a Promise.
+  callAsync: function (name, ...args) {
+    return this.applyAsync(name, args);
+  },
 
+  apply: function (name, args, options, callback) {
     // We were passed 3 arguments. They may be either (name, args, options)
     // or (name, args, callback)
-    if (!callback && typeof options === 'function') {
+    if (! callback && typeof options === 'function') {
       callback = options;
       options = {};
-    }
-    options = options || {};
-
-    if (callback)
-      // It's not really necessary to do this, since we immediately
-      // run the callback in this fiber before returning, but we do it
-      // anyway for regularity.
-      // XXX improve error message (and how we report it)
-      callback = Meteor.bindEnvironment(
-        callback,
-        "delivering result of invoking '" + name + "'"
-      );
-
-    // Run the handler
-    var handler = self.method_handlers[name];
-    var exception;
-    if (!handler) {
-      exception = new Meteor.Error(404, `Method '${name}' not found`);
     } else {
-      // If this is a method call from within another method, get the
-      // user state from the outer method, otherwise don't allow
-      // setUserId to be called
-      var userId = null;
-      var setUserId = function() {
-        throw new Error("Can't call setUserId on a server initiated method call");
-      };
-      var connection = null;
-      var currentInvocation = DDP._CurrentInvocation.get();
-      if (currentInvocation) {
-        userId = currentInvocation.userId;
-        setUserId = function(userId) {
-          currentInvocation.setUserId(userId);
-        };
-        connection = currentInvocation.connection;
-      }
-
-      var invocation = new DDPCommon.MethodInvocation({
-        isSimulation: false,
-        userId: userId,
-        setUserId: setUserId,
-        connection: connection,
-        randomSeed: DDPCommon.makeRpcSeed(currentInvocation, name)
-      });
-      try {
-        var result = DDP._CurrentInvocation.withValue(invocation, function () {
-          return maybeAuditArgumentChecks(
-            handler, invocation, EJSON.clone(args), "internal call to '" +
-              name + "'");
-        });
-        result = EJSON.clone(result);
-      } catch (e) {
-        exception = e;
-      }
+      options = options || {};
     }
+
+    const promise = this.applyAsync(name, args, options);
 
     // Return the result in whichever way the caller asked for it. Note that we
     // do NOT block on the write fence in an analogous way to how the client
@@ -1637,12 +1627,68 @@ _.extend(Server.prototype, {
     // cursor observe callbacks have fired when your callback is invoked. (We
     // can change this if there's a real use case.)
     if (callback) {
-      callback(exception, result);
-      return undefined;
+      promise.then(
+        result => callback(undefined, result),
+        exception => callback(exception)
+      );
+    } else {
+      return promise.await();
     }
-    if (exception)
-      throw exception;
-    return result;
+  },
+
+  // @param options {Optional Object}
+  applyAsync: function (name, args, options) {
+    // Run the handler
+    var handler = this.method_handlers[name];
+    if (! handler) {
+      return Promise.reject(
+        new Meteor.Error(404, `Method '${name}' not found`)
+      );
+    }
+
+    // If this is a method call from within another method or publish function,
+    // get the user state from the outer method or publish function, otherwise
+    // don't allow setUserId to be called
+    var userId = null;
+    var setUserId = function() {
+      throw new Error("Can't call setUserId on a server initiated method call");
+    };
+    var connection = null;
+    var currentMethodInvocation = DDP._CurrentMethodInvocation.get();
+    var currentPublicationInvocation = DDP._CurrentPublicationInvocation.get();
+    var randomSeed = null;
+    if (currentMethodInvocation) {
+      userId = currentMethodInvocation.userId;
+      setUserId = function(userId) {
+        currentMethodInvocation.setUserId(userId);
+      };
+      connection = currentMethodInvocation.connection;
+      randomSeed = DDPCommon.makeRpcSeed(currentMethodInvocation, name);
+    } else if (currentPublicationInvocation) {
+      userId = currentPublicationInvocation.userId;
+      setUserId = function(userId) {
+        currentPublicationInvocation._session._setUserId(userId);
+      };
+      connection = currentPublicationInvocation.connection;
+    }
+
+    var invocation = new DDPCommon.MethodInvocation({
+      isSimulation: false,
+      userId,
+      setUserId,
+      connection,
+      randomSeed
+    });
+
+    return new Promise(resolve => resolve(
+      DDP._CurrentMethodInvocation.withValue(
+        invocation,
+        () => maybeAuditArgumentChecks(
+          handler, invocation, EJSON.clone(args),
+          "internal call to '" + name + "'"
+        )
+      )
+    )).then(EJSON.clone);
   },
 
   _urlForSession: function (sessionId) {
@@ -1672,8 +1718,19 @@ DDPServer._calculateVersion = calculateVersion;
 // "blind" exceptions other than those that were deliberately thrown to signal
 // errors to the client
 var wrapInternalException = function (exception, context) {
-  if (!exception || exception instanceof Meteor.Error)
+  if (!exception) return exception;
+
+  // To allow packages to throw errors intended for the client but not have to
+  // depend on the Meteor.Error class, `isClientSafe` can be set to true on any
+  // error before it is thrown.
+  if (exception.isClientSafe) {
+    if (!(exception instanceof Meteor.Error)) {
+      const originalMessage = exception.message;
+      exception = new Meteor.Error(exception.error, exception.reason, exception.details);
+      exception.message = originalMessage;
+    }
     return exception;
+  }
 
   // tests can set the 'expected' flag on an exception so it won't go to the
   // server log
@@ -1690,10 +1747,10 @@ var wrapInternalException = function (exception, context) {
   // provided a "sanitized" version with more context than 500 Internal server
   // error? Use that.
   if (exception.sanitizedError) {
-    if (exception.sanitizedError instanceof Meteor.Error)
+    if (exception.sanitizedError.isClientSafe)
       return exception.sanitizedError;
     Meteor._debug("Exception " + context + " provides a sanitizedError that " +
-                  "is not a Meteor.Error; ignoring");
+                  "does not have isClientSafe property set; ignoring");
   }
 
   return new Meteor.Error(500, "Internal server error");

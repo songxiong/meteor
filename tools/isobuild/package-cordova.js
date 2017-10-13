@@ -1,9 +1,13 @@
 import { ensureOnlyValidVersions } from "../utils/utils.js";
 import buildmessage from "../utils/buildmessage.js";
 
-// == Class of the `Cordova` object visible in package.js ==
-
 export class PackageCordova {
+  /**
+   * @summary Class of the 'Cordova' object visible in package.js
+   * @locus package.js
+   * @instanceName Cordova
+   * @showInstanceName true
+   */
   constructor() {
     this._dependencies = null;
   }
@@ -16,7 +20,7 @@ export class PackageCordova {
    * [plugins.cordova.io](http://plugins.cordova.io/), so the plugins and
    * versions specified must exist there. Alternatively, the version
    * can be replaced with a GitHub tarball URL as described in the
-   * [Cordova](https://github.com/meteor/meteor/wiki/Meteor-Cordova-integration#meteor-packages-with-cordova-dependencies)
+   * [Cordova](https://guide.meteor.com/mobile.html#cordova-plugins)
    * page of the Meteor wiki on GitHub.
    * @param  {Object} dependencies An object where the keys are plugin
    * names and the values are version numbers or GitHub tarball URLs
@@ -39,7 +43,6 @@ export class PackageCordova {
    * ```
    *
    * @locus package.js
-   * @memberOf  Cordova
    */
   depends(dependencies) {
     // XXX make cordovaDependencies be separate between use and test, so that

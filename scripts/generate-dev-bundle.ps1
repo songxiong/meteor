@@ -1,22 +1,31 @@
 # determine the platform
 # use 32bit by default
 $PLATFORM = "windows_x86"
-$MONGO_VERSION = "3.2.6"
-$NODE_VERSION = "4.6.0"
-$NPM_VERSION = "3.10.8"
 $PYTHON_VERSION = "2.7.12" # For node-gyp
 
-# take it form the environment if exists
+# take it from the environment if exists
 if (Test-Path env:PLATFORM) {
   $PLATFORM = (Get-Item env:PLATFORM).Value
 }
 
 $script_path = Split-Path -parent $MyInvocation.MyCommand.Definition
 $CHECKOUT_DIR = Split-Path -parent $script_path
+$common_script = "${script_path}\build-dev-bundle-common.sh"
+
+function Get-ShellScriptVariableFromFile {
+  Param ([string]$Path, [string]$Name)
+  $v = Select-String -Path $Path -Pattern "^\s*${Name}=(\S+)" | % { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
+  $v = $v.Trim()
+  Write-Output $v
+}
 
 # extract the bundle version from the meteor bash script
-$BUNDLE_VERSION = Select-String -Path ($CHECKOUT_DIR + "\meteor") -Pattern 'BUNDLE_VERSION=(\S+)'  | % { $_.Matches[0].Groups[1].Value } | Select-Object -First 1
-$BUNDLE_VERSION = $BUNDLE_VERSION.Trim()
+$BUNDLE_VERSION = Get-ShellScriptVariableFromFile -Path "${CHECKOUT_DIR}\meteor" -Name 'BUNDLE_VERSION'
+
+# extract the major package versions from the build-dev-bundle-common script.
+$MONGO_VERSION = Get-ShellScriptVariableFromFile -Path $common_script -Name 'MONGO_VERSION'
+$NODE_VERSION = Get-ShellScriptVariableFromFile -Path $common_script -Name 'NODE_VERSION'
+$NPM_VERSION = Get-ShellScriptVariableFromFile -Path $common_script -Name 'NPM_VERSION'
 
 # generate-dev-bundle-xxxxxxxx shortly
 # convert relative path to absolute path because not all commands know how to deal with this themselves
@@ -32,16 +41,19 @@ mkdir lib\node_modules
 mkdir bin
 cd bin
 
+# add bin to the front of the path so we can use our own node for building
+$env:PATH = "${DIR}\bin;${env:PATH}"
+
 $webclient = New-Object System.Net.WebClient
 $shell = New-Object -com shell.application
 
 mkdir "$DIR\7z"
 cd "$DIR\7z"
-$webclient.DownloadFile("http://www.7-zip.org/a/7z1602.msi", "$DIR\7z\7z.msi")
-$webclient.DownloadFile("http://www.7-zip.org/a/7z1602-extra.7z", "$DIR\7z\extra.7z")
+$webclient.DownloadFile("http://www.7-zip.org/a/7z1604.msi", "$DIR\7z\7z.msi")
+$webclient.DownloadFile("http://www.7-zip.org/a/7z1604-extra.7z", "$DIR\7z\extra.7z")
 msiexec /i 7z.msi /quiet /qn /norestart
 ping -n 4 127.0.0.1 | out-null
-& "C:\Program Files*\7-Zip\7z.exe" x extra.7z
+& "C:\Program Files\7-Zip\7z.exe" x extra.7z
 mv 7za.exe "$DIR\bin\7z.exe"
 cd "$DIR\bin"
 
@@ -50,18 +62,47 @@ cd "$DIR\bin"
 $node_link = "http://nodejs.org/dist/v${NODE_VERSION}/win-x86/node.exe"
 $webclient.DownloadFile($node_link, "$DIR\bin\node.exe")
 
+mkdir "$DIR\Release"
+cd "$DIR\Release"
+$nodeLibUrl = & "$DIR\bin\node.exe" -p process.release.libUrl
+echo "Downloading node.lib from ${nodeLibUrl}"
+$webclient.DownloadFile($nodeLibUrl, "$DIR\Release\node.lib")
+echo ""
+echo "Node lib:"
+dir
+
+mkdir "$DIR\include"
+cd "$DIR\include"
+$nodeHeadersUrl = & "$DIR\bin\node.exe" -p process.release.headersUrl
+$nodeHeadersTar = "node-v${NODE_VERSION}-headers.tar"
+$nodeHeadersTarGz = "${nodeHeadersTar}.gz"
+echo "Downloading ${nodeHeadersTarGz} from ${nodeHeadersUrl}"
+$webclient.DownloadFile($nodeHeadersUrl, "$DIR\include\$nodeHeadersTarGz")
+7z x "$nodeHeadersTarGz"
+7z x "$nodeHeadersTar"
+$nodeHeadersDir = "node-v${NODE_VERSION}"
+mv "$nodeHeadersDir\include\node" .
+rm "$nodeHeadersTarGz"
+rm "$nodeHeadersTar"
+rm -Recurse -Force "$nodeHeadersDir"
+echo ""
+echo "Node headers:"
+dir node
+
 # On Windows we provide a reliable version of python.exe for use by
 # node-gyp (the tool that rebuilds binary node modules). #WinPy
-$py_msi_link = "http://www.python.org/ftp/python/${PYTHON_VERSION}/python-${PYTHON_VERSION}.msi"
-$py_msi = "${DIR}\python.msi"
-$webclient.DownloadFile($py_msi_link, $py_msi)
-$py_dir = "${DIR}\python"
-msiexec /i "$py_msi" TARGETDIR="$py_dir" /quiet /qn /norestart
-$env:PATH = "${py_dir};${env:PATH}"
+
+cd "$DIR"
+$py_s3_url = "https://s3.amazonaws.com/com.meteor.static/windows-python/python-${PYTHON_VERSION}.7z"
+$py_archive = "${DIR}\python.7z"
+$webclient.DownloadFile($py_s3_url, $py_archive)
+& "$DIR\bin\7z.exe" x "$py_archive"
+rm -Recurse -Force "$py_archive"
+$env:PATH = "${DIR}\python;${env:PATH}"
+python --version
 
 # download initial version of npm
 $npm_zip = "$DIR\bin\npm.zip"
-
 # These dist/npm archives were only published for 1.x versions of npm, and
 # this is the most recent one.
 $npm_link = "https://nodejs.org/dist/npm/npm-1.4.12.zip"
@@ -74,9 +115,6 @@ foreach($item in $zip.items()) {
 
 rm -Recurse -Force $npm_zip
 rm -Recurse -Force "$DIR\7z"
-
-# add bin to the front of the path so we can use our own node for building
-$env:PATH = "${DIR}\bin;${env:PATH}"
 
 # Install the version of npm that we're actually going to expose from the
 # dev bundle. Note that we use npm@1.4.12 to install npm@${NPM_VERSION}.
@@ -156,9 +194,6 @@ cp "$DIR\mongodb\$mongo_name\bin\mongo.exe" $DIR\mongodb\bin
 rm -Recurse -Force $mongo_zip
 rm -Recurse -Force "$DIR\mongodb\$mongo_name"
 
-rm -Recurse -Force "$py_msi"
-python --version
-
 cd $DIR
 
 # mark the version
@@ -169,8 +204,8 @@ cd "$DIR\.."
 # rename the folder with the devbundle
 cmd /c rename "$DIR" "dev_bundle_${PLATFORM}_${BUNDLE_VERSION}"
 
-& "C:\Program Files*\7-zip\7z.exe" a -ttar dev_bundle.tar "dev_bundle_${PLATFORM}_${BUNDLE_VERSION}"
-& "C:\Program Files*\7-zip\7z.exe" a -tgzip "${CHECKOUT_DIR}\dev_bundle_${PLATFORM}_${BUNDLE_VERSION}.tar.gz" dev_bundle.tar
+& "C:\Program Files\7-zip\7z.exe" a -ttar dev_bundle.tar "dev_bundle_${PLATFORM}_${BUNDLE_VERSION}"
+& "C:\Program Files\7-zip\7z.exe" a -tgzip "${CHECKOUT_DIR}\dev_bundle_${PLATFORM}_${BUNDLE_VERSION}.tar.gz" dev_bundle.tar
 del dev_bundle.tar
 cmd /c rmdir "dev_bundle_${PLATFORM}_${BUNDLE_VERSION}" /s /q
 

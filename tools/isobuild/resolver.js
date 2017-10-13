@@ -64,13 +64,12 @@ export default class Resolver {
     targetArch,
     extensions = [".js", ".json"],
     nodeModulesPaths = [],
-    statOrNull = optimisticStatOrNull,
   }) {
     this.sourceRoot = sourceRoot;
     this.extensions = extensions;
     this.targetArch = targetArch;
     this.nodeModulesPaths = nodeModulesPaths;
-    this.statOrNull = statOrNull;
+    this.statOrNull = optimisticStatOrNull;
 
     this.resolve = wrap((id, absParentPath) => {
       return this._resolve(id, absParentPath);
@@ -177,7 +176,7 @@ export default class Resolver {
       this.extensions.some(ext => {
         const pathWithExt = path + ext;
         const stat = this.statOrNull(pathWithExt);
-        if (stat) {
+        if (stat && ! stat.isDirectory()) {
           return result = { path: pathWithExt, stat };
         }
       });
@@ -286,26 +285,34 @@ export default class Resolver {
       return null;
     }
 
-    let main = pkg.main;
+    // Output a JS module that exports just the "name", "version", "main",
+    // and "browser" properties (if defined) from the package.json file.
+    const pkgSubset = {};
 
-    if (archMatches(this.targetArch, "web") &&
-        isString(pkg.browser)) {
-      main = pkg.browser;
+    if (has(pkg, "name")) {
+      pkgSubset.name = pkg.name;
     }
-
-    // Output a JS module that exports just the "name", "version", and
-    // "main" properties defined in the package.json file.
-    const pkgSubset = {
-      name: pkg.name,
-    };
 
     if (has(pkg, "version")) {
       pkgSubset.version = pkg.version;
     }
 
-    if (isString(main)) {
-      pkgSubset.main = main;
+    let main;
+    function tryMain(name) {
+      const value = pkg[name];
+      if (isString(value)) {
+        main = main || value;
+        pkgSubset[name] = value;
+      }
+    }
 
+    if (archMatches(this.targetArch, "web")) {
+      tryMain("browser");
+    }
+
+    tryMain("main");
+
+    if (isString(main)) {
       // The "main" field of package.json does not have to begin with ./
       // to be considered relative, so first we try simply appending it to
       // the directory path before falling back to a full resolve, which
@@ -313,7 +320,7 @@ export default class Resolver {
       const resolved = this._joinAndStat(dirPath, main) ||
         this._resolve(main, pkgJsonPath, _seenDirPaths);
 
-      if (resolved) {
+      if (resolved && typeof resolved === "object") {
         if (! resolved.packageJsonMap) {
           resolved.packageJsonMap = Object.create(null);
         }

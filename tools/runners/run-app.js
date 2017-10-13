@@ -14,6 +14,7 @@ var release = require('../packaging/release.js');
 import * as cordova from '../cordova';
 import { CordovaBuilder } from '../cordova/builder.js';
 import { closeAllWatchers } from "../fs/safe-watcher.js";
+import { eachline } from "../utils/eachline.js";
 
 // Parse out s as if it were a bash command line.
 var bashParse = function (s) {
@@ -86,13 +87,7 @@ _.extend(AppProcess.prototype, {
     // Start the app!
     self.proc = self._spawn();
 
-    // Send stdout and stderr to the runLog
-    var realEachline = require('eachline');
-    function eachline(stream, encoding, callback) {
-      realEachline(stream, encoding, (...args) => void(callback(...args)));
-    }
-
-    eachline(self.proc.stdout, 'utf8', async function (line) {
+    eachline(self.proc.stdout, function (line) {
       if (line.match(/^LISTENING\s*$/)) {
         // This is the child process telling us that it's ready to receive
         // connections.  (It does this because we told it to with
@@ -104,9 +99,9 @@ _.extend(AppProcess.prototype, {
       }
     });
 
-    eachline(self.proc.stderr, 'utf8', async function (line) {
+    eachline(self.proc.stderr, function (line) {
       if (self.debugPort &&
-          line.indexOf("debugger listening on port ") >= 0) {
+          line.indexOf("Debugger listening on") >= 0) {
         Console.enableProgressDisplay(false);
         return;
       }
@@ -184,12 +179,26 @@ _.extend(AppProcess.prototype, {
     if (self.settings) {
       env.METEOR_SETTINGS = self.settings;
     } else {
+      // Warn the developer that we are not going to use their environment var.
+      if (env.METEOR_SETTINGS) {
+        runLog.log(
+          "WARNING: The 'METEOR_SETTINGS' environment variable is ignored " +
+          "when running in development (as you are doing now).  Instead, use " +
+          "the '--settings settings.json' option to see reactive changes " +
+          "when settings are changed.  For more information, see the " +
+          "documentation for 'Meteor.settings': " +
+          "https://docs.meteor.com/api/core.html#Meteor-settings" +
+          "\n");
+      }
+
+      // To provide a consistent, reactive experience in development, do
+      // not use settings provided via the environment variable.
       delete env.METEOR_SETTINGS;
     }
     if (self.testMetadata) {
       env.TEST_METADATA = JSON.stringify(self.testMetadata);
     } else {
-      delete env.TEST_METADATA; 
+      delete env.TEST_METADATA;
     }
     if (self.listenHost) {
       env.BIND_IP = self.listenHost;

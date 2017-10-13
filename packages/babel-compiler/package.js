@@ -6,15 +6,15 @@ Package.describe({
   // isn't possible because you can't publish a non-recommended
   // release with package versions that don't have a pre-release
   // identifier at the end (eg, -dev)
-  version: '6.13.0-rc.0'
+  version: '6.20.0'
 });
 
 Npm.depends({
-  'meteor-babel': '0.13.0'
+  'meteor-babel': '0.23.1'
 });
 
 Package.onUse(function (api) {
-  api.use('ecmascript-runtime');
+  api.use('ecmascript-runtime', 'server');
 
   api.addFiles([
     'babel.js',

@@ -34,7 +34,7 @@ var compiler = exports;
 // dependencies. (At least for now, packages only used in target creation (eg
 // minifiers) don't require you to update BUILT_BY, though you will need to quit
 // and rerun "meteor run".)
-compiler.BUILT_BY = 'meteor/23';
+compiler.BUILT_BY = 'meteor/29';
 
 // This is a list of all possible architectures that a build can target. (Client
 // is expanded into 'web.browser' and 'web.cordova')
@@ -562,6 +562,13 @@ api.addAssets('${relPath}', 'client').`);
 
     Console.nudge(true);
 
+    if (classification.type === "meteor-ignore") {
+      // Return after watching .meteorignore files but before adding them
+      // as resources to be processed by compiler plugins. To see how
+      // these files are handled, see PackageSource#_findSources.
+      return;
+    }
+
     if (contents === null) {
       // It really sucks to put this check here, since this isn't publish
       // code...
@@ -765,9 +772,12 @@ function runLinters({inputSourceArch, isopackCache, sources,
         classification.type === 'unmatched') {
       return;
     }
-    // We shouldn't ever add a legacy handler and we're not hardcoding JS for
-    // linters, so we should always have SourceProcessor if anything matches.
-    if (! classification.sourceProcessors) {
+
+    // We shouldn't ever add a legacy handler and we're not hardcoding JS
+    // for linters, so we should always have SourceProcessor if anything
+    // matches, unless this is a .meteorignore file.
+    if (classification.type !== "meteor-ignore" &&
+        ! classification.sourceProcessors) {
       throw Error(
         `Unexpected classification for ${ relPath }: ${ classification.type }`);
     }
@@ -776,6 +786,14 @@ function runLinters({inputSourceArch, isopackCache, sources,
     const {hash, contents} = watch.readAndWatchFileWithHash(
       watchSet,
       files.pathResolve(inputSourceArch.sourceRoot, relPath));
+
+    if (classification.type === "meteor-ignore") {
+      // Return after watching .meteorignore files but before adding them
+      // as resources to be processed by compiler plugins. To see how
+      // these files are handled, see PackageSource#_findSources.
+      return;
+    }
+
     const wrappedSource = {
       relPath, contents, hash, fileOptions,
       arch: inputSourceArch.arch,
@@ -973,7 +991,7 @@ export function isIsobuildFeaturePackage(packageName) {
 
 // If you update this data structure to add more feature packages, you should
 // update the wiki page here:
-// https://github.com/meteor/meteor/wiki/Isobuild-Feature-Packages
+// https://docs.meteor.com/api/packagejs.html#isobuild-features
 export const KNOWN_ISOBUILD_FEATURE_PACKAGES = {
   // This package directly calls Plugin.registerCompiler. Package authors
   // must explicitly depend on this feature package to use the API.
@@ -1021,5 +1039,9 @@ export const KNOWN_ISOBUILD_FEATURE_PACKAGES = {
   // One scenario is a package depending on a Cordova plugin or version
   // that is only available on npm, which means downloading the plugin is not
   // supported on versions of Cordova below 5.0.0.
-  'isobuild:cordova': ['5.4.0']
+  'isobuild:cordova': ['5.4.0'],
+
+  // This package requires functionality introduced in meteor-tool@1.5.0
+  // to enable dynamic module fetching via import(...).
+  'isobuild:dynamic-import': ['1.5.0'],
 };

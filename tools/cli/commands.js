@@ -270,7 +270,8 @@ var runCommandOptions = {
     'no-lint': { type: Boolean },
     // Allow the version solver to make breaking changes to the versions
     // of top-level dependencies.
-    'allow-incompatible-update': { type: Boolean }
+    'allow-incompatible-update': { type: Boolean },
+    'extra-packages': { type: String }
   },
   catalogRefresh: new catalog.Refresh.Never()
 };
@@ -289,10 +290,16 @@ function doRunCommand(options) {
   const { parsedServerUrl, parsedMobileServerUrl } =
     parseServerOptionsForRunCommand(options, runTargets);
 
+  var includePackages = [];
+  if (options['extra-packages']) {
+    includePackages = options['extra-packages'].trim().split(/\s*,\s*/);
+  }
+
   var projectContext = new projectContextModule.ProjectContext({
     projectDir: options.appDir,
     allowIncompatibleUpdate: options['allow-incompatible-update'],
-    lintAppAndLocalPackages: !options['no-lint']
+    lintAppAndLocalPackages: !options['no-lint'],
+    includePackages: includePackages,
   });
 
   main.captureAndExit("=> Errors while initializing project:", function () {
@@ -329,7 +336,7 @@ function doRunCommand(options) {
   if (options.production) {
     Console.warn(
       "Warning: The --production flag should only be used to simulate production " +
-      "bundling for testing purposes. Use meteor build to create a bundle for " + 
+      "bundling for testing purposes. Use meteor build to create a bundle for " +
       "production deployment. See: https://guide.meteor.com/deployment.html"
     );
   }
@@ -433,7 +440,9 @@ main.registerCommand({
   options: {
     list: { type: Boolean },
     example: { type: String },
-    package: { type: Boolean }
+    package: { type: Boolean },
+    full: { type: Boolean },
+    bare: { type: Boolean }
   },
   catalogRefresh: new catalog.Refresh.Never()
 }, function (options) {
@@ -576,7 +585,7 @@ main.registerCommand({
 
     Console.info();
     Console.info("To create an example, simply", Console.command("git clone"),
-      "the relevant repository and branch (run", 
+      "the relevant repository and branch (run",
       Console.command("'meteor create --example <name>'"),
       " to see the full command).");
     return 0;
@@ -651,8 +660,8 @@ main.registerCommand({
 
       // We do mind if there are non-hidden directories, because we don't want
       // to recursively check everything to do some crazy heuristic to see if
-      // we should try to creat an app.
-      var stats = files.stat(filePath);
+      // we should try to create an app.
+      var stats = files.stat(files.pathJoin(appPath, filePath));
       if (stats.isDirectory()) {
         // Could contain code
         return true;
@@ -676,7 +685,16 @@ main.registerCommand({
     toIgnore.push(/(\.html|\.js|\.css)/)
   }
 
-  files.cp_r(files.pathJoin(__dirnameConverted, '..', 'static-assets', 'skel'), appPath, {
+  let skelName = 'skel';
+
+  if(options.bare){
+    skelName += '-bare';
+  }
+  else if(options.full){
+    skelName += '-full';
+  }
+
+  files.cp_r(files.pathJoin(__dirnameConverted, '..', 'static-assets', skelName), appPath, {
     transformFilename: function (f) {
       return transform(f);
     },
@@ -733,6 +751,8 @@ main.registerCommand({
   // the packages (or maybe an unpredictable subset based on what happens to be
   // in the template's versions file).
 
+  require("./default-npm-deps.js").install(appPath);
+
   var appNameToDisplay = appPathAsEntered === "." ?
     "current directory" : `'${appPathAsEntered}'`;
 
@@ -764,8 +784,17 @@ main.registerCommand({
   Console.info("");
   Console.info("If you are new to Meteor, try some of the learning resources here:");
   Console.info(
-    Console.url("https://www.meteor.com/learn"),
+    Console.url("https://www.meteor.com/tutorials"),
       Console.options({ indent: 2 }));
+
+  if (!options.full && !options.bare){
+    // Notice people about --bare and --full
+    const bareOptionNotice = 'meteor create --bare to create an empty app.';
+    const fullOptionNotice = 'meteor create --full to create a scaffolded app.';
+
+    Console.info("");
+    Console.info(bareOptionNotice + '\n' + fullOptionNotice);
+  }
 
   Console.info("");
 });
@@ -983,28 +1012,36 @@ ${Console.command("meteor build ../output")}`,
           { title: `building Cordova app for \
 ${cordova.displayNameForPlatform(platform)}` }, () => {
             let buildOptions = { release: !options.debug };
-            
+
             const buildPath = files.pathJoin(
               projectContext.getProjectLocalDirectory('cordova-build'),
               'platforms', platform);
             const platformOutputPath = files.pathJoin(outputPath, platform);
 
+            // Prepare the project once again to ensure that it is up to date
+            // with current build options.  For example, --server=example.com
+            // is utilized in the Cordova builder to write boilerplate HTML and
+            // various config.xml settings (e.g. access policies)
+            if (platform === 'ios') {
+              cordovaProject.prepareForPlatform(platform, buildOptions);
+            } else if (platform === 'android') {
+              cordovaProject.buildForPlatform(platform, buildOptions);
+            }
+
+            // Once prepared, copy the bundle to the final location.
             files.cp_r(buildPath,
               files.pathJoin(platformOutputPath, 'project'));
 
+            // Make some platform-specific adjustments to the resulting build.
             if (platform === 'ios') {
-              cordovaProject.prepareForPlatform(platform, buildOptions);
-
               files.writeFile(
                 files.pathJoin(platformOutputPath, 'README'),
 `This is an auto-generated XCode project for your iOS application.
 
 Instructions for publishing your iOS app to App Store can be found at:
-https://github.com/meteor/meteor/wiki/How-to-submit-your-iOS-app-to-App-Store
+https://guide.meteor.com/mobile.html#submitting-ios
 `, "utf8");
             } else if (platform === 'android') {
-              cordovaProject.buildForPlatform(platform, buildOptions);
-
               const apkPath = files.pathJoin(buildPath, 'build/outputs/apk',
                 options.debug ? 'android-debug.apk' : 'android-release-unsigned.apk')
 
@@ -1018,7 +1055,7 @@ https://github.com/meteor/meteor/wiki/How-to-submit-your-iOS-app-to-App-Store
 `This is an auto-generated Gradle project for your Android application.
 
 Instructions for publishing your Android app to Play Store can be found at:
-https://github.com/meteor/meteor/wiki/How-to-submit-your-Android-app-to-Play-Store
+https://guide.meteor.com/mobile.html#submitting-android
 `, "utf8");
             }
         });
@@ -1208,7 +1245,7 @@ main.registerCommand({
       Console.command("meteor deploy appname"), Console.options({ indent: 2 }));
     return 1;
   }
-  
+
   if (process.env.MONGO_URL) {
     Console.info("As a precaution, meteor reset only clears the local database that is " +
                  "provided by meteor run for development. The database specified with " +
@@ -1273,8 +1310,7 @@ main.registerCommand({
       "Setting passwords on apps is no longer supported. Now there are " +
         "user accounts and your apps are associated with your account so " +
         "that only you (and people you designate) can access them. See the " +
-        Console.command("'meteor claim'") + " and " +
-        Console.command("'meteor authorized'") + " commands.");
+        Console.command("'meteor authorized'") + " command.");
     return 1;
   }
 
@@ -1402,33 +1438,6 @@ main.registerCommand({
 });
 
 ///////////////////////////////////////////////////////////////////////////////
-// claim
-///////////////////////////////////////////////////////////////////////////////
-
-main.registerCommand({
-  name: 'claim',
-  minArgs: 1,
-  maxArgs: 1,
-  catalogRefresh: new catalog.Refresh.Never()
-}, function (options) {
-  auth.pollForRegistrationCompletion();
-  var site = qualifySitename(options.args[0]);
-
-  if (! auth.isLoggedIn()) {
-    Console.error(
-      "You must be logged in to claim sites. Use " +
-      Console.command("'meteor login'") + " to log in. If you don't have a " +
-      "Meteor developer account yet, create one by clicking " +
-      Console.command("'Sign in'") + " and then " +
-      Console.command("'Create account'") + " at www.meteor.com.");
-    Console.error();
-    return 1;
-  }
-
-  return deploy.claim(site);
-});
-
-///////////////////////////////////////////////////////////////////////////////
 // test and test-packages
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -1441,6 +1450,7 @@ testCommandOptions = {
     // XXX COMPAT WITH 0.9.2.2
     'mobile-port': { type: String },
     'debug-port': { type: String },
+    'no-release-check': { type: Boolean },
     deploy: { type: String },
     production: { type: Boolean },
     settings: { type: String, short: 's' },
@@ -1495,7 +1505,9 @@ testCommandOptions = {
     'test-packages': { type: Boolean, 'default': false },
 
     // For 'test-packages': Run in "full app" mode
-    'full-app': { type: Boolean, 'default': false }
+    'full-app': { type: Boolean, 'default': false },
+
+    'extra-packages': { type: String }
   }
 };
 
@@ -1539,8 +1551,31 @@ function doTestCommand(options) {
   // cleaned up on process exit. Using a temporary app dir means that we can
   // run multiple "test-packages" commands in parallel without them stomping
   // on each other.
-  var testRunnerAppDir =
-        options['test-app-path'] || files.mkdtemp('meteor-test-run');
+  let testRunnerAppDir;
+  const testAppPath = options['test-app-path'];
+  if (testAppPath) {
+    try {
+      if (files.mkdir_p(testAppPath, 0o700)) {
+        testRunnerAppDir = testAppPath;
+      } else {
+        Console.error(
+          'The specified --test-app-path directory could not be used, as ' +
+          `"${testAppPath}" already exists and it is not a directory.`
+        );
+        return 1;
+      }
+    } catch (error) {
+      Console.error(
+        'Unable to create the specified --test-app-path directory of ' +
+        `"${testAppPath}".`
+      );
+      throw error;
+    }
+  }
+
+  if (!testRunnerAppDir) {
+    testRunnerAppDir = files.mkdtemp('meteor-test-run');
+  }
 
   // Download packages for our architecture, and for the deploy server's
   // architecture if we're deploying.
@@ -1553,10 +1588,16 @@ function doTestCommand(options) {
     runLog.setRawLogs(true);
   }
 
+  var includePackages = [];
+  if (options['extra-packages']) {
+    includePackages = options['extra-packages'].trim().split(/\s*,\s*/);
+  }
+
   var projectContextOptions = {
     serverArchitectures: serverArchitectures,
     allowIncompatibleUpdate: options['allow-incompatible-update'],
-    lintAppAndLocalPackages: !options['no-lint']
+    lintAppAndLocalPackages: !options['no-lint'],
+    includePackages: includePackages
   };
   var projectContext;
 
@@ -1564,6 +1605,23 @@ function doTestCommand(options) {
     global.testCommandMetadata.driverPackage = options['driver-package'] || 'test-in-browser';
     projectContextOptions.projectDir = testRunnerAppDir;
     projectContextOptions.projectDirForLocalPackages = options.appDir;
+
+    try {
+      require("./default-npm-deps.js").install(testRunnerAppDir);
+    } catch (error) {
+      if (error.code === 'EACCES' && options['test-app-path']) {
+        Console.error(
+          'The specified --test-app-path directory of ' +
+          `"${testRunnerAppDir}" exists, but the current user does not have ` +
+          `read/write permission in it.`
+        );
+      }
+      throw error;
+    }
+
+    if (buildmessage.jobHasMessages()) {
+      return;
+    }
 
     // Find any packages mentioned by a path instead of a package name. We will
     // load them explicitly into the catalog.
@@ -1639,7 +1697,7 @@ function doTestCommand(options) {
 
     global.testCommandMetadata.isAppTest = options['full-app'];
     global.testCommandMetadata.isTest = !global.testCommandMetadata.isAppTest;
-    
+
     projectContextOptions.projectDir = options.appDir;
     projectContextOptions.projectLocalDir = files.pathJoin(testRunnerAppDir, '.meteor', 'local');
 
@@ -1669,7 +1727,7 @@ function doTestCommand(options) {
     copyDirIntoTestRunnerApp(true, '.meteor', 'local', 'isopacks');
     copyDirIntoTestRunnerApp(true, '.meteor', 'local', 'plugin-cache');
     copyDirIntoTestRunnerApp(true, '.meteor', 'local', 'shell');
-    
+
     projectContext = new projectContextModule.ProjectContext(projectContextOptions);
 
     main.captureAndExit("=> Errors while setting up tests:", function () {
@@ -1771,7 +1829,7 @@ var runTestAppForPackages = function (projectContext, options) {
     minifyMode: options.production ? 'production' : 'development'
   };
   buildOptions.buildMode = "test";
-  
+
   if (options.deploy) {
     // Run the constraint solver and build local packages.
     main.captureAndExit("=> Errors while initializing project:", function () {
@@ -2056,6 +2114,7 @@ main.registerCommand({
     'without-tag': { type: String },
     // Only run tests with this tag
     'with-tag': { type: String },
+    junit: { type: String },
   },
   hidden: true,
   catalogRefresh: new catalog.Refresh.Never()
@@ -2152,6 +2211,7 @@ main.registerCommand({
     // other options
     historyLines: options.history,
     clients: clients,
+    junit: options.junit && files.pathResolve(options.junit),
     'without-tag': options['without-tag'],
     'with-tag': options['with-tag']
   });

@@ -8,7 +8,7 @@ var catalogLocal = require('./packaging/catalog/catalog-local.js');
 var Console = require('./console/console.js').Console;
 var files = require('./fs/files.js');
 var isopackCacheModule = require('./isobuild/isopack-cache.js');
-var isopackets = require('./tool-env/isopackets.js');
+import { loadIsopackage } from './tool-env/isopackets.js';
 var packageMapModule = require('./packaging/package-map.js');
 var release = require('./packaging/release.js');
 var tropohouse = require('./packaging/tropohouse.js');
@@ -67,6 +67,8 @@ _.extend(ProjectContext.prototype, {
 
     self.projectDir = options.projectDir;
     self.tropohouse = options.tropohouse || tropohouse.default;
+
+    self._includePackages = options.includePackages;
 
     self._packageMapFilename = options.packageMapFilename ||
       files.pathJoin(self.projectDir, '.meteor', 'versions');
@@ -140,6 +142,21 @@ _.extend(ProjectContext.prototype, {
     // a web.cordova slice (because we aren't yet smart enough to just default
     // to using the web.browser slice instead or make a common 'web' slice).
     self._forceIncludeCordovaUnibuild = options.forceIncludeCordovaUnibuild;
+
+    // If explicitly specified as null, use no release for constraints.
+    // If specified non-null, should be a release version catalog record.
+    // If not specified, defaults to release.current.
+    //
+    // Note that NONE of these cases are "use the release from
+    // self.releaseFile"; after all, if you are explicitly running `meteor
+    // --release foo` it will override what is found in .meteor/releases.
+    if (_.has(options, 'releaseForConstraints')) {
+      self._releaseForConstraints = options.releaseForConstraints || null;
+    } else if (release.current.isCheckout()) {
+      self._releaseForConstraints = null;
+    } else {
+      self._releaseForConstraints = release.current.getCatalogReleaseData();
+    }
 
     if (resetOptions.preservePackageMap && self.packageMap) {
       self._cachedVersionsBeforeReset = self.packageMap.toVersionMap();
@@ -307,7 +324,8 @@ _.extend(ProjectContext.prototype, {
 
       // Read .meteor/packages.
       self.projectConstraintsFile = new exports.ProjectConstraintsFile({
-        projectDir: self.projectDir
+        projectDir: self.projectDir,
+        includePackages: self._includePackages
       });
       if (buildmessage.jobHasMessages())
         return;
@@ -633,7 +651,11 @@ _.extend(ProjectContext.prototype, {
         files.pathJoin(files.getCurrentToolsDir(), 'packages');
 
       searchDirs.push(
+        // Include packages like packages/ecmascript.
         packagesDir,
+        // Include packages like packages/non-core/coffeescript.
+        files.pathJoin(packagesDir, "non-core"),
+        // Include packages like packages/non-core/blaze/packages/blaze.
         files.pathJoin(packagesDir, "non-core", "*", "packages"),
       );
     }
@@ -691,6 +713,7 @@ _.extend(ProjectContext.prototype, {
 
     self._addAppConstraints(depsAndConstraints);
     self._addLocalPackageConstraints(depsAndConstraints);
+    self._addReleaseConstraints(depsAndConstraints);
     return depsAndConstraints;
   },
 
@@ -713,6 +736,23 @@ _.extend(ProjectContext.prototype, {
         packageName + "@=" + versionRecord.version);
       // Add a constraint ("this is the only version available") but no
       // dependency (we don't automatically use all local packages!)
+      depsAndConstraints.constraints.push(constraint);
+    });
+  },
+
+  _addReleaseConstraints: function (depsAndConstraints) {
+    var self = this;
+    if (! self._releaseForConstraints)
+      return;
+    _.each(self._releaseForConstraints.packages, function (version, packageName) {
+      var constraint = utils.parsePackageConstraint(
+        // Note that this used to be an exact name@=version constraint,
+        // before #7084 eliminated these constraints completely. They
+        // were reinstated in Meteor 1.4.3 as name@version constraints,
+        // and further refined to name@~version constraints in 1.5.2.
+        packageName + "@~" + version);
+      // Add a constraint but no dependency (we don't automatically use
+      // all local packages!):
       depsAndConstraints.constraints.push(constraint);
     });
   },
@@ -749,20 +789,15 @@ _.extend(ProjectContext.prototype, {
   },
 
   _buildResolver: function () {
-    var self = this;
+    const { ConstraintSolver } = loadIsopackage('constraint-solver');
 
-    var constraintSolverPackage =
-          isopackets.load('constraint-solver')['constraint-solver'];
-    var resolver =
-          new constraintSolverPackage.ConstraintSolver.PackagesResolver(
-            self.projectCatalog, {
-              nudge: function () {
-                Console.nudge(true);
-              },
-              Profile: Profile,
-              resultCache: self._resolverResultCache
-            });
-    return resolver;
+    return new ConstraintSolver.PackagesResolver(this.projectCatalog, {
+      nudge() {
+        Console.nudge(true);
+      },
+      Profile: Profile,
+      resultCache: this._resolverResultCache
+    });
   },
 
   _downloadMissingPackages: Profile('_downloadMissingPackages', function () {
@@ -842,6 +877,9 @@ exports.ProjectConstraintsFile = function (options) {
   self.filename = files.pathJoin(options.projectDir, '.meteor', 'packages');
   self.watchSet = null;
 
+  // List of packages that should be included if not provided in .meteor/packages
+  self._includePackages = options.includePackages || [];
+
   // Have we modified the in-memory representation since reading from disk?
   self._modified = null;
   // List of each line in the file; object with keys:
@@ -871,6 +909,15 @@ _.extend(exports.ProjectConstraintsFile.prototype, {
     // fixed by _ensureProjectDir!)
     if (contents === null)
       throw Error("packages file missing: " + self.filename);
+
+    var extraConstraintMap = {};
+    _.each(self._includePackages, function (pkg) {
+      var lineRecord = {
+        constraint: utils.parsePackageConstraint(pkg.trim()),
+        skipOnWrite: true
+      };
+      extraConstraintMap[lineRecord.constraint.package] = lineRecord;
+    });
 
     var lines = files.splitBufferToLines(contents);
     // Don't keep a record for the space at the end of the file.
@@ -907,6 +954,10 @@ _.extend(exports.ProjectConstraintsFile.prototype, {
       if (! lineRecord.constraint)
         return;  // recover by ignoring
 
+      // Mark as not iterable if already included in self._includePackages
+      if (_.has(extraConstraintMap, lineRecord.constraint.package))
+        lineRecord.skipOnRead = true;
+
       if (_.has(self._constraintMap, lineRecord.constraint.package)) {
         buildmessage.error(
           "Package name appears twice: " + lineRecord.constraint.package, {
@@ -915,6 +966,12 @@ _.extend(exports.ProjectConstraintsFile.prototype, {
           });
         return;  // recover by ignoring
       }
+      self._constraintMap[lineRecord.constraint.package] = lineRecord;
+    });
+
+    _.each(_.keys(extraConstraintMap), function (key) {
+      var lineRecord = extraConstraintMap[key];
+      self._constraintLines.push(lineRecord);
       self._constraintMap[lineRecord.constraint.package] = lineRecord;
     });
   },
@@ -927,6 +984,9 @@ _.extend(exports.ProjectConstraintsFile.prototype, {
   _write: function () {
     var self = this;
     var lines = _.map(self._constraintLines, function (lineRecord) {
+      // Don't write packages that were not loaded from .meteor/packages
+      if (lineRecord.skipOnWrite)
+        return;
       var lineParts = [lineRecord.leadingSpace];
       if (lineRecord.constraint) {
         lineParts.push(lineRecord.constraint.package);
@@ -953,7 +1013,7 @@ _.extend(exports.ProjectConstraintsFile.prototype, {
   eachConstraint: function (iterator) {
     var self = this;
     _.each(self._constraintLines, function (lineRecord) {
-      if (lineRecord.constraint)
+      if (! lineRecord.skipOnRead && lineRecord.constraint)
         iterator(lineRecord.constraint);
     });
   },

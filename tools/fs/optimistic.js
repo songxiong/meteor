@@ -5,11 +5,14 @@ import { watch } from "./safe-watcher.js";
 import { sha1 } from "./watch.js";
 import {
   pathSep,
+  pathDirname,
   pathIsAbsolute,
+  pathJoin,
   statOrNull,
   lstat,
   readFile,
   readdir,
+  dependOnPath,
 } from "./files.js";
 
 // When in doubt, the optimistic caching system can be completely disabled
@@ -17,13 +20,10 @@ import {
 const ENABLED = ! process.env.METEOR_DISABLE_OPTIMISTIC_CACHING;
 
 function makeOptimistic(name, fn) {
-  const wrapper = wrap(function (...args) {
-    const packageName = getNpmPackageName(args[0]);
-    if (packageName) {
-      dependOnNpmPackage(packageName);
-    }
+  const wrapper = wrap(ENABLED ? function (...args) {
+    maybeDependOnPath(args[0]);
     return fn.apply(this, args);
-  }, {
+  } : fn, {
     makeCacheKey(...args) {
       if (! ENABLED) {
         // Cache nothing when the optimistic caching system is disabled.
@@ -54,18 +54,16 @@ function makeOptimistic(name, fn) {
 
     subscribe(...args) {
       const path = args[0];
-      assert.ok(pathIsAbsolute(path));
 
-      // Only start watchers for files not in node_modules directories.
-      // This means caching the result until the server is restarted, or
-      // until we call dirtyNpmPackageBy{Path,Name} explicitly, but that's
-      // better than wasting thousands of watchers on rarely-changing
-      // node_modules files.
-      if (getNpmPackageName(path)) {
+      if (! shouldWatch(path)) {
         return;
       }
 
-      var watcher = watch(path, () => wrapper.dirty(...args));
+      assert.ok(pathIsAbsolute(path));
+
+      let watcher = watch(path, () => {
+        wrapper.dirty(...args);
+      });
 
       return () => {
         if (watcher) {
@@ -79,56 +77,144 @@ function makeOptimistic(name, fn) {
   return Profile("optimistic " + name, wrapper);
 }
 
-// Return the name of the subdirectory just after the last node_modules
-// directory in the given path, if possible; else return undefined.
-function getNpmPackageName(path) {
-  if (typeof path === "string") {
-    const parts = path.split(pathSep);
+export const shouldWatch = wrap(path => {
+  const parts = path.split(pathSep);
+  const nmi = parts.indexOf("node_modules");
 
-    // In case the path ends with node_modules, look for the previous
-    // node_modules directory.
-    const lastAcceptableIndex = parts.length - 2;
-    const index = parts.lastIndexOf("node_modules", lastAcceptableIndex);
+  if (nmi < 0) {
+    // Watch everything not in a node_modules directory.
+    return true;
+  }
 
-    if (index >= 0) {
-      return parts[index + 1] || void 0;
+  if (nmi < parts.length - 1) {
+    const nmi2 = parts.indexOf("node_modules", nmi + 1);
+    if (nmi2 > nmi) {
+      // If this path is nested inside more than one node_modules
+      // directory, then it isn't part of a linked npm package, so we
+      // should not watch it.
+      return false;
     }
+
+    const packageDirParts = parts.slice(0, nmi + 2);
+
+    if (parts[nmi + 1].startsWith("@")) {
+      // For linked @scoped npm packages, the symlink is nested inside the
+      // @scoped directory (which is a child of node_modules).
+      packageDirParts.push(parts[nmi + 2]);
+    }
+
+    const packageDir = packageDirParts.join(pathSep);
+    if (optimisticIsSymbolicLink(packageDir)) {
+      // If this path is in a linked npm package, then it might be under
+      // active development, so we should watch it.
+      return true;
+    }
+  }
+
+  // Starting a watcher for every single file contained within a
+  // node_modules directory would be prohibitively expensive, so
+  // instead we rely on dependOnNodeModules to tell us when files in
+  // node_modules directories might have changed.
+  return false;
+});
+
+function maybeDependOnPath(path) {
+  if (typeof path === "string") {
+    dependOnPath(path);
+    maybeDependOnNodeModules(path);
   }
 }
 
-// See comment in dependOnNpmPackage.
-let npmDepCount = 0;
+function maybeDependOnNodeModules(path) {
+  if (typeof path !== "string") {
+    return;
+  }
+
+  const parts = path.split(pathSep);
+
+  while (true) {
+    const index = parts.lastIndexOf("node_modules");
+    if (index < 0) {
+      return;
+    }
+
+    parts.length = index + 1;
+    dependOnNodeModules(parts.join(pathSep));
+    assert.strictEqual(parts.pop(), "node_modules");
+  }
+}
+
+let dependOnDirectorySalt = 0;
+
+const dependOnDirectory = wrap(dir => {
+  // Always return something different to prevent optimism from
+  // second-guessing the dirtiness of this function.
+  return ++dependOnDirectorySalt;
+}, {
+  subscribe(dir) {
+    let watcher = watch(
+      dir,
+      () => dependOnDirectory.dirty(dir),
+    );
+
+    return function () {
+      if (watcher) {
+        watcher.close();
+        watcher = null;
+      }
+    };
+  }
+});
+
+// Called when an optimistic function detects the given file does not
+// exist, but needs to return null or false rather than throwing an
+// exception. When/if the file is eventually created, we might only get a
+// file change notification for the parent directory, so it's important to
+// depend on the parent directory using this function, so that we don't
+// cache the unsuccessful result forever.
+function dependOnParentDirectory(path) {
+  const parentDir = pathDirname(path);
+  if (parentDir !== path) {
+    dependOnDirectory(parentDir);
+  }
+}
 
 // Called by any optimistic function that receives a */node_modules/* path
 // as its first argument, so that we can later bulk-invalidate the results
-// of those calls when/if the package (or, more precisely, any package of
-// the same name) changes.
-const dependOnNpmPackage = wrap(packageName => {
-  // Always return something different to prevent optimism from
-  // second-guessing the dirtiness of this function.
-  return ++npmDepCount;
+// of those calls if the contents of the node_modules directory change.
+// Note that this strategy will not detect changes within subdirectories
+// of this node_modules directory, but that's ok because the use case we
+// care about is adding or removing npm packages.
+const dependOnNodeModules = wrap(nodeModulesDir => {
+  assert(pathIsAbsolute(nodeModulesDir));
+  assert(nodeModulesDir.endsWith(pathSep + "node_modules"));
+  return dependOnDirectory(nodeModulesDir);
 });
 
-// Invalidate all optimistic results derived from paths involving npm
-// packages with the given packageName. If there are multiple copies of
-// the package installed, they all get invalidated, because that's a small
-// price to pay for the comfort of not having to keep the copies straight
-// as they get copied around, deleted, et cetera.
-export function dirtyNpmPackageByName(packageName) {
-  dependOnNpmPackage.dirty(packageName);
+// Invalidate all optimistic results derived from paths involving the
+// given node_modules directory.
+export function dirtyNodeModulesDirectory(nodeModulesDir) {
+  dependOnNodeModules.dirty(nodeModulesDir);
 }
 
-// Invalidate all optimistic results derived from paths involving an npm
-// package whose name equals getNpmPackageName(path).
-export function dirtyNpmPackageByPath(path) {
-  const packageName = getNpmPackageName(path);
-  if (packageName) {
-    dirtyNpmPackageByName(packageName);
+export const optimisticStatOrNull = makeOptimistic("statOrNull", path => {
+  const result = statOrNull(path);
+  if (result === null) {
+    dependOnParentDirectory(path);
   }
-}
+  return result;
+});
 
-export const optimisticStatOrNull = makeOptimistic("statOrNull", statOrNull);
 export const optimisticLStat = makeOptimistic("lstat", lstat);
+export const optimisticLStatOrNull = makeOptimistic("lstatOrNull", path => {
+  try {
+    return optimisticLStat(path);
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+    dependOnParentDirectory(path);
+    return null;
+  }
+});
 export const optimisticReadFile = makeOptimistic("readFile", readFile);
 export const optimisticReaddir = makeOptimistic("readdir", readdir);
 export const optimisticHashOrNull = makeOptimistic("hashOrNull", (...args) => {
@@ -142,18 +228,64 @@ export const optimisticHashOrNull = makeOptimistic("hashOrNull", (...args) => {
     }
   }
 
+  dependOnParentDirectory(args[0]);
+
   return null;
 });
 
 export const optimisticReadJsonOrNull =
-makeOptimistic("readJsonOrNull", (...args) => {
+makeOptimistic("readJsonOrNull", (path, options) => {
   try {
-    return JSON.parse(optimisticReadFile(...args));
+    return JSON.parse(optimisticReadFile(path, options));
+
   } catch (e) {
-    if (! (e instanceof SyntaxError ||
-           e.code === "ENOENT")) {
-      throw e;
+    if (e.code === "ENOENT") {
+      dependOnParentDirectory(path);
+      return null;
     }
+
+    if (e instanceof SyntaxError &&
+        options && options.allowSyntaxError) {
+      return null;
+    }
+
+    throw e;
   }
+});
+
+export const optimisticReadMeteorIgnore = wrap(dir => {
+  const meteorIgnorePath = pathJoin(dir, ".meteorignore");
+  const meteorIgnoreStat = optimisticStatOrNull(meteorIgnorePath);
+
+  if (meteorIgnoreStat &&
+      meteorIgnoreStat.isFile()) {
+    return require("ignore")().add(
+      optimisticReadFile(meteorIgnorePath, "utf8")
+    );
+  }
+
   return null;
+});
+
+const optimisticIsSymbolicLink = wrap(path => {
+  try {
+    return lstat(path).isSymbolicLink();
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+    dependOnParentDirectory(path);
+    return false;
+  }
+}, {
+  subscribe(path) {
+    let watcher = watch(path, () => {
+      optimisticIsSymbolicLink.dirty(path);
+    });
+
+    return function () {
+      if (watcher) {
+        watcher.close();
+        watcher = null;
+      }
+    };
+  }
 });

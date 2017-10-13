@@ -13,6 +13,14 @@ var assert = require("assert");
 // after bootup (since they block all concurrency!)
 var files = module.exports;
 
+// Detect that we are on a Windows-like Filesystem, such as that in a WSL
+// (Windows Subsystem for Linux) even if it otherwise looks like we're on Unix.
+// https://github.com/Microsoft/BashOnWindows/issues/423#issuecomment-221627364
+var isWindowsLikeFilesystem = function () {
+  return process.platform === "win32" ||
+    (os.release().indexOf("Microsoft") > -1);
+};
+
 var toPosixPath = function (p, partialPath) {
   // Sometimes, you can have a path like \Users\IEUser on windows, and this
   // actually means you want C:\Users\IEUser
@@ -69,6 +77,11 @@ var convertToStandardLineEndings = function (fileContents) {
                      .replace(new RegExp("\r", "g"), "\n");
 };
 
+// Return the Unicode Normalization Form of the passed in path string, using
+// "Normalization Form Canonical Composition"
+const unicodeNormalizePath = (path) => {
+  return (path) ? path.normalize('NFC') : path;
+};
 
 // wrappings for path functions that always run as they were on unix (using
 // forward slashes)
@@ -110,6 +123,8 @@ files.pathSep = '/';
 files.pathDelimiter = ':';
 files.pathOsDelimiter = path.delimiter;
 
+files.isWindowsLikeFilesystem = isWindowsLikeFilesystem;
+
 files.convertToStandardPath = convertToStandardPath;
 files.convertToOSPath = convertToOSPath;
 files.convertToWindowsPath = toDosPath;
@@ -117,3 +132,4 @@ files.convertToPosixPath = toPosixPath;
 
 files.convertToStandardLineEndings = convertToStandardLineEndings;
 files.convertToOSLineEndings = convertToOSLineEndings;
+files.unicodeNormalizePath = unicodeNormalizePath;

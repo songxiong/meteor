@@ -1,25 +1,26 @@
-////////// Requires //////////
-
-var fs = Npm.require("fs");
-var http = Npm.require("http");
-var os = Npm.require("os");
-var path = Npm.require("path");
-var url = Npm.require("url");
-var crypto = Npm.require("crypto");
-
-var connect = Npm.require('connect');
-var parseurl = Npm.require('parseurl');
-var useragent = Npm.require('useragent');
-var send = Npm.require('send');
-
-var Future = Npm.require('fibers/future');
-var Fiber = Npm.require('fibers');
+import assert from "assert";
+import { readFile } from "fs";
+import { createServer } from "http";
+import {
+  join as pathJoin,
+  dirname as pathDirname,
+} from "path";
+import { parse as parseUrl } from "url";
+import { createHash } from "crypto";
+import connect from "connect";
+import parseRequest from "parseurl";
+import { lookup as lookupUserAgent } from "useragent";
+import send from "send";
+import {
+  removeExistingSocketFile,
+  registerSocketFileCleanup,
+} from './socket_file.js';
 
 var SHORT_SOCKET_TIMEOUT = 5*1000;
 var LONG_SOCKET_TIMEOUT = 120*1000;
 
-WebApp = {};
-WebAppInternals = {};
+export const WebApp = {};
+export const WebAppInternals = {};
 
 WebAppInternals.NpmModules = {
   connect: {
@@ -43,13 +44,13 @@ var bundledJsCssUrlRewriteHook = function (url) {
 };
 
 var sha1 = function (contents) {
-  var hash = crypto.createHash('sha1');
+  var hash = createHash('sha1');
   hash.update(contents);
   return hash.digest('hex');
 };
 
 var readUtf8FileSync = function (filename) {
-  return Meteor.wrapAsync(fs.readFile)(filename, 'utf8');
+  return Meteor.wrapAsync(readFile)(filename, 'utf8');
 };
 
 // #BrowserIdentification
@@ -98,7 +99,7 @@ var camelCase = function (name) {
 };
 
 var identifyBrowser = function (userAgentString) {
-  var userAgent = useragent.lookup(userAgentString);
+  var userAgent = lookupUserAgent(userAgentString);
   return {
     name: camelCase(userAgent.family),
     major: +userAgent.major,
@@ -113,7 +114,7 @@ WebAppInternals.identifyBrowser = identifyBrowser;
 WebApp.categorizeRequest = function (req) {
   return _.extend({
     browser: identifyBrowser(req.headers['user-agent']),
-    url: url.parse(req.url, true)
+    url: parseUrl(req.url, true)
   }, _.pick(req, 'dynamicHead', 'dynamicBody'));
 };
 
@@ -241,44 +242,93 @@ WebApp._timeoutAdjustmentRequestCallback = function (req, res) {
 //   - baseData: XXX
 var boilerplateByArch = {};
 
+// Register a callback function that can selectively modify boilerplate
+// data given arguments (request, data, arch). The key should be a unique
+// identifier, to prevent accumulating duplicate callbacks from the same
+// call site over time. Callbacks will be called in the order they were
+// registered. A callback should return false if it did not make any
+// changes affecting the boilerplate. Passing null deletes the callback.
+// Any previous callback registered for this key will be returned.
+const boilerplateDataCallbacks = Object.create(null);
+WebAppInternals.registerBoilerplateDataCallback = function (key, callback) {
+  const previousCallback = boilerplateDataCallbacks[key];
+
+  if (typeof callback === "function") {
+    boilerplateDataCallbacks[key] = callback;
+  } else {
+    assert.strictEqual(callback, null);
+    delete boilerplateDataCallbacks[key];
+  }
+
+  // Return the previous callback in case the new callback needs to call
+  // it; for example, when the new callback is a wrapper for the old.
+  return previousCallback || null;
+};
+
 // Given a request (as returned from `categorizeRequest`), return the
 // boilerplate HTML to serve for that request.
 //
 // If a previous connect middleware has rendered content for the head or body,
 // returns the boilerplate with that content patched in otherwise
-// memoizes on HTML attributes (used by, eg, appcache) and whether inline 
+// memoizes on HTML attributes (used by, eg, appcache) and whether inline
 // scripts are currently allowed.
 // XXX so far this function is always called with arch === 'web.browser'
 var memoizedBoilerplate = {};
-var getBoilerplate = function (request, arch) {
-  var useMemoized = ! (request.dynamicHead || request.dynamicBody);
-  var htmlAttributes = getHtmlAttributes(request);
-  
-  if (useMemoized) {
-    // The only thing that changes from request to request (unless extra 
-    // content is added to the head or body) are the HTML attributes 
-    // (used by, eg, appcache) and whether inline scripts are allowed, so we 
-    // can memoize based on that.
+
+function getBoilerplate(request, arch) {
+  return getBoilerplateAsync(request, arch).await();
+}
+
+function getBoilerplateAsync(request, arch) {
+  const boilerplate = boilerplateByArch[arch];
+  const data = Object.assign({}, boilerplate.baseData, {
+    htmlAttributes: getHtmlAttributes(request),
+  }, _.pick(request, "dynamicHead", "dynamicBody"));
+
+  let madeChanges = false;
+  let promise = Promise.resolve();
+
+  Object.keys(boilerplateDataCallbacks).forEach(key => {
+    promise = promise.then(() => {
+      const callback = boilerplateDataCallbacks[key];
+      return callback(request, data, arch);
+    }).then(result => {
+      // Callbacks should return false if they did not make any changes.
+      if (result !== false) {
+        madeChanges = true;
+      }
+    });
+  });
+
+  return promise.then(() => {
+    const useMemoized = ! (
+      data.dynamicHead ||
+      data.dynamicBody ||
+      madeChanges
+    );
+
+    if (! useMemoized) {
+      return boilerplate.toHTML(data);
+    }
+
+    // The only thing that changes from request to request (unless extra
+    // content is added to the head or body, or boilerplateDataCallbacks
+    // modified the data) are the HTML attributes (used by, eg, appcache)
+    // and whether inline scripts are allowed, so memoize based on that.
     var memHash = JSON.stringify({
-      inlineScriptsAllowed: inlineScriptsAllowed,
-      htmlAttributes: htmlAttributes,
-      arch: arch
+      inlineScriptsAllowed,
+      htmlAttributes: data.htmlAttributes,
+      arch,
     });
 
     if (! memoizedBoilerplate[memHash]) {
-      memoizedBoilerplate[memHash] = boilerplateByArch[arch].toHTML({
-        htmlAttributes: htmlAttributes
-      });
+      memoizedBoilerplate[memHash] =
+        boilerplateByArch[arch].toHTML(data);
     }
+
     return memoizedBoilerplate[memHash];
-  }
-  
-  var boilerplateOptions = _.extend({ 
-    htmlAttributes: htmlAttributes 
-  }, _.pick(request, 'dynamicHead', 'dynamicBody'));
-  
-  return boilerplateByArch[arch].toHTML(boilerplateOptions);
-};
+  });
+}
 
 WebAppInternals.generateBoilerplateInstance = function (arch,
                                                         manifest,
@@ -292,7 +342,7 @@ WebAppInternals.generateBoilerplateInstance = function (arch,
   return new Boilerplate(arch, manifest,
     _.extend({
       pathMapper: function (itemPath) {
-        return path.join(archPath[arch], itemPath); },
+        return pathJoin(archPath[arch], itemPath); },
       baseDataExtension: {
         additionalStaticJs: _.map(
           additionalStaticJs || [],
@@ -338,7 +388,7 @@ WebAppInternals.staticFilesMiddleware = function (staticFiles, req, res, next) {
     next();
     return;
   }
-  var pathname = parseurl(req).pathname;
+  var pathname = parseRequest(req).pathname;
   try {
     pathname = decodeURIComponent(pathname);
   } catch (e) {
@@ -395,7 +445,8 @@ WebAppInternals.staticFilesMiddleware = function (staticFiles, req, res, next) {
                   info.sourceMapUrl);
   }
 
-  if (info.type === "js") {
+  if (info.type === "js" ||
+      info.type === "dynamic js") {
     res.setHeader("Content-Type", "application/javascript; charset=UTF-8");
   } else if (info.type === "css") {
     res.setHeader("Content-Type", "text/css; charset=UTF-8");
@@ -439,21 +490,26 @@ var getUrlPrefixForArch = function (arch) {
     '' : '/' + '__' + arch.replace(/^web\./, '');
 };
 
-// parse port to see if its a Windows Server style named pipe. If so, return as-is (String), otherwise return as Int
-WebAppInternals.parsePort = function (port) {
-  if( /\\\\?.+\\pipe\\?.+/.test(port) ) {
-    return port;
+// Parse the passed in port value. Return the port as-is if it's a String
+// (e.g. a Windows Server style named pipe), otherwise return the port as an
+// integer.
+//
+// DEPRECATED: Direct use of this function is not recommended; it is no
+// longer used internally, and will be removed in a future release.
+WebAppInternals.parsePort = port => {
+  let parsedPort = parseInt(port);
+  if (Number.isNaN(parsedPort)) {
+    parsedPort = port;
   }
+  return parsedPort;
+}
 
-  return parseInt(port);
-};
-
-var runWebAppServer = function () {
+function runWebAppServer() {
   var shuttingDown = false;
   var syncQueue = new Meteor._SynchronousQueue();
 
   var getItemPathname = function (itemUrl) {
-    return decodeURIComponent(url.parse(itemUrl).pathname);
+    return decodeURIComponent(parseUrl(itemUrl).pathname);
   };
 
   WebAppInternals.reloadClientPrograms = function () {
@@ -461,9 +517,9 @@ var runWebAppServer = function () {
       staticFiles = {};
       var generateClientProgram = function (clientPath, arch) {
         // read the control for the client we'll be serving up
-        var clientJsonPath = path.join(__meteor_bootstrap__.serverDir,
+        var clientJsonPath = pathJoin(__meteor_bootstrap__.serverDir,
                                    clientPath);
-        var clientDir = path.dirname(clientJsonPath);
+        var clientDir = pathDirname(clientJsonPath);
         var clientJson = JSON.parse(readUtf8FileSync(clientJsonPath));
         if (clientJson.format !== "web-program-pre1")
           throw new Error("Unsupported format for client assets: " +
@@ -478,7 +534,7 @@ var runWebAppServer = function () {
         _.each(manifest, function (item) {
           if (item.url && item.where === "client") {
             staticFiles[urlPrefix + getItemPathname(item.url)] = {
-              absolutePath: path.join(clientDir, item.path),
+              absolutePath: pathJoin(clientDir, item.path),
               cacheable: item.cacheable,
               hash: item.hash,
               // Link from source to its map
@@ -490,7 +546,7 @@ var runWebAppServer = function () {
               // Serve the source map too, under the specified URL. We assume all
               // source maps are cacheable.
               staticFiles[urlPrefix + getItemPathname(item.sourceMapUrl)] = {
-                absolutePath: path.join(clientDir, item.sourceMap),
+                absolutePath: pathJoin(clientDir, item.sourceMap),
                 cacheable: true
               };
             }
@@ -500,8 +556,12 @@ var runWebAppServer = function () {
         var program = {
           format: "web-program-pre1",
           manifest: manifest,
-          version: WebAppHashing.calculateClientHash(manifest, null, _.pick(
-            __meteor_runtime_config__, 'PUBLIC_SETTINGS')),
+          version: process.env.AUTOUPDATE_VERSION ||
+            WebAppHashing.calculateClientHash(
+              manifest,
+              null,
+              _.pick(__meteor_runtime_config__, "PUBLIC_SETTINGS")
+            ),
           cordovaCompatibilityVersions: clientJson.cordovaCompatibilityVersions,
           PUBLIC_SETTINGS: __meteor_runtime_config__.PUBLIC_SETTINGS
         };
@@ -521,7 +581,7 @@ var runWebAppServer = function () {
       try {
         var clientPaths = __meteor_bootstrap__.configJson.clientPaths;
         _.each(clientPaths, function (clientPath, arch) {
-          archPath[arch] = path.dirname(clientPath);
+          archPath[arch] = pathDirname(clientPath);
           generateClientProgram(clientPath, arch);
         });
 
@@ -638,9 +698,9 @@ var runWebAppServer = function () {
   // Serve static files from the manifest.
   // This is inspired by the 'static' middleware.
   app.use(function (req, res, next) {
-    Fiber(function () {
-     WebAppInternals.staticFilesMiddleware(staticFiles, req, res, next);
-    }).run();
+    Promise.resolve().then(() => {
+      WebAppInternals.staticFilesMiddleware(staticFiles, req, res, next);
+    });
   });
 
   // Packages and apps can add handlers to this via WebApp.connectHandlers.
@@ -662,15 +722,18 @@ var runWebAppServer = function () {
   });
 
   app.use(function (req, res, next) {
-    Fiber(function () {
-      if (!appUrl(req.url))
+    Promise.resolve().then(() => {
+      if (! appUrl(req.url)) {
         return next();
+      }
 
       var headers = {
         'Content-Type': 'text/html; charset=utf-8'
       };
-      if (shuttingDown)
+
+      if (shuttingDown) {
         headers['Connection'] = 'Close';
+      }
 
       var request = WebApp.categorizeRequest(req);
 
@@ -687,7 +750,7 @@ var runWebAppServer = function () {
         res.writeHead(200, headers);
         res.write(".meteor-css-not-found-error { width: 0px;}");
         res.end();
-        return undefined;
+        return;
       }
 
       if (request.url.query && request.url.query['meteor_js_resource']) {
@@ -698,7 +761,7 @@ var runWebAppServer = function () {
         headers['Cache-Control'] = 'no-cache';
         res.writeHead(404, headers);
         res.end("404 Not Found");
-        return undefined;
+        return;
       }
 
       if (request.url.query && request.url.query['meteor_dont_serve_index']) {
@@ -709,11 +772,11 @@ var runWebAppServer = function () {
         headers['Cache-Control'] = 'no-cache';
         res.writeHead(404, headers);
         res.end("404 Not Found");
-        return undefined;
+        return;
       }
 
       // /packages/asdfsad ... /__cordova/dafsdf.js
-      var pathname = parseurl(req).pathname;
+      var pathname = parseRequest(req).pathname;
       var archKey = pathname.split('/')[1];
       var archKeyCleaned = 'web.' + archKey.replace(/^__/, '');
 
@@ -723,22 +786,20 @@ var runWebAppServer = function () {
         archKey = archKeyCleaned;
       }
 
-      var boilerplate;
-      try {
-        boilerplate = getBoilerplate(request, archKey);
-      } catch (e) {
-        Log.error("Error running template: " + e.stack);
+      return getBoilerplateAsync(
+        request,
+        archKey
+      ).then(boilerplate => {
+        var statusCode = res.statusCode ? res.statusCode : 200;
+        res.writeHead(statusCode, headers);
+        res.write(boilerplate);
+        res.end();
+      }, error => {
+        Log.error("Error running template: " + error.stack);
         res.writeHead(500, headers);
         res.end();
-        return undefined;
-      }
-
-      var statusCode = res.statusCode ? res.statusCode : 200;
-      res.writeHead(statusCode, headers);
-      res.write(boilerplate);
-      res.end();
-      return undefined;
-    }).run();
+      });
+    });
   });
 
   // Return 404 by default, if no other handlers serve this URL.
@@ -748,7 +809,7 @@ var runWebAppServer = function () {
   });
 
 
-  var httpServer = http.createServer(app);
+  var httpServer = createServer(app);
   var onListeningCallbacks = [];
 
   // After 5 seconds w/o data on a socket, kill it.  On the other hand, if
@@ -761,12 +822,34 @@ var runWebAppServer = function () {
   // own.
   httpServer.on('request', WebApp._timeoutAdjustmentRequestCallback);
 
+  // If the client gave us a bad request, tell it instead of just closing the
+  // socket. This lets load balancers in front of us differentiate between "a
+  // server is randomly closing sockets for no reason" and "client sent a bad
+  // request".
+  //
+  // This will only work on Node 6; Node 4 destroys the socket before calling
+  // this event. See https://github.com/nodejs/node/pull/4557/ for details.
+  httpServer.on('clientError', (err, socket) => {
+    // Pre-Node-6, do nothing.
+    if (socket.destroyed) {
+      return;
+    }
+
+    if (err.message === 'Parse Error') {
+      socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+    } else {
+      // For other errors, use the default behavior as if we had no clientError
+      // handler.
+      socket.destroy(err);
+    }
+  });
 
   // start up app
   _.extend(WebApp, {
     connectHandlers: packageAndAppHandlers,
     rawConnectHandlers: rawConnectHandlers,
     httpServer: httpServer,
+    connectApp: app,
     // For testing.
     suppressConnectErrors: function () {
       suppressConnectErrors = true;
@@ -782,29 +865,50 @@ var runWebAppServer = function () {
   // Let the rest of the packages (and Meteor.startup hooks) insert connect
   // middlewares and update __meteor_runtime_config__, then keep going to set up
   // actually serving HTML.
-  main = function (argv) {
+  exports.main = argv => {
     WebAppInternals.generateBoilerplate();
 
-    // only start listening after all the startup code has run.
-    var localPort = WebAppInternals.parsePort(process.env.PORT) || 0;
-    var host = process.env.BIND_IP;
-    var localIp = host || '0.0.0.0';
-    httpServer.listen(localPort, localIp, Meteor.bindEnvironment(function() {
-      if (process.env.METEOR_PRINT_ON_LISTEN)
-        console.log("LISTENING"); // must match run-app.js
+    const startHttpServer = listenOptions => {
+      httpServer.listen(listenOptions, Meteor.bindEnvironment(() => {
+        if (process.env.METEOR_PRINT_ON_LISTEN) {
+          console.log("LISTENING");
+        }
+        const callbacks = onListeningCallbacks;
+        onListeningCallbacks = null;
+        callbacks.forEach(callback => { callback(); });
+      }, e => {
+        console.error("Error listening:", e);
+        console.error(e && e.stack);
+      }));
+    };
 
-      var callbacks = onListeningCallbacks;
-      onListeningCallbacks = null;
-      _.each(callbacks, function (x) { x(); });
+    let localPort = process.env.PORT || 0;
+    const unixSocketPath = process.env.UNIX_SOCKET_PATH;
 
-    }, function (e) {
-      console.error("Error listening:", e);
-      console.error(e && e.stack);
-    }));
+    if (unixSocketPath) {
+      // Start the HTTP server using a socket file.
+      removeExistingSocketFile(unixSocketPath);
+      startHttpServer({ path: unixSocketPath });
+      registerSocketFileCleanup(unixSocketPath);
+    } else {
+      localPort = isNaN(Number(localPort)) ? localPort : Number(localPort);
+      if (/\\\\?.+\\pipe\\?.+/.test(localPort)) {
+        // Start the HTTP server using Windows Server style named pipe.
+        startHttpServer({ path: localPort });
+      } else if (typeof localPort === "number") {
+        // Start the HTTP server using TCP.
+        startHttpServer({
+          port: localPort,
+          host: process.env.BIND_IP || "0.0.0.0"
+        });
+      } else {
+        throw new Error("Invalid PORT specified");
+      }
+    }
 
-    return 'DAEMON';
+    return "DAEMON";
   };
-};
+}
 
 
 runWebAppServer();

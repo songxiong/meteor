@@ -7,6 +7,8 @@ selftest.define("css hot code push", function (options) {
     clients: options.clients
   });
 
+  s.set("METEOR_WATCH_PRIORITIZE_CHANGED", "false");
+
   s.createApp("myapp", "css-injection-test");
   s.cd("myapp");
   s.testWithAllClients(function (run) {
@@ -116,7 +118,7 @@ selftest.define("versioning hot code push", function (options) {
   });
 });
 
-selftest.define("javascript hot code push", function (options) {
+selftest.define("javascript hot code push", ["slow"], function (options) {
   var s = new Sandbox({
     clients: options.clients
   });
@@ -223,6 +225,7 @@ appcache`);
     run.match("jsVar: undefined");
 
     s.write("client/test.js", "jsVar = 'bar'");
+    run.waitSecs(20);
     run.match("client connected: 1");
     run.match("jsVar: bar");
 

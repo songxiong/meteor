@@ -6,6 +6,32 @@ Tinytest.add('ReactiveDict - set to undefined', function (test) {
   test.equal(dict.get('foo'), undefined);
 });
 
+Tinytest.add('ReactiveDict - initialize with data', function (test) {
+  var now = new Date();
+  var dict = new ReactiveDict({
+    now: now
+  });
+
+  var nowFromDict = dict.get('now');
+  test.equal(nowFromDict, now);
+
+  // Test with static value here as a named dict could
+  // be migrated if code reload happens while testing
+  dict = new ReactiveDict('foo', {
+    foo: 'bar'
+  });
+
+  nowFromDict = dict.get('foo');
+  test.equal(nowFromDict, 'bar');
+
+  dict = new ReactiveDict(undefined, {
+    now: now
+  });
+
+  nowFromDict = dict.get('now');
+  test.equal(nowFromDict, now);
+});
+
 Tinytest.add('ReactiveDict - setDefault', function (test) {
   var dict = new ReactiveDict;
   dict.set('A', 'blah');
@@ -126,4 +152,45 @@ Tinytest.add('ReactiveDict - delete(key) works', function (test) {
 
   didRemove = dict.delete('barfoobar');
   test.equal(didRemove, false);
+});
+
+Tinytest.add('ReactiveDict - destroy works', function (test) {
+  var dict = new ReactiveDict('test');
+
+  // Should throw on client when reload package is present
+  Meteor.isClient && test.throws(function () {
+    var dict2 = new ReactiveDict('test');
+  }, 'Duplicate ReactiveDict name: test');
+
+  dict.set('foo', 'bar');
+
+  var val, equals, equalsUndefined, all;
+  Tracker.autorun(function() {
+    val = dict.get('foo');
+  });
+  Tracker.autorun(function() {
+    equals = dict.equals('foo', 'bar');
+  });
+  Tracker.autorun(function() {
+    equalsUndefined = dict.equals('foo', undefined);
+  });
+  Tracker.autorun(function() {
+    all = dict.all();
+  });
+
+  test.equal(val, 'bar');
+  test.equal(equals, true);
+  test.equal(equalsUndefined, false);
+  test.equal(all, {foo: 'bar'});
+
+  // .destroy() should clear the dict
+  dict.destroy();
+  Tracker.flush();
+  test.isUndefined(val);
+  test.equal(equals, false);
+  test.equal(equalsUndefined, true);
+  test.equal(all, {});
+  
+  // Shouldn't throw now that we've destroyed the previous dict
+  dict = new ReactiveDict('test');
 });

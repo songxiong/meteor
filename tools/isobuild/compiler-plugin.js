@@ -10,7 +10,6 @@ var _ = require('underscore');
 var Profile = require('../tool-env/profile.js').Profile;
 import {sha1, readAndWatchFileWithHash} from  '../fs/watch.js';
 import LRU from 'lru-cache';
-import Fiber from 'fibers';
 import {sourceMapLength} from '../utils/utils.js';
 import {Console} from '../console/console.js';
 import ImportScanner from './import-scanner.js';
@@ -62,7 +61,7 @@ import { isTestFilePath } from './test-files.js';
 // Cache the (slightly post-processed) results of linker.fullLink.
 const CACHE_SIZE = process.env.METEOR_LINKER_CACHE_SIZE || 1024*1024*100;
 const CACHE_DEBUG = !! process.env.METEOR_TEST_PRINT_LINKER_CACHE_DEBUG;
-const LINKER_CACHE_SALT = 10; // Increment this number to force relinking.
+const LINKER_CACHE_SALT = 17; // Increment this number to force relinking.
 const LINKER_CACHE = new LRU({
   max: CACHE_SIZE,
   // Cache is measured in bytes. We don't care about servePath.
@@ -239,17 +238,21 @@ class InputFile extends buildPluginModule.InputFile {
     return ! this.getPackageName();
   }
 
-  getSourceRoot() {
+  getSourceRoot(tolerant = false) {
     const sourceRoot = this._resourceSlot.packageSourceBatch.sourceRoot;
 
-    if (! _.isString(sourceRoot)) {
+    if (_.isString(sourceRoot)) {
+      return sourceRoot;
+    }
+
+    if (! tolerant) {
       const name = this.getPackageName();
       throw new Error(
         "Unknown source root for " + (
           name ? "package " + name : "app"));
     }
 
-    return sourceRoot;
+    return null;
   }
 
   getPathInPackage() {
@@ -300,14 +303,16 @@ class InputFile extends buildPluginModule.InputFile {
       return absPath;
     }
 
-    const sourceRoot = this._resourceSlot.packageSourceBatch.sourceRoot;
+    const sourceRoot = this.getSourceRoot(true);
     if (! _.isString(sourceRoot)) {
       return this._controlFileCache[basename] = null;
     }
 
-    let dir = files.pathDirname(this.getPathInPackage());
+    let dir = files.pathDirname(
+      files.pathJoin(sourceRoot, this.getPathInPackage()));
+
     while (true) {
-      absPath = files.pathJoin(sourceRoot, dir, basename);
+      absPath = files.pathJoin(dir, basename);
 
       const stat = this._stat(absPath);
       if (stat && stat.isFile()) {
@@ -319,6 +324,7 @@ class InputFile extends buildPluginModule.InputFile {
         return this._controlFileCache[basename] = null;
       }
 
+      if (dir === sourceRoot) break;
       let parentDir = files.pathDirname(dir);
       if (parentDir === dir) break;
       dir = parentDir;
@@ -341,10 +347,8 @@ class InputFile extends buildPluginModule.InputFile {
   }
 
   resolve(id, parentPath) {
-    const batch = this._resourceSlot.packageSourceBatch;
-
     parentPath = parentPath || files.pathJoin(
-      batch.sourceRoot,
+      this.getSourceRoot(),
       this.getPathInPackage()
     );
 
@@ -353,12 +357,13 @@ class InputFile extends buildPluginModule.InputFile {
       return resId;
     }
 
-    const parentStat = files.statOrNull(parentPath);
+    const parentStat = optimisticStatOrNull(parentPath);
     if (! parentStat ||
         ! parentStat.isFile()) {
       throw new Error("Not a file: " + parentPath);
     }
 
+    const batch = this._resourceSlot.packageSourceBatch;
     const resolver = batch.getResolver();
     const resolved = resolver.resolve(id, parentPath);
 
@@ -372,6 +377,12 @@ class InputFile extends buildPluginModule.InputFile {
   }
 
   require(id, parentPath) {
+    return this._require(id, parentPath);
+  }
+
+  // This private helper method exists to prevent ambiguity between the
+  // module-global `require` function and the method name.
+  _require(id, parentPath) {
     return require(this.resolve(id, parentPath));
   }
 
@@ -652,7 +663,7 @@ class ResourceSlot {
         // If a compiler plugin calls addJavaScript with the same
         // sourcePath, that code should take precedence over this empty
         // stub, so this property marks the resource as disposable.
-        emtpyStub: true,
+        implicit: true,
         lazy: true,
       });
 
@@ -714,7 +725,8 @@ class ResourceSlot {
       if (_.isString(options.data)) {
         options.data = new Buffer(options.data);
       } else {
-        throw new Error("'data' option to addAsset must be a Buffer or String.");
+        throw new Error("'data' option to addAsset must be a Buffer or " +
+                        "String: " + self.inputResource.path);
       }
     }
 
@@ -769,15 +781,6 @@ class ResourceSlot {
       error: { message, info },
     });
   }
-}
-
-let babelRuntime;
-function checkBabelRuntimeHelper(id) {
-  if (! babelRuntime) {
-    babelRuntime = require("../tool-env/isopackets.js")
-      .load("runtime")["babel-runtime"];
-  }
-  return babelRuntime.checkHelper(id);
 }
 
 export class PackageSourceBatch {
@@ -947,6 +950,7 @@ export class PackageSourceBatch {
 
       map.set(name, {
         files: inputFiles,
+        mainModule: _.find(inputFiles, file => file.mainModule) || null,
         importExtensions: batch.importExtensions,
       });
     });
@@ -970,9 +974,8 @@ export class PackageSourceBatch {
       map.forEach((info, name) => {
         if (! name) return;
 
-        let mainModule = _.find(info.files, file => file.mainModule);
-        mainModule = mainModule ?
-          `meteor/${name}/${mainModule.targetPath}` : false;
+        const mainModule = info.mainModule &&
+          `meteor/${name}/${info.mainModule.targetPath}`;
 
         meteorPackageInstalls.push(
           "install(" + JSON.stringify(name) +
@@ -1049,11 +1052,24 @@ export class PackageSourceBatch {
         let name = null;
 
         if (parts[0] === "meteor") {
+          let found = false;
+          name = parts[1];
+
           if (parts.length > 2) {
-            name = parts[1];
             parts[1] = ".";
             id = parts.slice(1).join("/");
+            found = true;
+
           } else {
+            const entry = map.get(name);
+            const mainModule = entry && entry.mainModule;
+            if (mainModule) {
+              id = "./" + mainModule.sourcePath;
+              found = true;
+            }
+          }
+
+          if (! found) {
             return;
           }
         }
@@ -1097,11 +1113,8 @@ export class PackageSourceBatch {
 
     this._warnAboutMissingModules(allMissingNodeModules);
 
-    const meteorProvidesBabelRuntime = map.has("babel-runtime");
-
     scannerMap.forEach((scanner, name) => {
       const isApp = ! name;
-      const isWeb = scanner.isWeb();
       const outputFiles = scanner.getOutputFiles();
 
       if (isApp) {
@@ -1109,23 +1122,6 @@ export class PackageSourceBatch {
 
         outputFiles.forEach(file => {
           const parts = file.installPath.split("/");
-
-          if (meteorProvidesBabelRuntime || ! isWeb) {
-            // If the Meteor babel-runtime package is installed, it will
-            // provide implementations for babel-runtime/helpers/* and
-            // babel-runtime/regenerator at runtime, so we should filter
-            // out any node_modules/babel-runtime/* modules from the app.
-            // If the Meteor babel-runtime package is not installed, then
-            // we should rely on node_modules/babel-runtime/* instead. On
-            // the server that still means removing bundled files here and
-            // relying on programs/server/npm/node_modules/babel-runtime,
-            // but on the web these bundled files are all we have, so we'd
-            // better not remove them.
-            if (checkBabelRuntimeHelper(file.installPath)) {
-              return;
-            }
-          }
-
           const nodeModulesIndex = parts.indexOf("node_modules");
 
           if (nodeModulesIndex === -1 || (nodeModulesIndex === 0 &&
@@ -1199,12 +1195,6 @@ export class PackageSourceBatch {
         const packageDir = parts[0];
         if (packageDir === "meteor") {
           // Don't print warnings for uninstalled Meteor packages.
-          return;
-        }
-
-        if (packageDir === "babel-runtime") {
-          // Don't print warnings for babel-runtime/helpers/* modules,
-          // since we provide most of those.
           return;
         }
 
@@ -1301,12 +1291,12 @@ export class PackageSourceBatch {
       noLineNumbers: !isWeb
     };
 
-    const cacheKey = sha1(JSON.stringify({
-      LINKER_CACHE_SALT,
+    const fileHashes = [];
+    const cacheKeyPrefix = sha1(JSON.stringify({
       linkerOptions,
       files: jsResources.map((inputFile) => {
+        fileHashes.push(inputFile.hash);
         return {
-          hash: inputFile.hash,
           installPath: inputFile.installPath,
           sourceMap: !! inputFile.sourceMap,
           mainModule: inputFile.mainModule,
@@ -1316,20 +1306,25 @@ export class PackageSourceBatch {
         };
       })
     }));
+    const cacheKeySuffix = sha1(JSON.stringify({
+      LINKER_CACHE_SALT,
+      fileHashes
+    }));
+    const cacheKey = `${cacheKeyPrefix}_${cacheKeySuffix}`;
 
-    {
-      const inMemoryCached = LINKER_CACHE.get(cacheKey);
-      if (inMemoryCached) {
-        if (CACHE_DEBUG) {
-          console.log('LINKER IN-MEMORY CACHE HIT:',
-                      linkerOptions.name, bundleArch);
-        }
-        return inMemoryCached;
+    if (LINKER_CACHE.has(cacheKey)) {
+      if (CACHE_DEBUG) {
+        console.log('LINKER IN-MEMORY CACHE HIT:',
+                    linkerOptions.name, bundleArch);
       }
+      return LINKER_CACHE.get(cacheKey);
     }
 
-    const cacheFilename = self.linkerCacheDir && files.pathJoin(
-      self.linkerCacheDir, cacheKey + '.cache');
+    const cacheFilename = self.linkerCacheDir &&
+      files.pathJoin(self.linkerCacheDir, cacheKey + '.cache');
+
+    const wildcardCacheFilename = cacheFilename &&
+      files.pathJoin(self.linkerCacheDir, cacheKeyPrefix + "_*.cache");
 
     // The return value from _linkJS includes Buffers, but we want everything to
     // be JSON for writing to the disk cache. This function converts the string
@@ -1404,7 +1399,13 @@ export class PackageSourceBatch {
       LINKER_CACHE.set(cacheKey, ret);
       if (cacheFilename) {
         // Write asynchronously.
-        Fiber(() => files.writeFileAtomically(cacheFilename, retAsJSON)).run();
+        Promise.resolve().then(() => {
+          try {
+            files.rm_recursive(wildcardCacheFilename);
+          } finally {
+            files.writeFileAtomically(cacheFilename, retAsJSON);
+          }
+        });
       }
     }
 

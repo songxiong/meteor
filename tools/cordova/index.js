@@ -11,8 +11,8 @@ export const CORDOVA_ARCH = "web.cordova";
 export const CORDOVA_PLATFORMS = ['ios', 'android'];
 
 export const CORDOVA_PLATFORM_VERSIONS = {
-  'android': '5.2.2',
-  'ios': '4.2.1'
+  'android': '6.2.3',
+  'ios': '4.5.1'
 };
 
 const PLATFORM_TO_DISPLAY_NAME_MAP = {

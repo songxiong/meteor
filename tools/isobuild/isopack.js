@@ -8,12 +8,16 @@ import Builder from './builder.js';
 var bundler = require('./bundler.js');
 var watch = require('../fs/watch.js');
 var files = require('../fs/files.js');
-var isopackets = require('../tool-env/isopackets.js');
+import {
+  ISOPACKETS,
+  makeIsopacketBuildContext,
+} from '../tool-env/isopackets.js';
 var colonConverter = require('../utils/colon-converter.js');
 var utils = require('../utils/utils.js');
 var buildPluginModule = require('./build-plugin.js');
 var Console = require('../console/console.js').Console;
 var Profile = require('../tool-env/profile.js').Profile;
+import { requestGarbageCollection } from "../utils/gc.js";
 
 var rejectBadPath = function (p) {
   if (p.match(/\.\./)) {
@@ -720,7 +724,7 @@ _.extend(Isopack.prototype, {
        * @param {Function} factory A function that returns an instance
        * of a compiler class.
        *
-       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://github.com/meteor/meteor/wiki/Build-Plugins-API).
+       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://docs.meteor.com/api/packagejs.html#build-plugin-api).
        * @memberOf Plugin
        * @locus Build Plugin
        */
@@ -768,7 +772,7 @@ _.extend(Isopack.prototype, {
        * @param {Function} factory A function that returns an instance
        * of a linter class.
        *
-       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://github.com/meteor/meteor/wiki/Build-Plugins-API).
+       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://docs.meteor.com/api/packagejs.html#build-plugin-api).
        * @memberOf Plugin
        * @locus Build Plugin
        */
@@ -820,7 +824,7 @@ _.extend(Isopack.prototype, {
        * @param {Function} factory A function that returns an instance
        * of a minifier class.
        *
-       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://github.com/meteor/meteor/wiki/Build-Plugins-API).
+       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://docs.meteor.com/api/packagejs.html#build-plugin-api).
        * @memberOf Plugin
        * @locus Build Plugin
        */
@@ -1802,16 +1806,20 @@ _.extend(Isopack.prototype, {
       symlink: false
     });
 
+    requestGarbageCollection();
+
     // Build all of the isopackets now, so that no build step is required when
     // you're actually running meteor from a release in order to load packages.
-    var isopacketBuildContext = isopackets.makeIsopacketBuildContext();
+    var isopacketBuildContext = makeIsopacketBuildContext();
 
     var messages = buildmessage.capture(function () {
       // We rebuild them in the order listed in ISOPACKETS. This is not strictly
       // necessary here, since any isopackets loaded as part of the build
       // process are going to be the current tool's isopackets, not the
       // isopackets that we're writing out.
-      _.each(isopackets.ISOPACKETS, function (packages, isopacketName) {
+      _.each(ISOPACKETS, function (packages, isopacketName) {
+        requestGarbageCollection();
+
         buildmessage.enterJob({
           title: "compiling " + isopacketName + " packages for the tool"
         }, function () {
@@ -1829,6 +1837,8 @@ _.extend(Isopack.prototype, {
           if (buildmessage.jobHasMessages()) {
             return;
           }
+
+          requestGarbageCollection();
 
           image.write(
             builder.enter(files.pathJoin('isopackets', isopacketName)));
