@@ -1,14 +1,80 @@
 var _ = require('underscore');
 var buildmessage = require('../../utils/buildmessage.js');
-var files = require('../../fs/files.js');
-var watch = require('../../fs/watch.js');
+var files = require('../../fs/files');
+var watch = require('../../fs/watch');
+
 var PackageSource = require('../../isobuild/package-source.js');
-import { KNOWN_ISOBUILD_FEATURE_PACKAGES } from '../../isobuild/compiler.js';
 import { sync as glob } from "glob";
-import { Profile } from "../../tool-env/profile.js";
+import { Profile } from "../../tool-env/profile";
 import {
   optimisticHashOrNull,
-} from "../../fs/optimistic.js";
+} from "../../fs/optimistic";
+
+// This variable was duplicated due to an issue on importing it.
+// The issue only happens on node 14, and is most surely related to this: https://nodejs.org/en/blog/release/v14.0.0/
+// !!! When changing this, also change on tools/project-context.js !!!
+const KNOWN_ISOBUILD_FEATURE_PACKAGES = {
+  // This package directly calls Plugin.registerCompiler. Package authors
+  // must explicitly depend on this feature package to use the API.
+  'isobuild:compiler-plugin': ['1.0.0'],
+
+  // This package directly calls Plugin.registerMinifier. Package authors
+  // must explicitly depend on this feature package to use the API.
+  'isobuild:minifier-plugin': ['1.0.0'],
+
+  // This package directly calls Plugin.registerLinter. Package authors
+  // must explicitly depend on this feature package to use the API.
+  'isobuild:linter-plugin': ['1.0.0'],
+
+  // This package is only published in the isopack-2 format, not isopack-1 or
+  // older. ie, it contains "source" files for compiler plugins, not just
+  // JS/CSS/static assets/head/body.
+  // This is implicitly added at publish time to any such package; package
+  // authors don't have to add it explicitly. It isn't relevant for local
+  // packages, which can be rebuilt if possible by the older tool.
+  //
+  // Specifically, this is to avoid the case where a package is published with a
+  // dependency like `api.use('less@1.0.0 || 2.0.0')` and the publication
+  // selects the newer compiler plugin version to generate the isopack. The
+  // published package (if this feature package wasn't implicitly included)
+  // could still be selected by the Version Solver to be used with an old
+  // Isobuild... just because less@2.0.0 depends on isobuild:compiler-plugin
+  // doesn't mean it couldn't choose less@1.0.0, which is not actually
+  // compatible with this published package.  (Constraints of the form described
+  // above are not very helpful, but at least we can prevent old Isobuilds from
+  // choking on confusing packages.)
+  //
+  // (Why not isobuild:isopack@2.0.0? Well, that would imply that Version Solver
+  // would have to choose only one isobuild:isopack feature version, which
+  // doesn't make sense here.)
+  'isobuild:isopack-2': ['1.0.0'],
+
+  // This package uses the `prodOnly` metadata flag, which causes it to
+  // automatically depend on the `isobuild:prod-only` feature package.
+  'isobuild:prod-only': ['1.0.0'],
+
+  // This package depends on a specific version of Cordova. Package authors must
+  // explicitly depend on this feature package to indicate that they are not
+  // compatible with earlier Cordova versions, which is most likely a result of
+  // the Cordova plugins they depend on.
+  // One scenario is a package depending on a Cordova plugin or version
+  // that is only available on npm, which means downloading the plugin is not
+  // supported on versions of Cordova below 5.0.0.
+  'isobuild:cordova': ['5.4.0'],
+
+  // This package requires functionality introduced in meteor-tool@1.5.0
+  // to enable dynamic module fetching via import(...).
+  'isobuild:dynamic-import': ['1.5.0'],
+
+  // This package ensures that processFilesFor{Bundle,Target,Package} are
+  // allowed to return a Promise instead of having to await async
+  // compilation using fibers and/or futures.
+  'isobuild:async-plugins': ['1.6.1'],
+
+  // This package requires functionality introduced in meteor-tools@3.0
+  // to enable using top level await
+  'isobuild:top-level-await': ['3.0.0'],
+}
 
 // LocalCatalog represents packages located in the application's
 // package directory, other package directories specified via an
@@ -50,7 +116,7 @@ var LocalCatalog = function (options) {
   self._nextId = 1;
 };
 
-_.extend(LocalCatalog.prototype, {
+Object.assign(LocalCatalog.prototype, {
   toString: function () {
     var self = this;
     return "LocalCatalog [localPackageSearchDirs=" +
@@ -72,7 +138,10 @@ _.extend(LocalCatalog.prototype, {
   //    are package source trees.  Takes precedence over packages found
   //    via localPackageSearchDirs.
   //  - buildingIsopackets: true if we are building isopackets
-  initialize(options) {
+  //  - buildingSelfTestCatalog: true if this catalog is being built for
+  //    use by `meteor self-test` sandboxes. Forwarded to PackageSource so
+  //    that versionsFrom() in scanned package.js files no-ops.
+  async initialize(options) {
     var self = this;
     buildmessage.assertInCapture();
 
@@ -87,19 +156,13 @@ _.extend(LocalCatalog.prototype, {
         patterns.forEach(pattern => {
           if (process.platform === "win32") {
             pattern = files.convertToOSPath(pattern);
-
-            if (pattern.charAt(1) === ":") {
-              // Get rid of drive prefix, e.g. C:
-              pattern = pattern.slice(2);
-            }
-
-            // Convert to /forward/slash/path without /C
-            pattern = files.convertToPosixPath(pattern, true);
           }
 
-          // Note: glob expects POSIX-style paths, even on Windows.
-          // https://github.com/isaacs/node-glob/blob/master/README.md#windows
-          glob(pattern).forEach(
+          glob(pattern, {
+            // convertToOSPath uses backslashes on Windows. glob treats those
+            // as escapes unless this option makes them path separators.
+            windowsPathsNoEscape: process.platform === "win32",
+          }).forEach(
             p => list.push(files.pathResolve(p))
           );
         });
@@ -115,8 +178,11 @@ _.extend(LocalCatalog.prototype, {
       self.explicitlyAddedLocalPackageDirs = [],
     );
 
-    self._computeEffectiveLocalPackages();
-    self._loadLocalPackages(options.buildingIsopackets);
+    await self._computeEffectiveLocalPackages();
+    await self._loadLocalPackages(
+      options.buildingIsopackets,
+      options.buildingSelfTestCatalog,
+    );
     self.initialized = true;
   },
 
@@ -134,7 +200,7 @@ _.extend(LocalCatalog.prototype, {
     var self = this;
     self._requireInitialized();
 
-    return _.keys(self.packages);
+    return Object.keys(self.packages);
   },
 
   // Return an array with the names of all of the non-test packages that we know
@@ -260,7 +326,7 @@ _.extend(LocalCatalog.prototype, {
 
     self.effectiveLocalPackageDirs = [];
 
-    buildmessage.enterJob("looking for packages", function () {
+    return buildmessage.enterJob("looking for packages", function () {
       _.each(self.explicitlyAddedLocalPackageDirs, (explicitDir) => {
         const packageJsPath = files.pathJoin(explicitDir, "package.js");
         const packageJsHash = optimisticHashOrNull(packageJsPath);
@@ -322,7 +388,7 @@ _.extend(LocalCatalog.prototype, {
     });
   },
 
-  _loadLocalPackages(buildingIsopackets) {
+  async _loadLocalPackages(buildingIsopackets, buildingSelfTestCatalog) {
     var self = this;
     buildmessage.assertInCapture();
 
@@ -336,14 +402,15 @@ _.extend(LocalCatalog.prototype, {
     // (note: this is the behavior that we want for overriding things in
     //  checkout.  It is not clear that you get good UX if you have two packages
     //  with the same name in your app. We don't check that.)
-    var initSourceFromDir = function (packageDir, definiteName) {
-      var packageSource = new PackageSource;
-      buildmessage.enterJob({
+    var initSourceFromDir = async function (packageDir, definiteName) {
+      var packageSource = new PackageSource();
+      await buildmessage.enterJob({
         title: "reading package from `" + packageDir + "`",
         rootPath: packageDir
-      }, function () {
+      }, async function () {
         var initFromPackageDirOptions = {
-          buildingIsopackets: !! buildingIsopackets
+          buildingIsopackets: !! buildingIsopackets,
+          buildingSelfTestCatalog: !! buildingSelfTestCatalog,
         };
         // If we specified a name, then we know what we want to get and should
         // pass that into the options. Otherwise, we will use the 'name'
@@ -351,7 +418,7 @@ _.extend(LocalCatalog.prototype, {
         if (definiteName) {
           initFromPackageDirOptions.name = definiteName;
         }
-        packageSource.initFromPackageDir(packageDir, initFromPackageDirOptions);
+        await packageSource.initFromPackageDir(packageDir, initFromPackageDirOptions);
         if (buildmessage.jobHasMessages())
           return;  // recover by ignoring
 
@@ -364,6 +431,12 @@ _.extend(LocalCatalog.prototype, {
         // in which we loaded local package dirs when running this function.)
         if (_.has(self.packages, name))
           return;
+
+        const dependencies = packageSource.getDependencyMetadata({ logError: true });
+
+        if (buildmessage.jobHasMessages()) {
+          return; // recover by ignoring
+        }
 
         self.packages[name] = {
           packageSource: packageSource,
@@ -381,7 +454,7 @@ _.extend(LocalCatalog.prototype, {
             publishedBy: null,
             description: packageSource.metadata.summary,
             git: packageSource.metadata.git,
-            dependencies: packageSource.getDependencyMetadata(),
+            dependencies,
             source: null,
             lastUpdated: null,
             published: null,
@@ -389,6 +462,11 @@ _.extend(LocalCatalog.prototype, {
             debugOnly: packageSource.debugOnly,
             prodOnly: packageSource.prodOnly,
             testOnly: packageSource.testOnly,
+            devOnly: packageSource.devOnly,
+
+            deprecated: packageSource.deprecated,
+            deprecatedMessage: packageSource.deprecatedMessage,
+
             containsPlugins: packageSource.containsPlugins()
           }
         };
@@ -397,22 +475,18 @@ _.extend(LocalCatalog.prototype, {
         // marked as test packages by package source, so we will not recurse
         // infinitely), then process that too.
         if (!packageSource.isTest && packageSource.testName) {
-          initSourceFromDir(packageSource.sourceRoot, packageSource.testName);
+          await initSourceFromDir(packageSource.sourceRoot, packageSource.testName);
         }
       });
     };
 
     // Load the package sources for packages and their tests into
     // self.packages.
-    //
-    // XXX We should make this work with parallel: true; right now it seems to
-    // hit node problems.
-    buildmessage.forkJoin(
-      { 'title': 'initializing packages', parallel: false },
-      self.effectiveLocalPackageDirs,
-      function (dir) {
-        initSourceFromDir(dir);
-      });
+    await buildmessage.enterJob('initializing packages', async function() {
+      for (const dir of self.effectiveLocalPackageDirs) {
+        await initSourceFromDir(dir);
+      }
+    });
   },
 
   getPackageSource: function (name) {

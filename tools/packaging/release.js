@@ -1,6 +1,4 @@
-var _ = require('underscore');
-
-var files = require('../fs/files.js');
+var files = require('../fs/files');
 var catalog = require('./catalog/catalog.js');
 
 var release = exports;
@@ -21,7 +19,7 @@ var Release = function (options) {
   }
 };
 
-_.extend(Release.prototype, {
+Object.assign(Release.prototype, {
   // True if an actual, proper, "released" release. If so, this.name
   // will have the name of the release, eg, "1.0".
   isProperRelease: function () {
@@ -188,7 +186,7 @@ release.usingRightReleaseForApp = function (projectContext) {
 // Return the name of the latest release that is downloaded and ready
 // for use. May not be called when running from a checkout.
 // 'track' is optional (it defaults to the default track).
-release.latestKnown = function (track) {
+release.latestKnown = async function (track) {
   if (! files.usesWarehouse()) {
     throw new Error("called from checkout?");
   }
@@ -198,7 +196,7 @@ release.latestKnown = function (track) {
   }
 
 
-  var defaultRelease = catalog.official.getDefaultReleaseVersion(track);
+  var defaultRelease = await catalog.official.getDefaultReleaseVersion(track);
 
   if (!defaultRelease) {
     return null;
@@ -224,7 +222,7 @@ release.latestKnown = function (track) {
 //   release because it's not locally cached and we're not online.
 // - warehouse.NoSuchReleaseError if no release called 'name' exists
 //   in the world (confirmed with server).
-release.load = function (name, options) {
+release.load = async function (name, options) {
   options = options || {};
 
   if (! name) {
@@ -246,7 +244,7 @@ release.load = function (name, options) {
     name = track + '@' + version;
   }
 
-  var releaseVersion = catalog.official.getReleaseVersion(track, version);
+  var releaseVersion = await catalog.official.getReleaseVersion(track, version);
   if (releaseVersion === null) {
     throw new release.NoSuchReleaseError;
   }

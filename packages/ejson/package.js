@@ -1,20 +1,18 @@
 Package.describe({
   summary: "Extended and Extensible JSON library",
-  version: '1.0.13-rc.0'
+  version: "1.4.1",
 });
 
-Package.onUse(function (api) {
-  api.use(['underscore', 'base64']);
-  api.export('EJSON');
-  api.export('EJSONTest', {testOnly: true});
-  api.addFiles('ejson.js', ['client', 'server']);
-  api.addFiles('stringify.js', ['client', 'server']);
+Package.onUse(function onUse(api) {
+  api.use(["ecmascript", "base64"]);
+  api.addAssets("ejson.d.ts", "server");
+  api.types("ejson.native.d.ts");
+  api.mainModule("ejson.js");
+  api.export("EJSON");
 });
 
-Package.onTest(function (api) {
-  api.use('ejson', ['client', 'server']);
-  api.use(['tinytest', 'underscore']);
-
-  api.addFiles('custom_models_for_tests.js', ['client', 'server']);
-  api.addFiles('ejson_test.js', ['client', 'server']);
+Package.onTest(function onTest(api) {
+  api.use(["ecmascript", "tinytest", "mongo"]);
+  api.use("ejson");
+  api.mainModule("ejson_tests.js");
 });

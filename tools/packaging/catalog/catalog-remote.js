@@ -1,20 +1,27 @@
 var _ = require('underscore');
 var sqlite3 = require('sqlite3');
 
-var files = require('../../fs/files.js');
+var files = require('../../fs/files');
 var utils = require('../../utils/utils.js');
 var buildmessage = require('../../utils/buildmessage.js');
 var config = require('../../meteor-services/config.js');
-var archinfo = require('../../utils/archinfo.js');
+var archinfo = require('../../utils/archinfo');
 var Console = require('../../console/console.js').Console;
 
 var tropohouse = require('../tropohouse.js');
 var packageClient = require('../package-client.js');
 var VersionParser = require('../package-version-parser.js');
-var Profile = require('../../tool-env/profile.js').Profile;
+var Profile = require('../../tool-env/profile').Profile;
 
 // XXX: Rationalize these flags.  Maybe use the logger?
 var DEBUG_SQL = !!process.env.METEOR_DEBUG_SQL;
+
+// Developers using Windows Subsystem for Linux (WSL) may want to override
+// this environment variable to TRUNCATE instead of WAL. WAL mode copes
+// better with (multi-process) concurrency but is currently incompatible
+// with WSL: https://github.com/meteor/meteor-feature-requests/issues/154
+const JOURNAL_MODE =
+  process.env.METEOR_SQLITE_JOURNAL_MODE || "WAL";
 
 var SYNCTOKEN_ID = "1";
 
@@ -31,8 +38,8 @@ var Mutex = function () {
   self._resolvers = [];
 };
 
-_.extend(Mutex.prototype, {
-  lock: function () {
+Object.assign(Mutex.prototype, {
+  lock: async function () {
     var self = this;
 
     while (true) {
@@ -41,13 +48,13 @@ _.extend(Mutex.prototype, {
         return;
       }
 
-      new Promise(function (resolve) {
+      await new Promise(function (resolve) {
         self._resolvers.push(resolve);
-      }).await();
+      });
     }
   },
 
-  unlock: function () {
+  unlock: async function () {
     var self = this;
 
     if (!self._locked) {
@@ -57,7 +64,7 @@ _.extend(Mutex.prototype, {
     self._locked = false;
     var resolve = self._resolvers.shift();
     if (resolve) {
-      resolve();
+      await resolve();
     }
   }
 });
@@ -70,7 +77,7 @@ var Txn = function (db) {
   self.started = false;
 };
 
-_.extend(Txn.prototype, {
+Object.assign(Txn.prototype, {
   // Runs a SQL query and returns the rows
   query: function (sql, params) {
     var self = this;
@@ -84,7 +91,7 @@ _.extend(Txn.prototype, {
   },
 
   // Start a transaction
-  begin: function (mode) {
+  begin: async function (mode) {
     var self = this;
 
     // XXX: Use DEFERRED mode?
@@ -94,12 +101,12 @@ _.extend(Txn.prototype, {
       throw new Error("Transaction already started");
     }
 
-    self.db._execute("BEGIN " + mode + " TRANSACTION");
+    await self.db._execute("BEGIN " + mode + " TRANSACTION");
     self.started = true;
   },
 
   // Releases resources from the transaction; Rollback if commit not already called.
-  close: function () {
+  close: async function () {
     var self = this;
 
     if (self.closed) {
@@ -110,16 +117,16 @@ _.extend(Txn.prototype, {
       return;
     }
 
-    self.db._execute("ROLLBACK TRANSACTION");
+    await self.db._execute("ROLLBACK TRANSACTION");
     self.committed = false;
     self.closed = true;
   },
 
   // Commits the transaction.  close() will then be a no-op
-  commit: function () {
+  commit: async function () {
     var self = this;
 
-    self.db._execute("END TRANSACTION");
+    await self.db._execute("END TRANSACTION");
     self.committed = true;
     self.closed = true;
   }
@@ -134,26 +141,26 @@ var Db = function (dbFile, options) {
   self._prepared = {};
 
   self._transactionMutex = new Mutex();
-
-  self._db = self._retry(function () {
-    return self.open(dbFile);
-  });
-
-  // WAL mode copes much better with (multi-process) concurrency
-  self._retry(function () {
-    self._execute('PRAGMA journal_mode=WAL');
-  });
 };
 
-_.extend(Db.prototype, {
+Object.assign(Db.prototype, {
+  init: async function() {
+    const self = this;
+    self._db = await self._retry(function () {
+      return self.open(self._dbFile);
+    });
 
+    await self._retry(function () {
+      return self._execute(`PRAGMA journal_mode=${JOURNAL_MODE}`);
+    });
+  },
   // TODO: Move to utils?
-  _retry: function (f, options) {
-    options = _.extend({ maxAttempts: 3, delay: 500}, options || {});
+  _retry: async function (f, options) {
+    options = Object.assign({ maxAttempts: 3, delay: 500}, options || {});
 
     for (var attempt = 1; attempt <= options.maxAttempts; attempt++) {
       try {
-        return f();
+        return await f();
       } catch (err) {
         if (attempt < options.maxAttempts) {
           Console.warn("Retrying after error", err);
@@ -163,40 +170,40 @@ _.extend(Db.prototype, {
       }
 
       if (options.delay) {
-        utils.sleepMs(options.delay);
+        await utils.sleepMs(options.delay);
       }
     }
   },
 
   // Runs functions serially, in a mutex
-  _serialize: function (f) {
+  _serialize: async function (f) {
     var self = this;
 
     try {
-      self._transactionMutex.lock();
-      return f();
+      await self._transactionMutex.lock();
+      return await f();
     } finally {
-      self._transactionMutex.unlock();
+      await self._transactionMutex.unlock();
     }
   },
 
   // Do not call any other methods on this object after calling this one.
   // This yields.
-  closePermanently: function () {
+  closePermanently: async function () {
     var self = this;
-    self._closePreparedStatements();
+    await self._closePreparedStatements();
     var db = self._db;
     self._db = null;
-    new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) => {
       db.close(err => err ? reject(err) : resolve());
-    }).await();
+    });
   },
 
   // Runs the function inside a transaction block
-  runInTransaction: function (action) {
+  runInTransaction: async function (action) {
     var self = this;
 
-    var runOnce = Profile("sqlite query", function () {
+    var runOnce = Profile("sqlite query", async function () {
       var txn = new Txn(self);
 
       var t1 = Date.now();
@@ -205,15 +212,15 @@ _.extend(Db.prototype, {
       var result = null;
       var resultError = null;
 
-      txn.begin();
+      await txn.begin();
       try {
-        result = action(txn);
-        txn.commit();
+        result = await action(txn);
+        await txn.commit();
       } catch (err) {
         resultError = err;
       } finally {
         try {
-          txn.close();
+          await txn.close();
         } catch (e) {
           // We don't have a lot of options here...
           Console.warn("Error closing transaction", e);
@@ -237,13 +244,13 @@ _.extend(Db.prototype, {
 
     for (var attempt = 0; ; attempt++) {
       try {
-        return self._serialize(runOnce);
+        return await self._serialize(runOnce);
       } catch (err) {
         var retry = false;
         // Grr... doesn't expose error code; must string-match
-        if (err.message
-            && (   err.message == "SQLITE_BUSY: database is locked"
-                || err.message == "SQLITE_BUSY: cannot commit transaction - SQL statements in progress")) {
+        if (err.message &&
+            (err.message === "SQLITE_BUSY: database is locked" ||
+             err.message === "SQLITE_BUSY: cannot commit transaction - SQL statements in progress")) {
           if (attempt < BUSY_RETRY_ATTEMPTS) {
             retry = true;
           }
@@ -255,7 +262,7 @@ _.extend(Db.prototype, {
 
       // Wait on average BUSY_RETRY_INTERVAL, but randomize to avoid thundering herd
       var t = (Math.random() + 0.5) * BUSY_RETRY_INTERVAL;
-      utils.sleepMs(t);
+      await utils.sleepMs(t);
     }
   },
 
@@ -276,13 +283,13 @@ _.extend(Db.prototype, {
 
   // Runs a query synchronously, returning all rows
   // Hidden to enforce transaction usage
-  _query: function (sql, params) {
+  _query: async function (sql, params) {
     var self = this;
 
     var prepared = null;
     var prepare = self._autoPrepare && !_.isEmpty(params);
     if (prepare) {
-      prepared = self._prepareWithCache(sql);
+      prepared = await self._prepareWithCache(sql);
     }
 
     if (DEBUG_SQL) {
@@ -291,7 +298,7 @@ _.extend(Db.prototype, {
 
     //Console.debug("Executing SQL ", sql, params);
 
-    var rows = new Promise((resolve, reject) => {
+    var rows = await new Promise((resolve, reject) => {
       function callback(err, rows) {
         err ? reject(err) : resolve(rows);
       }
@@ -301,7 +308,7 @@ _.extend(Db.prototype, {
       } else {
         self._db.all(sql, params, callback);
       }
-    }).await();
+    });
 
     if (DEBUG_SQL) {
       var t2 = Date.now();
@@ -314,9 +321,9 @@ _.extend(Db.prototype, {
     return rows;
   },
 
-  // Runs a query synchronously, returning no rows
+  // Runs a query, returning no rows
   // Hidden to enforce transaction usage
-  _execute: function (sql, params) {
+  _execute: async function (sql, params) {
     var self = this;
 
     var prepared = null;
@@ -329,7 +336,7 @@ _.extend(Db.prototype, {
     // entirely.)
     var prepare = self._autoPrepare && !_.isEmpty(params);
     if (prepare) {
-      prepared = self._prepareWithCache(sql);
+      prepared = await self._prepareWithCache(sql);
     }
 
     if (DEBUG_SQL) {
@@ -338,7 +345,7 @@ _.extend(Db.prototype, {
 
     //Console.debug("Executing SQL ", sql, params);
 
-    var ret = new Promise(function (resolve, reject) {
+    var ret = await new Promise(function (resolve, reject) {
       function callback(err) {
         err ? reject(err) : resolve({
           // Yes, lastID & changes are on this(!)
@@ -352,7 +359,7 @@ _.extend(Db.prototype, {
       } else {
         self._db.run(sql, params, callback);
       }
-    }).await();
+    });
 
     if (DEBUG_SQL) {
       var t2 = Date.now();
@@ -365,17 +372,17 @@ _.extend(Db.prototype, {
   },
 
   // Prepares the statement, caching the result
-  _prepareWithCache: function (sql) {
+  _prepareWithCache: async function (sql) {
     var self = this;
 
     var prepared = self._prepared[sql];
     if (!prepared) {
       //Console.debug("Preparing statement: ", sql);
-      new Promise(function (resolve, reject) {
+      await new Promise(function (resolve, reject) {
         prepared = self._db.prepare(sql, function (err) {
           err ? reject(err) : resolve();
         });
-      }).await();
+      });
 
       self._prepared[sql] = prepared;
     }
@@ -385,25 +392,24 @@ _.extend(Db.prototype, {
 
 
   // Close any cached prepared statements
-  _closePreparedStatements: function () {
+  _closePreparedStatements: async function () {
     var self = this;
 
     var prepared = self._prepared;
     self._prepared = {};
 
-    _.each(prepared, function (statement) {
-      var err = new Promise(function (resolve) {
+    for (const statement of Object.values(prepared)) {
+      var err = await new Promise(function (resolve) {
         // We resolve the promise with an error instead of rejecting it,
         // because we don't want to throw.
         statement.finalize(resolve);
-      }).await();
+      });
 
       if (err) {
         Console.warn("Error finalizing statement ", err);
       }
-    });
+    }
   }
-
 });
 
 
@@ -418,7 +424,7 @@ var Table = function (name, jsonFields, options) {
   self._buildStatements();
 };
 
-_.extend(Table.prototype, {
+Object.assign(Table.prototype, {
   _buildStatements: function () {
     var self = this;
 
@@ -435,9 +441,9 @@ _.extend(Table.prototype, {
     return "(" + _.times(n, function () { return "?" }).join(",") + ")";
   },
 
-  find: function (txn, id) {
+  find: async function (db, id) {
     var self = this;
-    var rows = txn.query(self._selectQuery, [ id ]);
+    var rows = await db._query(self._selectQuery, [ id ]);
     if (rows.length !== 0) {
       if (rows.length !== 1) {
         throw new Error("Corrupt database (PK violation)");
@@ -447,17 +453,17 @@ _.extend(Table.prototype, {
     return undefined;
   },
 
-  upsert: function (txn, objects) {
+  upsert: async function (txn, objects) {
     var self = this;
 
     // XXX: Use sqlite upsert
     // XXX: Speculative insert
     // XXX: Fix transaction logic so we always roll back
-    _.each(objects, function (o) {
+    for (const o of objects) {
       var id = o._id;
-      var rows = txn.query(self._selectQuery, [ id ]);
+      var rows = await txn.query(self._selectQuery, [ id ]);
       if (rows.length !== 0) {
-        var deleteResults = txn.execute(self._deleteQuery, [ id ]);
+        var deleteResults = await txn.execute(self._deleteQuery, [ id ]);
         if (deleteResults.changes !== 1) {
           throw new Error("Unable to delete row: " + id);
         }
@@ -469,11 +475,11 @@ _.extend(Table.prototype, {
       if (! self.noContentColumn) {
         row.push(JSON.stringify(o));
       }
-      txn.execute(self._insertQuery, row);
-    });
+      await txn.execute(self._insertQuery, row);
+    }
   },
 
-  createTable: function (txn) {
+  createTable: async function (txn) {
     var self = this;
 
     var sql = 'CREATE TABLE IF NOT EXISTS ' + self.name + '(';
@@ -490,7 +496,7 @@ _.extend(Table.prototype, {
       sql += ", content STRING";
     }
     sql += ")";
-    txn.execute(sql);
+    await txn.execute(sql);
 
     //sql = "CREATE INDEX IF NOT EXISTS idx_" + self.name + "_id ON " + self.name + "(_id)";
     //txn.execute(sql);
@@ -514,7 +520,7 @@ var RemoteCatalog = function () {
   self.db = null;
 };
 
-_.extend(RemoteCatalog.prototype, {
+Object.assign(RemoteCatalog.prototype, {
   toString: function () {
     var self = this;
     return "RemoteCatalog";
@@ -524,34 +530,31 @@ _.extend(RemoteCatalog.prototype, {
   // are closed (eg to ensure that all writes have been flushed from the '-wal'
   // file to the main DB file). Most methods on this class will stop working
   // after you call this method. Note that this yields.
-  closePermanently: function () {
+  closePermanently: async function () {
     var self = this;
-    self.db.closePermanently();
+    await self.db.closePermanently();
     self.db = null;
   },
 
-  getVersion: function (name, version) {
-    var result = this._contentQuery(
+  getVersion: async function (packageName, version) {
+    var result = await this._contentQuery(
       "SELECT content FROM versions WHERE packageName=? AND version=?",
-      [name, version]);
-    if(!result || result.length === 0) {
-      return null;
-    }
-    return result[0];
+      [packageName, version]);
+    return filterExactRows(result, { packageName, version });
   },
 
   // As getVersion, but returns info on the latest version of the
   // package, or null if the package doesn't exist or has no versions.
-  getLatestVersion: function (name) {
+  getLatestVersion: async function (name) {
     var self = this;
 
-    var versions = self.getSortedVersions(name);
-    return self.getVersion(name, _.last(versions));
+    var versions = await self.getSortedVersions(name);
+    return await self.getVersion(name, _.last(versions));
   },
 
-  getSortedVersions: function (name) {
+  getSortedVersions: async function (name) {
     var self = this;
-    var match = this._columnsQuery(
+    var match = await this._columnsQuery(
       "SELECT version FROM versions WHERE packageName=?", name);
     if (match === null)
       return [];
@@ -563,9 +566,9 @@ _.extend(RemoteCatalog.prototype, {
 
   // Just getVersion mapped over getSortedVersions, but only makes one round
   // trip to sqlite.
-  getSortedVersionRecords: function (name) {
+  getSortedVersionRecords: async function (name) {
     var self = this;
-    var versionRecords = this._contentQuery(
+    var versionRecords = await this._contentQuery(
       "SELECT content FROM versions WHERE packageName=?", [name]);
     if (! versionRecords)
       return [];
@@ -578,20 +581,20 @@ _.extend(RemoteCatalog.prototype, {
     return versionRecords;
   },
 
-  getLatestMainlineVersion: function (name) {
+  getLatestMainlineVersion: async function (name) {
     var self = this;
-    var versions = self.getSortedVersions(name);
+    var versions = await self.getSortedVersions(name);
     versions.reverse();
     var latest = _.find(versions, function (version) {
       return !/-/.test(version);
     });
     if (!latest)
       return null;
-    return self.getVersion(name, latest);
+    return await self.getVersion(name, latest);
   },
 
-  getPackage: function (name, options) {
-    var result = this._contentQuery(
+  getPackage: async function (name) {
+    var result = await this._contentQuery(
       "SELECT content FROM packages WHERE name=?", name);
     if (!result || result.length === 0)
       return null;
@@ -601,8 +604,8 @@ _.extend(RemoteCatalog.prototype, {
     return result[0];
   },
 
-  getAllBuilds: function (name, version) {
-    var result = this._contentQuery(
+  getAllBuilds: async function (name, version) {
+    var result = await this._contentQuery(
       "SELECT content FROM builds WHERE builds.versionId = " +
         "(SELECT _id FROM versions WHERE versions.packageName=? AND " +
         "versions.version=?)",
@@ -616,11 +619,11 @@ _.extend(RemoteCatalog.prototype, {
   // which cover all of the required arches, or null if it is impossible to
   // cover them all (or if the version does not exist).
   // Note that this method is specific to RemoteCatalog.
-  getBuildsForArches: function (name, version, arches) {
+  getBuildsForArches: async function (name, version, arches) {
     var self = this;
 
     var solution = null;
-    var allBuilds = self.getAllBuilds(name, version) || [];
+    var allBuilds = await self.getAllBuilds(name, version) || [];
 
     utils.generateSubsetsOfIncreasingSize(allBuilds, function (buildSubset) {
       // This build subset works if for all the arches we need, at least one
@@ -640,50 +643,60 @@ _.extend(RemoteCatalog.prototype, {
     return solution;  // might be null!
   },
 
-  // Returns general (non-version-specific) information about a
-  // release track, or null if there is no such release track.
-  getReleaseTrack: function (name) {
-    var self = this;
-    var result = self._contentQuery(
-      "SELECT content FROM releaseTracks WHERE name=?", name);
-    if (!result || result.length === 0)
-      return null;
-    return result[0];
+  filterArchesWithBuilds: async function (name, version, arches) {
+    const buildArches = [];
+
+    for (const arch of arches) {
+      if (await this.getBuildsForArches(name, version, [arch])) {
+        buildArches.push(arch);
+      }
+    }
+    return buildArches;
   },
 
-  getReleaseVersion: function (track, version) {
+  // Returns general (non-version-specific) information about a
+  // release track, or null if there is no such release track.
+  getReleaseTrack: async function (name) {
     var self = this;
-    var result = self._contentQuery(
+    var result = await self._contentQuery(
+      "SELECT content FROM releaseTracks WHERE name=?", name);
+    return filterExactRows(result, { name });
+  },
+
+  getReleaseVersion: async function (track, version) {
+    var self = this;
+    var result = await self._contentQuery(
       "SELECT content FROM releaseVersions WHERE track=? AND version=?",
       [track, version]);
-    if (!result || result.length === 0)
-      return null;
-    return result[0];
+    return filterExactRows(result, { track, version });
   },
 
   // Used by make-bootstrap-tarballs. Only should be used on catalogs that are
   // specially constructed for bootstrap tarballs.
-  forceRecommendRelease: function (track, version) {
+  forceRecommendRelease: async function (track, version) {
     var self = this;
-    var releaseVersionData = self.getReleaseVersion(track, version);
+    var releaseVersionData = await self.getReleaseVersion(track, version);
     if (!releaseVersionData) {
       throw Error("Can't force-recommend unknown release " + track + "@"
                   + version);
     }
     releaseVersionData.recommended = true;
-    self._insertReleaseVersions([releaseVersionData]);
+    await self._insertReleaseVersions([releaseVersionData]);
   },
 
-  getAllReleaseTracks: function () {
-    return _.pluck(this._columnsQuery("SELECT name FROM releaseTracks"),
-                   'name');
+  getAllReleaseTracks: async function () {
+    const result = await this._columnsQuery("SELECT name FROM releaseTracks");
+
+    return result.map(({name}) => name);
   },
 
-  getAllPackageNames: function () {
-    return _.pluck(this._columnsQuery("SELECT name FROM packages"), 'name');
+  getAllPackageNames: async function () {
+    const results = await this._columnsQuery("SELECT name FROM packages");
+
+    return results.map(({name}) => name);
   },
 
-  initialize: function (options) {
+  initialize: async function (options) {
     var self = this;
 
     options = options || {};
@@ -692,6 +705,8 @@ _.extend(RemoteCatalog.prototype, {
 
     var dbFile = options.packageStorage || config.getPackageStorage();
     self.db = new Db(dbFile);
+
+    await self.db.init();
 
     self.tableVersions = new Table('versions', ['packageName', 'version', '_id']);
     self.tableBuilds = new Table('builds', ['versionId', '_id']);
@@ -713,24 +728,24 @@ _.extend(RemoteCatalog.prototype, {
       self.tableMetadata,
       self.tableBannersShown
     ];
-    return self.db.runInTransaction(function(txn) {
-      _.each(self.allTables, function (table) {
-        table.createTable(txn);
-      });
+    return self.db.runInTransaction(async function(txn) {
+      for (const table of self.allTables) {
+        await table.createTable(txn);
+      }
 
       // Extra indexes for the most expensive queries
       // These are non-unique indexes
       // XXX We used to have a versionsNamesIdx here on versions(packageName);
       //     we no longer create it but we don't waste time dropping it either.
-      txn.execute("CREATE INDEX IF NOT EXISTS versionsIdx ON " +
+      await txn.execute("CREATE INDEX IF NOT EXISTS versionsIdx ON " +
                   "versions(packageName, version)");
-      txn.execute("CREATE INDEX IF NOT EXISTS buildsVersionsIdx ON " +
+      await txn.execute("CREATE INDEX IF NOT EXISTS buildsVersionsIdx ON " +
                   "builds(versionId)");
-      txn.execute("CREATE INDEX IF NOT EXISTS packagesIdx ON " +
+      await txn.execute("CREATE INDEX IF NOT EXISTS packagesIdx ON " +
                   "packages(name)");
-      txn.execute("CREATE INDEX IF NOT EXISTS releaseTracksIdx ON " +
+      await txn.execute("CREATE INDEX IF NOT EXISTS releaseTracksIdx ON " +
                   "releaseTracks(name)");
-      txn.execute("CREATE INDEX IF NOT EXISTS releaseVersionsIdx ON " +
+      await txn.execute("CREATE INDEX IF NOT EXISTS releaseVersionsIdx ON " +
                   "releaseVersions(track, version)");
     });
   },
@@ -745,7 +760,7 @@ _.extend(RemoteCatalog.prototype, {
     });
   },
 
-  refresh: function (options) {
+  refresh: async function (options) {
     var self = this;
     options = options || {};
 
@@ -761,7 +776,7 @@ _.extend(RemoteCatalog.prototype, {
       return false;
 
     if (options.maxAge) {
-      var lastSync = self.getMetadata(METADATA_LAST_SYNC);
+      var lastSync = await self.getMetadata(METADATA_LAST_SYNC);
       Console.debug("lastSync = ", lastSync);
       if (lastSync && lastSync.timestamp) {
         if ((Date.now() - lastSync.timestamp) < options.maxAge) {
@@ -773,12 +788,12 @@ _.extend(RemoteCatalog.prototype, {
 
     var updateResult = {};
     // XXX This buildmessage.enterJob only exists for showing progress.
-    buildmessage.enterJob({ title: 'updating package catalog' }, function () {
-      updateResult = packageClient.updateServerPackageData(self);
+    await buildmessage.enterJob({ title: 'updating package catalog' }, async function () {
+      updateResult = await packageClient.updateServerPackageData(self);
     });
 
     if (updateResult.resetData) {
-      tropohouse.default.wipeAllPackages();
+      await tropohouse.default.wipeAllPackages();
     }
 
     return true;
@@ -787,58 +802,58 @@ _.extend(RemoteCatalog.prototype, {
   // Given a release track, returns all recommended versions for this track,
   // sorted by their orderKey. Returns the empty array if the release track does
   // not exist or does not have any recommended versions.
-  getSortedRecommendedReleaseVersions: function (track, laterThanOrderKey) {
+  getSortedRecommendedReleaseVersions: async function (track, laterThanOrderKey) {
     var self = this;
     var versions =
-          self.getSortedRecommendedReleaseRecords(track, laterThanOrderKey);
+          await self.getSortedRecommendedReleaseRecords(track, laterThanOrderKey);
     return _.pluck(versions, "version");
   },
 
   // Given a release track, returns all recommended version *records* for this
   // track, sorted by their orderKey. Returns the empty array if the release
   // track does not exist or does not have any recommended versions.
-  getSortedRecommendedReleaseRecords: function (track, laterThanOrderKey) {
-    var self = this;
-    // XXX releaseVersions content objects are kinda big; if we put
-    // 'recommended' and 'orderKey' in their own columns this could be faster
-    var result = self._contentQuery(
-      "SELECT content FROM releaseVersions WHERE track=?", track);
+  getSortedRecommendedReleaseRecords: async function (track, laterThanOrderKey) {
+    const hasMinKey = laterThanOrderKey != null;
 
-    var recommended = _.filter(result, function (v) {
-      if (!v.recommended)
-        return false;
-      return !laterThanOrderKey || v.orderKey > laterThanOrderKey;
-    });
+    // Always use JSON1 to filter & sort directly in SQL
+    const sql = `
+    SELECT content
+    FROM releaseVersions
+    WHERE track = ?
+      AND json_extract(content, '$.recommended') = 1
+      ${hasMinKey ? "AND json_extract(content, '$.orderKey') > ?" : ""}
+    ORDER BY json_extract(content, '$.orderKey') DESC
+  `;
+    const params = hasMinKey
+        ? [track, laterThanOrderKey]
+        : [track];
 
-    var recSort = _.sortBy(recommended, function (rec) {
-      return rec.orderKey;
-    });
-    recSort.reverse();
-    return recSort;
+    // _contentQuery will JSON.parse(content) for you
+    return this._contentQuery(sql, params);
   },
 
   // Given a release track, returns all version records for this track.
-  getReleaseVersionRecords: function (track) {
+  getReleaseVersionRecords: async function (track) {
     var self = this;
-    var result = self._contentQuery(
+    var result = await self._contentQuery(
       "SELECT content FROM releaseVersions WHERE track=?", track);
     return result;
   },
 
   // For a given track, returns the total number of release versions on that
   // track.
-  getNumReleaseVersions: function (track) {
+  getNumReleaseVersions: async function (track) {
     var self = this;
-    var result = self._columnsQuery(
+    var result = await self._columnsQuery(
       "SELECT count(*) FROM releaseVersions WHERE track=?", track);
     return result[0]["count(*)"];
   },
 
   // Returns the default release version on the DEFAULT_TRACK, or for a
   // given release track.
-  getDefaultReleaseVersion: function (track) {
+  getDefaultReleaseVersion: async function (track) {
     var self = this;
-    var versionRecord = self.getDefaultReleaseVersionRecord(track);
+    var versionRecord = await self.getDefaultReleaseVersionRecord(track);
     if (! versionRecord)
       throw new Error("Can't get default release version for track " + track);
     return _.pick(versionRecord, ["track", "version" ]);
@@ -846,29 +861,29 @@ _.extend(RemoteCatalog.prototype, {
 
   // Returns the default release version record for the DEFAULT_TRACK, or for a
   // given release track.
-  getDefaultReleaseVersionRecord: function (track) {
+  getDefaultReleaseVersionRecord: async function (track) {
     var self = this;
 
     if (!track)
       track = exports.DEFAULT_TRACK;
 
-    var versions = self.getSortedRecommendedReleaseRecords(track);
+    var versions = await self.getSortedRecommendedReleaseRecords(track);
     if (!versions.length)
       return null;
     return  versions[0];
   },
 
-  getBuildWithPreciseBuildArchitectures: function (versionRecord, buildArchitectures) {
+  getBuildWithPreciseBuildArchitectures: async function (versionRecord, buildArchitectures) {
     var self = this;
-    var matchingBuilds = this._contentQuery(
+    var matchingBuilds = await this._contentQuery(
       "SELECT content FROM builds WHERE versionId=?", versionRecord._id);
     return _.findWhere(matchingBuilds, { buildArchitectures: buildArchitectures });
   },
 
   // Executes a query, returning an array of each content column parsed as JSON
-  _contentQuery: function (query, params) {
+  _contentQuery: async function (query, params) {
     var self = this;
-    var rows = self._columnsQuery(query, params);
+    var rows = await self._columnsQuery(query, params);
     return _.map(rows, function(entity) {
       return JSON.parse(entity.content);
     });
@@ -876,46 +891,44 @@ _.extend(RemoteCatalog.prototype, {
 
   // Executes a query, returning an array of maps from column name to data.
   // No JSON parsing is performed.
-  _columnsQuery: function (query, params) {
+  _columnsQuery: async function (query, params) {
     var self = this;
-    var rows = self.db.runInTransaction(function (txn) {
-      return txn.query(query, params);
-    });
+    var rows = await self.db._query(query, params);
     return rows;
   },
 
   _insertReleaseVersions: function(releaseVersions) {
     var self = this;
     return self.db.runInTransaction(function (txn) {
-      self.tableReleaseVersions.upsert(txn, releaseVersions);
+      return self.tableReleaseVersions.upsert(txn, releaseVersions);
     });
   },
 
   //Given data from troposphere, add it into the local store
   insertData: function(serverData, syncComplete) {
     var self = this;
-    return self.db.runInTransaction(function (txn) {
-      self.tablePackages.upsert(txn, serverData.collections.packages);
-      self.tableBuilds.upsert(txn, serverData.collections.builds);
-      self.tableVersions.upsert(txn, serverData.collections.versions);
-      self.tableReleaseTracks.upsert(txn, serverData.collections.releaseTracks);
-      self.tableReleaseVersions.upsert(txn, serverData.collections.releaseVersions);
+    return self.db.runInTransaction(async function (txn) {
+      await self.tablePackages.upsert(txn, serverData.collections.packages);
+      await self.tableBuilds.upsert(txn, serverData.collections.builds);
+      await self.tableVersions.upsert(txn, serverData.collections.versions);
+      await self.tableReleaseTracks.upsert(txn, serverData.collections.releaseTracks);
+      await self.tableReleaseVersions.upsert(txn, serverData.collections.releaseVersions);
 
       var syncToken = serverData.syncToken;
       Console.debug("Adding syncToken: ", JSON.stringify(syncToken));
       syncToken._id = SYNCTOKEN_ID; //Add fake _id so it fits the pattern
-      self.tableSyncToken.upsert(txn, [syncToken]);
+      await self.tableSyncToken.upsert(txn, [syncToken]);
 
       if (syncComplete) {
         var lastSync = {timestamp: Date.now()};
-        self._setMetadata(txn, METADATA_LAST_SYNC, lastSync);
+        await self._setMetadata(txn, METADATA_LAST_SYNC, lastSync);
       }
     });
   },
 
-  getSyncToken: function() {
+  getSyncToken: async function() {
     var self = this;
-    var result = self._contentQuery("SELECT content FROM syncToken WHERE _id=?",
+    var result = await self._contentQuery("SELECT content FROM syncToken WHERE _id=?",
                                     [ SYNCTOKEN_ID ]);
     if (!result || result.length === 0) {
       Console.debug("No sync token found");
@@ -929,35 +942,31 @@ _.extend(RemoteCatalog.prototype, {
     return result[0];
   },
 
-  getMetadata: function(key) {
+  getMetadata: async function(key) {
     var self = this;
-    var row = self.db.runInTransaction(function (txn) {
-      return self.tableMetadata.find(txn, key);
-    });
+    var row = await self.tableMetadata.find(self.db, key);
     if (row) {
       return JSON.parse(row['content']);
     }
     return undefined;
   },
 
-  setMetadata: function(key, value) {
+  setMetadata: async function(key, value) {
     var self = this;
-    self.db.runInTransaction(function (txn) {
-      self._setMetadata(txn, key, value);
+    await self.db.runInTransaction(function (txn) {
+      return self._setMetadata(txn, key, value);
     });
   },
 
-  _setMetadata: function(txn, key, value) {
+  _setMetadata: async function(txn, key, value) {
     var self = this;
     value._id = key;
-    self.tableMetadata.upsert(txn, [value]);
+    await self.tableMetadata.upsert(txn, [value]);
   },
 
-  shouldShowBanner: function (releaseName, bannerDate) {
+  shouldShowBanner: async function (releaseName, bannerDate) {
     var self = this;
-    var row = self.db.runInTransaction(function (txn) {
-      return self.tableBannersShown.find(txn, releaseName);
-    });
+    var row = await self.tableBannersShown.find(self.db, releaseName);
     // We've never printed a banner for this release.
     if (! row)
       return true;
@@ -970,10 +979,10 @@ _.extend(RemoteCatalog.prototype, {
     }
   },
 
-  setBannerShownDate: function (releaseName, bannerShownDate) {
+  setBannerShownDate: async function (releaseName, bannerShownDate) {
     var self = this;
-    self.db.runInTransaction(function (txn) {
-      self.tableBannersShown.upsert(txn, [{
+    return self.db.runInTransaction(function (txn) {
+      return self.tableBannersShown.upsert(txn, [{
         _id: releaseName,
         // XXX For now, there's no way to tell this file to make a non-string
         // column in a sqlite table, but this should probably change to a
@@ -983,6 +992,29 @@ _.extend(RemoteCatalog.prototype, {
     });
   }
 });
+
+// SQLite has a bizarre philosophy about automaticaly converting between
+// different data types, such as strings and floating point numbers:
+// https://www.sqlite.org/quirks.html#flexible_typing
+//
+// This means querying for the string "1.10" in a given column can return
+// rows where the column is actually the string "1.1", since SQLite thinks
+// you might be talking about the number 1.1 rather than the string you
+// actually requested.
+//
+// This "feature" first became a problem for Meteor after we published
+// Meteor 1.10, which caused SQLite to return multiple rows for the
+// getReleaseVersion query, including both 1.10 and 1.1.1 (ancient).
+//
+// While this policy seems completely indefensible, the SQLite project
+// does not consider it a bug, which forces us to work around it by
+// double-checking the queried results with this helper function:
+function filterExactRows(rows, requirements) {
+  const keys = Object.keys(requirements);
+  return rows && rows.filter(row => {
+    return keys.every(key => row[key] === requirements[key]);
+  })[0] || null;
+}
 
 exports.RemoteCatalog = RemoteCatalog;
 

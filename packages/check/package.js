@@ -1,12 +1,14 @@
 Package.describe({
-  summary: "Check whether a value matches a pattern",
-  version: '1.2.4-rc.0'
+  summary: 'Check whether a value matches a pattern',
+  version: '1.5.1',
 });
 
-Package.onUse(function (api) {
-  api.use('modules');
-  api.use('underscore');
+Package.onUse(api => {
+  api.use('ecmascript');
   api.use('ejson');
+
+  api.addAssets('check.d.ts', 'server');
+  api.types('check.native.d.ts');
 
   api.mainModule('match.js');
 
@@ -14,8 +16,8 @@ Package.onUse(function (api) {
   api.export('Match');
 });
 
-Package.onTest(function (api) {
-  api.use(['check', 'tinytest', 'underscore', 'ejson', 'ecmascript'], ['client', 'server']);
+Package.onTest(api => {
+  api.use(['check', 'tinytest', 'ejson', 'ecmascript'], ['client', 'server']);
 
   api.addFiles('match_test.js', ['client', 'server']);
 });

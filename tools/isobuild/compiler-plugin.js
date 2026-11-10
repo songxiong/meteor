@@ -1,26 +1,25 @@
-var archinfo = require('../utils/archinfo.js');
+var archinfo = require('../utils/archinfo');
 var buildmessage = require('../utils/buildmessage.js');
 var buildPluginModule = require('./build-plugin.js');
 var colonConverter = require('../utils/colon-converter.js');
-var files = require('../fs/files.js');
+var files = require('../fs/files');
 var compiler = require('./compiler.js');
 var linker = require('./linker.js');
-var util = require('util');
 var _ = require('underscore');
-var Profile = require('../tool-env/profile.js').Profile;
-import {sha1, readAndWatchFileWithHash} from  '../fs/watch.js';
-import LRU from 'lru-cache';
-import Fiber from 'fibers';
+var Profile = require('../tool-env/profile').Profile;
+import assert from "assert";
+import {readAndWatchFileWithHash, sha1, WatchSet,} from '../fs/watch';
+import LRUCache from 'lru-cache';
 import {sourceMapLength} from '../utils/utils.js';
 import {Console} from '../console/console.js';
-import ImportScanner from './import-scanner.js';
-import {cssToCommonJS} from "./css-modules.js";
-import Resolver from "./resolver.js";
-import {
-  optimisticStatOrNull,
-} from "../fs/optimistic.js";
+import ImportScanner from './import-scanner';
+import {cssToCommonJS} from "./css-modules";
+import Resolver from "./resolver";
+import {optimisticHashOrNull, optimisticStatOrNull,} from "../fs/optimistic";
 
-import { isTestFilePath } from './test-files.js';
+import {isTestFilePath} from './test-files.js';
+
+const hasOwn = Object.prototype.hasOwnProperty;
 
 // This file implements the new compiler plugins added in Meteor 1.2, which are
 // registered with the Plugin.registerCompiler API.
@@ -62,12 +61,12 @@ import { isTestFilePath } from './test-files.js';
 // Cache the (slightly post-processed) results of linker.fullLink.
 const CACHE_SIZE = process.env.METEOR_LINKER_CACHE_SIZE || 1024*1024*100;
 const CACHE_DEBUG = !! process.env.METEOR_TEST_PRINT_LINKER_CACHE_DEBUG;
-const LINKER_CACHE_SALT = 10; // Increment this number to force relinking.
-const LINKER_CACHE = new LRU({
+const LINKER_CACHE_SALT = 26; // Increment this number to force relinking.
+const LINKER_CACHE = new LRUCache({
   max: CACHE_SIZE,
   // Cache is measured in bytes. We don't care about servePath.
   // Key is JSONification of all options plus all hashes.
-  length: function (files) {
+  length (files) {
     return files.reduce((soFar, current) => {
       return soFar + current.data.length + sourceMapLength(current.sourceMap);
     }, 0);
@@ -105,40 +104,56 @@ export class CompilerPluginProcessor {
     unibuilds,
     arch,
     sourceRoot,
+    buildMode,
     isopackCache,
     linkerCacheDir,
+    scannerCacheDir,
+    minifyCssResource,
   }) {
-    const self = this;
+    Object.assign(this, {
+      unibuilds,
+      arch,
+      sourceRoot,
+      buildMode,
+      isopackCache,
+      linkerCacheDir,
+      scannerCacheDir,
+      minifyCssResource,
+    });
 
-    self.unibuilds = unibuilds;
-    self.arch = arch;
-    self.sourceRoot = sourceRoot;
-    self.isopackCache = isopackCache;
+    if (linkerCacheDir) {
+      files.mkdir_p(linkerCacheDir);
+    }
 
-    self.linkerCacheDir = linkerCacheDir;
-    if (self.linkerCacheDir) {
-      files.mkdir_p(self.linkerCacheDir);
+    if (scannerCacheDir) {
+      files.mkdir_p(scannerCacheDir);
     }
   }
 
-  runCompilerPlugins() {
+  async runCompilerPlugins() {
     const self = this;
     buildmessage.assertInJob();
 
     // plugin id -> {sourceProcessor, resourceSlots}
     var sourceProcessorsWithSlots = {};
 
-    var sourceBatches = _.map(self.unibuilds, function (unibuild) {
+    const sourceBatches = [];
+    for (const unibuild of self.unibuilds) {
       const { pkg: { name }, arch } = unibuild;
       const sourceRoot = name
-        && self.isopackCache.getSourceRoot(name, arch)
-        || self.sourceRoot;
+          && self.isopackCache.getSourceRoot(name, arch)
+          || self.sourceRoot;
 
-      return new PackageSourceBatch(unibuild, self, {
+      const batch = new PackageSourceBatch(unibuild, self, {
         sourceRoot,
-        linkerCacheDir: self.linkerCacheDir
+        linkerCacheDir: self.linkerCacheDir,
+        scannerCacheDir: self.scannerCacheDir,
       });
-    });
+
+      await batch.init();
+
+      sourceBatches.push(batch);
+    }
 
     // If we failed to match sources with processors, we're done.
     if (buildmessage.jobHasMessages()) {
@@ -165,8 +180,8 @@ export class CompilerPluginProcessor {
       });
     });
 
-    // Now actually run the handlers.
-    _.each(sourceProcessorsWithSlots, function (data, id) {
+    // Now actually run the handlers
+    for (const [id, data] of Object.entries(sourceProcessorsWithSlots)) {
       var sourceProcessor = data.sourceProcessor;
       var resourceSlots = data.resourceSlots;
 
@@ -176,25 +191,25 @@ export class CompilerPluginProcessor {
         " (for target ", self.arch, ")"
       ].join('');
 
-      Profile.time("plugin "+sourceProcessor.isopack.name, () => {
-        buildmessage.enterJob({
+      await Profile.time("plugin "+sourceProcessor.isopack.name, async () => {
+        await buildmessage.enterJob({
           title: jobTitle
-        }, function () {
-          var inputFiles = _.map(resourceSlots, function (resourceSlot) {
-            return new InputFile(resourceSlot);
-          });
+        }, async function () {
+          var inputFiles = resourceSlots.map(resourceSlot => new InputFile(resourceSlot));
 
-          var markedMethod = buildmessage.markBoundary(
-            sourceProcessor.userPlugin.processFilesForTarget.bind(
-              sourceProcessor.userPlugin));
+          const markedMethod = buildmessage.markBoundary(
+              sourceProcessor.userPlugin.processFilesForTarget,
+              sourceProcessor.userPlugin
+          );
+
           try {
-            markedMethod(inputFiles);
+            await markedMethod(inputFiles);
           } catch (e) {
             buildmessage.exception(e);
           }
         });
       });
-    });
+    }
 
     return sourceBatches;
   }
@@ -219,6 +234,18 @@ class InputFile extends buildPluginModule.InputFile {
     // Map from imported module identifier strings (possibly relative) to
     // fully require.resolve'd module identifiers.
     this._resolveCache = Object.create(null);
+
+    // Communicate to compiler plugins that methods like addJavaScript
+    // accept a lazy finalizer function as a second argument, so that
+    // compilation can be avoided until/unless absolutely necessary.
+    this.supportsLazyCompilation = true;
+
+    // Communicate to compiler plugins that this version of Meteor
+    // is able to support top level await
+    // TODO: maybe this should also check if the file and package meet the
+    // minimum requirements to use top level await (file isn't bare, and
+    // package uses core-runtime and modules)
+    this.supportsTopLevelAwait = true;
   }
 
   getContentsAsBuffer() {
@@ -239,17 +266,21 @@ class InputFile extends buildPluginModule.InputFile {
     return ! this.getPackageName();
   }
 
-  getSourceRoot() {
+  getSourceRoot(tolerant = false) {
     const sourceRoot = this._resourceSlot.packageSourceBatch.sourceRoot;
 
-    if (! _.isString(sourceRoot)) {
+    if (_.isString(sourceRoot)) {
+      return sourceRoot;
+    }
+
+    if (! tolerant) {
       const name = this.getPackageName();
       throw new Error(
         "Unknown source root for " + (
           name ? "package " + name : "app"));
     }
 
-    return sourceRoot;
+    return null;
   }
 
   getPathInPackage() {
@@ -258,26 +289,23 @@ class InputFile extends buildPluginModule.InputFile {
   }
 
   getFileOptions() {
-    var self = this;
     // XXX fileOptions only exists on some resources (of type "source"). The JS
     // resources might not have this property.
-    return self._resourceSlot.inputResource.fileOptions || {};
+    const { inputResource } = this._resourceSlot;
+    return inputResource.fileOptions || (inputResource.fileOptions = {});
+  }
+
+  hmrAvailable() {
+    const fileOptions = this.getFileOptions() || {};
+
+    return this._resourceSlot.hmrAvailable() && !fileOptions.bare;
   }
 
   readAndWatchFileWithHash(path) {
-    const osPath = files.convertToOSPath(path);
-    const sourceRoot = this.getSourceRoot();
-    const relPath = files.pathRelative(sourceRoot, osPath);
-    if (relPath.startsWith("..")) {
-      throw new Error(
-        `Attempting to read file outside ${
-          this.getPackageName() || "the app"}: ${osPath}`
-      );
-    }
     const sourceBatch = this._resourceSlot.packageSourceBatch;
     return readAndWatchFileWithHash(
       sourceBatch.unibuild.watchSet,
-      osPath
+      files.convertToPosixPath(path),
     );
   }
 
@@ -300,14 +328,16 @@ class InputFile extends buildPluginModule.InputFile {
       return absPath;
     }
 
-    const sourceRoot = this._resourceSlot.packageSourceBatch.sourceRoot;
+    const sourceRoot = this.getSourceRoot(true);
     if (! _.isString(sourceRoot)) {
       return this._controlFileCache[basename] = null;
     }
 
-    let dir = files.pathDirname(this.getPathInPackage());
+    let dir = files.pathDirname(
+      files.pathJoin(sourceRoot, this.getPathInPackage()));
+
     while (true) {
-      absPath = files.pathJoin(sourceRoot, dir, basename);
+      absPath = files.pathJoin(dir, basename);
 
       const stat = this._stat(absPath);
       if (stat && stat.isFile()) {
@@ -319,6 +349,7 @@ class InputFile extends buildPluginModule.InputFile {
         return this._controlFileCache[basename] = null;
       }
 
+      if (dir === sourceRoot) break;
       let parentDir = files.pathDirname(dir);
       if (parentDir === dir) break;
       dir = parentDir;
@@ -341,10 +372,8 @@ class InputFile extends buildPluginModule.InputFile {
   }
 
   resolve(id, parentPath) {
-    const batch = this._resourceSlot.packageSourceBatch;
-
     parentPath = parentPath || files.pathJoin(
-      batch.sourceRoot,
+      this.getSourceRoot(),
       this.getPathInPackage()
     );
 
@@ -353,13 +382,19 @@ class InputFile extends buildPluginModule.InputFile {
       return resId;
     }
 
-    const parentStat = files.statOrNull(parentPath);
+    const parentStat = optimisticStatOrNull(parentPath);
     if (! parentStat ||
         ! parentStat.isFile()) {
       throw new Error("Not a file: " + parentPath);
     }
 
-    const resolver = batch.getResolver();
+    const batch = this._resourceSlot.packageSourceBatch;
+    const resolver = batch.getResolver({
+      // Make sure we use a server architecture when resolving, so that we
+      // don't accidentally use package.json "browser" fields.
+      // https://github.com/meteor/meteor/issues/9870
+      targetArch: archinfo.host(),
+    });
     const resolved = resolver.resolve(id, parentPath);
 
     if (resolved === "missing") {
@@ -372,6 +407,12 @@ class InputFile extends buildPluginModule.InputFile {
   }
 
   require(id, parentPath) {
+    return this._require(id, parentPath);
+  }
+
+  // This private helper method exists to prevent ambiguity between the
+  // module-global `require` function and the method name.
+  _require(id, parentPath) {
     return require(this.resolve(id, parentPath));
   }
 
@@ -426,16 +467,16 @@ class InputFile extends buildPluginModule.InputFile {
    * @param {String|Object} options.sourceMap A stringified JSON
    * sourcemap, in case the stylesheet was generated from a different
    * file.
+   * @param {Function} lazyFinalizer Optional function that can be called
+   *                   to obtain any remaining options that may be
+   *                   expensive to compute, and thus should only be
+   *                   computed if/when we are sure this CSS will be used
+   *                   by the application.
    * @memberOf InputFile
    * @instance
    */
-  addStylesheet(options) {
-    var self = this;
-    if (options.sourceMap && typeof options.sourceMap === 'string') {
-      // XXX remove an anti-XSSI header? ")]}'\n"
-      options.sourceMap = JSON.parse(options.sourceMap);
-    }
-    self._resourceSlot.addStylesheet(options);
+  addStylesheet(options, lazyFinalizer) {
+    this._resourceSlot.addStylesheet(options, lazyFinalizer);
   }
 
   /**
@@ -451,16 +492,18 @@ class InputFile extends buildPluginModule.InputFile {
    * @param {String|Object} options.sourceMap A stringified JSON
    * sourcemap, in case the JavaScript file was generated from a
    * different file.
+   * @param {String} [options.hash] A hash of compiler inputs that affect the
+   * output, including source-map metadata. Contributes to the output hash.
+   * @param {Function} lazyFinalizer Optional function that can be called
+   *                   to obtain any remaining options that may be
+   *                   expensive to compute, and thus should only be
+   *                   computed if/when we are sure this JavaScript will
+   *                   be used by the application.
    * @memberOf InputFile
    * @instance
    */
-  addJavaScript(options) {
-    var self = this;
-    if (options.sourceMap && typeof options.sourceMap === 'string') {
-      // XXX remove an anti-XSSI header? ")]}'\n"
-      options.sourceMap = JSON.parse(options.sourceMap);
-    }
-    self._resourceSlot.addJavaScript(options);
+  addJavaScript(options, lazyFinalizer) {
+    this._resourceSlot.addJavaScript(options, lazyFinalizer);
   }
 
   /**
@@ -474,12 +517,16 @@ class InputFile extends buildPluginModule.InputFile {
    * file.
    * @param {String} [options.hash] Optionally, supply a hash for the output
    * file.
+   * @param {Function} lazyFinalizer Optional function that can be called
+   *                   to obtain any remaining options that may be
+   *                   expensive to compute, and thus should only be
+   *                   computed if/when we are sure this asset will be
+   *                   used by the application.
    * @memberOf InputFile
    * @instance
    */
-  addAsset(options) {
-    var self = this;
-    self._resourceSlot.addAsset(options);
+  addAsset(options, lazyFinalizer) {
+    this._resourceSlot.addAsset(options, lazyFinalizer);
   }
 
   /**
@@ -489,26 +536,29 @@ class InputFile extends buildPluginModule.InputFile {
    * @param {String} options.section Which section of the document should
    * be appended to. Can only be "head" or "body".
    * @param {String} options.data The content to append.
+   * @param {Function} lazyFinalizer Optional function that can be called
+   *                   to obtain any remaining options that may be
+   *                   expensive to compute, and thus should only be
+   *                   computed if/when we are sure this HTML will be used
+   *                   by the application.
    * @memberOf InputFile
    * @instance
    */
-  addHtml(options) {
-    var self = this;
-    self._resourceSlot.addHtml(options);
+  async addHtml(options, lazyFinalizer) {
+    if (typeof lazyFinalizer === "function") {
+      // For now, just call the lazyFinalizer function immediately. Since
+      // HTML is not compiled, this immediate invocation is probably
+      // permanently appropriate for addHtml, whereas methods like
+      // addJavaScript benefit from waiting to call lazyFinalizer.
+      Object.assign(options, await lazyFinalizer());
+    }
+
+    this._resourceSlot.addHtml(options);
   }
 
   _reportError(message, info) {
-    if (this.getFileOptions().lazy === true) {
-      // Files with fileOptions.lazy === true were not explicitly added to
-      // the source batch via api.addFiles or api.mainModule, so any
-      // compilation errors should not be fatal until the files are
-      // actually imported by the ImportScanner. Attempting compilation is
-      // still important for lazy files that might end up being imported
-      // later, which is why we defang the error here, instead of avoiding
-      // compilation preemptively. Note also that exceptions thrown by the
-      // compiler will still cause build errors.
-      this._resourceSlot.addError(message, info);
-    } else {
+    this._resourceSlot.addError(message, info);
+    if (! this.getFileOptions().lazy) {
       super._reportError(message, info);
     }
   }
@@ -525,49 +575,41 @@ class ResourceSlot {
     self.outputResources = [];
     // JS, which gets linked together at the end.
     self.jsOutputResources = [];
+    // Errors encountered while processing this resource.
+    self.errors = [];
     self.sourceProcessor = sourceProcessor;
     self.packageSourceBatch = packageSourceBatch;
 
     if (self.inputResource.type === "source") {
-      if (sourceProcessor) {
+      if (self.sourceProcessor) {
         // If we have a sourceProcessor, it will handle the adding of the
         // final processed JavaScript.
       } else if (self.inputResource.extension === "js") {
-        // If there is no sourceProcessor for a .js file, add the source
-        // directly to the output. #HardcodeJs
-        self.addJavaScript({
-          // XXX it's a shame to keep converting between Buffer and string, but
-          // files.convertToStandardLineEndings only works on strings for now
-          data: self.inputResource.data.toString('utf8'),
-          path: self.inputResource.path,
-          hash: self.inputResource.hash,
-          bare: self.inputResource.fileOptions &&
-            (self.inputResource.fileOptions.bare ||
-             // XXX eventually get rid of backward-compatibility "raw" name
-             // XXX COMPAT WITH 0.6.4
-             self.inputResource.fileOptions.raw)
-        });
+        self._addDirectlyToJsOutputResources();
       }
     } else {
-      if (sourceProcessor) {
+      if (self.sourceProcessor) {
         throw Error("sourceProcessor for non-source? " +
-                    JSON.stringify(unibuildResourceInfo));
+            JSON.stringify(self.inputResource));
       }
       // Any resource that isn't handled by compiler plugins just gets passed
       // through.
       if (self.inputResource.type === "js") {
-        let resource = self.inputResource;
-        if (! _.isString(resource.sourcePath)) {
-          resource.sourcePath = self.inputResource.path;
-        }
-        if (! _.isString(resource.targetPath)) {
-          resource.targetPath = resource.sourcePath;
-        }
-        self.jsOutputResources.push(resource);
+        self._addDirectlyToJsOutputResources();
       } else {
         self.outputResources.push(self.inputResource);
       }
     }
+  }
+
+  // Add this resource directly to jsOutputResources without modifying the
+  // original data. #HardcodeJs
+  _addDirectlyToJsOutputResources() {
+    this.addJavaScript({
+      ...(this.inputResource.fileOptions || {}),
+      path: this.inputResource.path,
+      data: this.inputResource.data,
+    });
   }
 
   _getOption(name, options) {
@@ -578,155 +620,237 @@ class ResourceSlot {
     return fileOptions && fileOptions[name];
   }
 
-  _isLazy(options) {
+  _isLazy(options, isJavaScript) {
     let lazy = this._getOption("lazy", options);
 
     if (typeof lazy === "boolean") {
       return lazy;
     }
 
-    // If file.lazy was not previously defined, mark the file lazy if
-    // it is contained by an imports directory. Note that any files
-    // contained by a node_modules directory will already have been
-    // marked lazy in PackageSource#_inferFileOptions. Same for
-    // non-test files if running (non-full-app) tests (`meteor test`)
-    if (!this.packageSourceBatch.useMeteorInstall) {
+    const isApp = ! this.packageSourceBatch.unibuild.pkg.name;
+    if (! isApp) {
+      // Meteor package files must be explicitly added by api.addFiles or
+      // api.mainModule, and are implicitly eager unless specified
+      // otherwise via this.inputResource.fileOptions.lazy, which we
+      // already checked above.
       return false;
     }
 
+    // The rest of this method assumes we're considering a resource in an
+    // application rather than a Meteor package.
+
+    if (! this.packageSourceBatch.useMeteorInstall) {
+      // If this application is somehow still not using the module system,
+      // then everything is eagerly loaded.
+      return false;
+    }
+
+    const {
+      isTest = false,
+      isAppTest = false,
+    } = global.testCommandMetadata || {};
+
+    const runningTests = isTest || isAppTest;
+
+    if (isJavaScript) {
+      if (runningTests) {
+        const testModule = this._getOption("testModule", options);
+
+        // If we set fileOptions.testModule = true in _inferFileOptions,
+        // then consider this module an eager entry point for tests. If we
+        // set it to false (rather than leaving it undefined), that means
+        // a meteor.testModule was configured in package.json, and this
+        // test module was not it. In that case, we fall through to the
+        // mainModule check, ignoring isTestFilePath, because we can
+        // assume this is not an eager test module. If testModule was not
+        // set to a boolean, then isTestFilePath should determine if this
+        // is an eager test module.
+        const isEagerTestModule = typeof testModule === "boolean"
+          ? testModule
+          : isTestFilePath(this.inputResource.path);
+
+        if (isEagerTestModule) {
+          // If we know it's eager, then it isn't lazy.
+          return false;
+        }
+
+        if (! isAppTest) {
+          // If running `meteor test` without the --full-app option, then
+          // any JS modules that are not eager test modules must be lazy.
+          return true;
+        }
+      }
+
+      // PackageSource#_inferFileOptions (in package-source.js) sets the
+      // mainModule option to false to indicate that a meteor.mainModule
+      // was configured for this architecture, but this module was not it.
+      // It's important to wait until this point (ResourceSlot#_isLazy) to
+      // make the final call, because we can finally tell whether the
+      // output resource is JavaScript or not (non-JS resources are not
+      // affected by the meteor.mainModule option).
+      const mainModule = this._getOption("mainModule", options);
+      if (typeof mainModule === "boolean") {
+        return ! mainModule;
+      }
+    }
+
+    // In other words, the imports directory remains relevant for non-JS
+    // resources, and for JS resources in the absence of an explicit
+    // meteor.mainModule configuration in package.json.
     const splitPath = this.inputResource.path.split(files.pathSep);
     const isInImports = splitPath.indexOf("imports") >= 0;
-
-    if (global.testCommandMetadata &&
-        (global.testCommandMetadata.isTest ||
-         global.testCommandMetadata.isAppTest)) {
-      // test files should always be included, if we're running app
-      // tests.
-      return isInImports && !isTestFilePath(this.inputResource.path);
-    } else {
-      return isInImports;
-    }
+    return isInImports;
   }
 
-  addStylesheet(options) {
-    const self = this;
-    if (! self.sourceProcessor) {
+  _isBare(options) {
+    return !! this._getOption("bare", options);
+  }
+
+  hmrAvailable() {
+    return this.packageSourceBatch.hmrAvailable;
+  }
+
+  addStylesheet(options, lazyFinalizer) {
+    if (! this.sourceProcessor) {
       throw Error("addStylesheet on non-source ResourceSlot?");
     }
 
-    const data = files.convertToStandardLineEndings(options.data);
-    const useMeteorInstall = self.packageSourceBatch.useMeteorInstall;
-    const sourcePath = this.inputResource.path;
-    const targetPath = options.path || sourcePath;
-    const resource = {
-      refreshable: true,
-      sourcePath,
-      targetPath,
-      servePath: self.packageSourceBatch.unibuild.pkg._getServePath(targetPath),
-      hash: sha1(data),
-      lazy: this._isLazy(options),
-    };
+    // In contrast to addJavaScript, CSS resources passed to addStylesheet
+    // default to being eager (non-lazy).
+    options.lazy = this._isLazy(options, false);
 
-    if (useMeteorInstall && resource.lazy) {
+    const cssResource = new CssOutputResource({
+      resourceSlot: this,
+      options,
+      lazyFinalizer,
+    });
+
+    if (this.packageSourceBatch.useMeteorInstall &&
+        cssResource.lazy) {
       // If the current packageSourceBatch supports modules, and this CSS
       // file is lazy, add it as a lazy JS module instead of adding it
       // unconditionally as a CSS resource, so that it can be imported
       // when needed.
-      resource.type = "js";
-      resource.data =
-        new Buffer(cssToCommonJS(data, resource.hash), "utf8");
+      const jsResource = this.addJavaScript(options, async () => {
+        const result = {};
 
-      self.jsOutputResources.push(resource);
+        let css = await this.packageSourceBatch.processor
+          .minifyCssResource(cssResource);
+
+        if (! css && typeof css !== "string") {
+          // The minifier didn't do anything, so we should use the
+          // original contents of cssResource.data.
+          css = (await cssResource.data).toString("utf8");
+
+          if (cssResource.sourceMap) {
+            // Add the source map as an asset, and append a
+            // sourceMappingURL comment to the end of the CSS text that
+            // will be dynamically inserted when/if this JS module is
+            // evaluated at runtime. Note that this only happens when the
+            // minifier did not modify the CSS, and thus does not happen
+            // when we are building for production.
+            const { servePath } = this.addAsset({
+              path: jsResource.targetPath + ".map.json",
+              data: JSON.stringify(cssResource.sourceMap)
+            });
+            css += "\n//# sourceMappingURL=" + servePath + "\n";
+          }
+        }
+
+        result.data = Buffer.from(cssToCommonJS(css), "utf8");
+
+        // The JavaScript module that dynamically loads this CSS should
+        // not inherit the source map of the original CSS output.
+        result.sourceMap = null;
+
+        return result;
+      });
 
     } else {
       // Eager CSS is added unconditionally to a combined <style> tag at
       // the beginning of the <head>. If the corresponding module ever
       // gets imported, its module.exports object should be an empty stub,
       // rather than a <style> node added dynamically to the <head>.
-      self.jsOutputResources.push({
-        ...resource,
-        type: "js",
-        data: new Buffer(
+      this.addJavaScript({
+        ...options,
+        // As above, the JavaScript module that dynamically loads this CSS
+        // should not inherit the source map of the original CSS output.
+        sourceMap: null,
+        data: Buffer.from(
           "// These styles have already been applied to the document.\n",
           "utf8"),
+        lazy: true,
         // If a compiler plugin calls addJavaScript with the same
         // sourcePath, that code should take precedence over this empty
-        // stub, so this property marks the resource as disposable.
-        emtpyStub: true,
-        lazy: true,
-      });
+        // stub, so setting .implicit marks the resource as disposable.
+      }).implicit = true;
 
-      resource.type = "css";
-      resource.data = new Buffer(data, 'utf8'),
+      // TODO[FIBERS]: Look into this. We probably don't want addStylesheet
+      // to be async, and I'm also not sure the old behavior here is what we wanted
+      //
+      // if (! cssResource.lazy &&s
+      //     ! Buffer.isBuffer(cssResource.data)) {
+      //   // If there was an error processing this file, cssResource.data
+      //   // will not be a Buffer, and accessing cssResource.data here
+      //   // should cause the error to be reported via inputFile.error.
+      //   return;
+      // }
 
-      // XXX do we need to call convertSourceMapPaths here like we did
-      //     in legacy handlers?
-      resource.sourceMap = options.sourceMap;
-
-      self.outputResources.push(resource);
+      this.outputResources.push(cssResource);
     }
   }
 
-  addJavaScript(options) {
-    const self = this;
+  addJavaScript(options, lazyFinalizer) {
     // #HardcodeJs this gets called by constructor in the "js" case
-    if (! self.sourceProcessor && self.inputResource.extension !== "js") {
+    if (! this.sourceProcessor &&
+        this.inputResource.extension !== "js" &&
+        this.inputResource.type !== "js") {
       throw Error("addJavaScript on non-source ResourceSlot?");
     }
 
-    let sourcePath = self.inputResource.path;
-    if (_.has(options, "sourcePath") &&
-        typeof options.sourcePath === "string") {
-      sourcePath = options.sourcePath;
-    }
+    const resource = new JsOutputResource({
+      resourceSlot: this,
+      options,
+      lazyFinalizer,
+    });
 
-    const targetPath = options.path || sourcePath;
+    this.jsOutputResources.push(resource);
 
-    var data = new Buffer(
-      files.convertToStandardLineEndings(options.data), 'utf8');
+    return resource;
+  }
 
-    self.jsOutputResources.push({
-      type: "js",
-      data: data,
-      sourcePath,
-      targetPath,
-      servePath: self.packageSourceBatch.unibuild.pkg._getServePath(targetPath),
-      // XXX should we allow users to be trusted and specify a hash?
-      hash: sha1(data),
-      // XXX do we need to call convertSourceMapPaths here like we did
-      //     in legacy handlers?
-      sourceMap: options.sourceMap,
-      // intentionally preserve a possible `undefined` value for files
-      // in apps, rather than convert it into `false` via `!!`
-      lazy: self._isLazy(options),
-      bare: !! self._getOption("bare", options),
-      mainModule: !! self._getOption("mainModule", options),
+  // Emit a lazy stub JS resource for a source file whose compilation failed
+  // (errors recorded in this.errors) without producing any output resource.
+  // The stub exists only so the deferred errors are carried into the
+  // ImportScanner: JsOutputResource shares this.errors, so reportPendingErrors
+  // surfaces the real compile error the moment the module is imported. The
+  // stub is always lazy (eager files already report errors synchronously via
+  // InputFile#_reportError) and is filtered out of the final output by
+  // ImportScanner#getOutputFiles once hasErrors is set, so its empty data is
+  // never used. See https://github.com/meteor/meteor/issues/10366.
+  addErrorPlaceholder() {
+    return this.addJavaScript({
+      path: this.inputResource.path,
+      sourcePath: this.inputResource.path,
+      data: Buffer.from("", "utf8"),
+      lazy: true,
     });
   }
 
-  addAsset(options) {
-    const self = this;
-    if (! self.sourceProcessor) {
+  addAsset(options, lazyFinalizer) {
+    if (! this.sourceProcessor) {
       throw Error("addAsset on non-source ResourceSlot?");
     }
 
-    if (! (options.data instanceof Buffer)) {
-      if (_.isString(options.data)) {
-        options.data = new Buffer(options.data);
-      } else {
-        throw new Error("'data' option to addAsset must be a Buffer or String.");
-      }
-    }
-
-    self.outputResources.push({
-      type: 'asset',
-      data: options.data,
-      path: options.path,
-      servePath: self.packageSourceBatch.unibuild.pkg._getServePath(
-        options.path),
-      hash: sha1(options.data),
-      lazy: self._isLazy(options),
+    const resource = new AssetOutputResource({
+      resourceSlot: this,
+      options,
+      lazyFinalizer,
     });
+
+    this.outputResources.push(resource);
+
+    return resource;
   }
 
   addHtml(options) {
@@ -748,42 +872,220 @@ class ResourceSlot {
 
     self.outputResources.push({
       type: options.section,
-      data: new Buffer(files.convertToStandardLineEndings(options.data), 'utf8'),
-      lazy: self._isLazy(options),
+      data: Buffer.from(files.convertToStandardLineEndings(options.data), 'utf8'),
+      lazy: self._isLazy(options, false),
     });
   }
 
   addError(message, info) {
     // If this file is ever actually imported, only then will we report
-    // the error. Use this.jsOutputResources because that's what the
-    // ImportScanner deals with.
-    this.jsOutputResources.push({
-      type: "js",
-      sourcePath: this.inputResource.path,
-      targetPath: this.inputResource.path,
-      servePath: this.inputResource.path,
-      data: new Buffer(
-        "throw new Error(" + JSON.stringify(message) + ");\n",
-        "utf8"),
-      lazy: true,
-      error: { message, info },
-    });
+    // the error.
+    this.errors.push({ message, info });
   }
 }
 
-let babelRuntime;
-function checkBabelRuntimeHelper(id) {
-  if (! babelRuntime) {
-    babelRuntime = require("../tool-env/isopackets.js")
-      .load("runtime")["babel-runtime"];
+class OutputResource {
+  constructor({
+    type,
+    resourceSlot,
+    options = Object.create(null),
+    lazyFinalizer = null,
+  }) {
+    this._lazyFinalizer = lazyFinalizer;
+    this._initialOptions = options;
+    this._finalizerPromise = null;
+    // Share the errors array of the resourceSlot.
+    this._errors = resourceSlot.errors;
+
+    let sourcePath = resourceSlot.inputResource.path;
+    if (_.has(options, "sourcePath") &&
+        typeof options.sourcePath === "string") {
+      sourcePath = options.sourcePath;
+    }
+
+    const targetPath = options.path || sourcePath;
+    const servePath = targetPath
+      ? resourceSlot.packageSourceBatch.unibuild.pkg._getServePath(targetPath)
+      : resourceSlot.inputResource.servePath;
+
+    Object.assign(this, {
+      type,
+      lazy: resourceSlot._isLazy(options, true),
+      bare: resourceSlot._isBare(options),
+      mainModule: !! resourceSlot._getOption("mainModule", options),
+      sourcePath,
+      targetPath,
+      servePath,
+      sourceRoot: resourceSlot.packageSourceBatch.sourceRoot,
+      // Remember the source hash so that changes to the source that
+      // disappear after compilation can still contribute to the hash.
+      // Bypassing SourceResource.hash getter so if the compiler plugin doesn't
+      // use the resource's content we don't unnecessarily mark it as used.
+      _inputHash: resourceSlot.inputResource._hash,
+    });
   }
-  return babelRuntime.checkHelper(id);
+
+  async finalize() {
+    if (this._finalizerPromise) {
+      await this._finalizerPromise;
+    } else if (this._lazyFinalizer) {
+      const finalize = this._lazyFinalizer;
+      this._lazyFinalizer = null;
+
+      // It's important to initialize this._finalizerPromise to the new
+      // Promise before calling finalize(), so there's no possibility of
+      // finalize() triggering code that reenters this function before we
+      // have the final version of this._finalizerPromise. If this code
+      // used `new Promise(resolve => resolve(finalize()))` instead of
+      // `Promise.resolve().then(finalize)`, the finalize() call would
+      // begin before this._finalizerPromise was fully initialized.
+      (this._finalizerPromise = Promise.resolve().then(finalize).then(result => {
+        if (result) {
+          Object.assign(this._initialOptions, result);
+        } else if (this._errors.length === 0) {
+          // In case the finalize() call failed without reporting any
+          // errors, create at least one generic error that can be
+          // reported when reportPendingErrors is called.
+          const error = new Error("lazyFinalizer failed");
+          error.info = { resource: this, finalize };
+          this._errors.push(error);
+        }
+        // The this._finalizerPromise object only survives for the
+        // duration of the initial finalization.
+        this._finalizerPromise = null;
+      }));
+
+      await this._finalizerPromise;
+    }
+  }
+
+  async hasPendingErrors() {
+    await this.finalize();
+    return this._errors.length > 0;
+  }
+
+  async reportPendingErrors() {
+    if (await this.hasPendingErrors()) {
+      const firstError = this._errors[0];
+      buildmessage.error(
+        firstError.message,
+        firstError.info
+      );
+    }
+    return this._errors.length;
+  }
+
+  get data() { return this._get("data"); }
+  set data(value) { return this._set("data", value); }
+
+  get hash() { return this._get("hash"); }
+  set hash(value) { return this._set("hash", value); }
+
+  get sourceMap() { return this._get("sourceMap"); }
+  set sourceMap(value) { return this._set("sourceMap", value); }
+
+  // Method for getting properties that may be computed lazily, or that
+  // require some one-time post-processing.
+  async _get(name) {
+    if (hasOwn.call(this, name)) {
+      return this[name];
+    }
+
+    if (await this.hasPendingErrors()) {
+      // If you're considering using this resource, you should call
+      // hasPendingErrors or reportPendingErrors to find out if it's safe
+      // to access computed properties like .data, .hash, or .sourceMap.
+      // If you get here without checking for errors first, those errors
+      // will be fatal.
+      throw new Error(
+        `_get "${name}" called for file with pending errors | ERROR: ${JSON.stringify(
+          this._errors[0]
+        )}`
+      );
+    }
+
+    switch (name) {
+    case "data":
+      let { data = null } = this._initialOptions;
+      if (typeof data === "string") {
+        data = Buffer.from(data, "utf8");
+      }
+      return this._set("data", data);
+
+    case "hash": {
+      const hashes = [];
+
+      if (typeof this._inputHash === "string") {
+        hashes.push(this._inputHash);
+      }
+
+      // Compilers can account for additional inputs, such as an upstream
+      // source map whose contents changed without changing the JavaScript.
+      if (typeof this._initialOptions.hash === "string") {
+        hashes.push(this._initialOptions.hash);
+      }
+
+      hashes.push(sha1(await this._get("data")));
+
+      return this._set("hash", sha1(...hashes));
+    }
+
+    case "sourceMap":
+      let { sourceMap } = this._initialOptions;
+      if (sourceMap && typeof sourceMap === "string") {
+        sourceMap = JSON.parse(sourceMap);
+      }
+      return this._set("sourceMap", sourceMap);
+    }
+
+    if (! hasOwn.call(this._initialOptions, name)) {
+      throw new Error(`Unknown JsOutputResource property: ${name}`);
+    }
+
+    return this[name] = this._initialOptions[name];
+  }
+
+  // This method must be used to set any properties that have a getter
+  // defined above (data, hash, sourceMap).
+  _set(name, value) {
+    Object.defineProperty(this, name, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    return value;
+  }
+}
+
+class JsOutputResource extends OutputResource {
+  constructor(params) {
+    super({ ...params, type: "js" });
+  }
+}
+
+class CssOutputResource extends OutputResource {
+  constructor(params) {
+    super({ ...params, type: "css" });
+    this.refreshable = true;
+  }
+}
+
+class AssetOutputResource extends OutputResource {
+  constructor(params) {
+    super({ ...params, type: "asset" });
+    // Asset paths must always be explicitly specified.
+    this.path = this._initialOptions.path;
+    // Eagerness/laziness should never matter for assets.
+    delete this.lazy;
+  }
 }
 
 export class PackageSourceBatch {
   constructor(unibuild, processor, {
     sourceRoot,
     linkerCacheDir,
+    scannerCacheDir,
   }) {
     const self = this;
     buildmessage.assertInJob();
@@ -792,46 +1094,11 @@ export class PackageSourceBatch {
     self.processor = processor;
     self.sourceRoot = sourceRoot;
     self.linkerCacheDir = linkerCacheDir;
+    self.scannerCacheDir = scannerCacheDir;
     self.importExtensions = [".js", ".json"];
-    self._resolver = null;
-
-    var sourceProcessorSet = self._getSourceProcessorSet();
+    self._nodeModulesPaths = null;
 
     self.resourceSlots = [];
-    unibuild.resources.forEach(function (resource) {
-      let sourceProcessor = null;
-      if (resource.type === "source") {
-        var extension = resource.extension;
-        if (extension === null) {
-          const filename = files.pathBasename(resource.path);
-          sourceProcessor = sourceProcessorSet.getByFilename(filename);
-          if (! sourceProcessor) {
-            buildmessage.error(
-              `no plugin found for ${ resource.path } in ` +
-                `${ unibuild.pkg.displayName() }; a plugin for ${ filename } ` +
-                `was active when it was published but none is now`);
-            return;
-            // recover by ignoring
-          }
-        } else {
-          sourceProcessor = sourceProcessorSet.getByExtension(extension);
-          // If resource.extension === 'js', it's ok for there to be no
-          // sourceProcessor, since we #HardcodeJs in ResourceSlot.
-          if (! sourceProcessor && extension !== 'js') {
-            buildmessage.error(
-              `no plugin found for ${ resource.path } in ` +
-                `${ unibuild.pkg.displayName() }; a plugin for *.${ extension } ` +
-                `was active when it was published but none is now`);
-            return;
-            // recover by ignoring
-          }
-
-          self.addImportExtension(extension);
-        }
-      }
-
-      self.resourceSlots.push(new ResourceSlot(resource, sourceProcessor, self));
-    });
 
     // Compute imports by merging the exports of all of the packages we
     // use. Note that in the case of conflicting symbols, later packages get
@@ -845,7 +1112,19 @@ export class PackageSourceBatch {
     // depends on something).
     self.importedSymbolToPackageName = {}; // map from symbol to supplying package name
 
-    compiler.eachUsedUnibuild({
+    self.deps = [];
+  }
+
+  async init() {
+    const self = this;
+    for (const resource of this.unibuild.resources) {
+      const slot = await self.makeResourceSlot(resource);
+      if (slot) {
+        self.resourceSlots.push(slot);
+      }
+    }
+
+    await compiler.eachUsedUnibuild({
       dependencies: self.unibuild.uses,
       arch: self.processor.arch,
       isopackCache: self.processor.isopackCache,
@@ -856,22 +1135,123 @@ export class PackageSourceBatch {
       skipDebugOnly: true,
       skipProdOnly: true,
       skipTestOnly: true,
-    }, depUnibuild => {
+    }, (depUnibuild, { weak, unordered }) => {
+      let packageName = depUnibuild.pkg.name;
+
       _.each(depUnibuild.declaredExports, function (symbol) {
         // Slightly hacky implementation of test-only exports.
         if (! symbol.testOnly || self.unibuild.pkg.isTest) {
-          self.importedSymbolToPackageName[symbol.name] = depUnibuild.pkg.name;
+          self.importedSymbolToPackageName[symbol.name] = packageName;
         }
       });
+
+      self.deps.push({ package: packageName, weak, unordered });
     });
 
     self.useMeteorInstall =
-      _.isString(self.sourceRoot) &&
-      self.processor.isopackCache.uses(
-        self.unibuild.pkg,
-        "modules",
-        self.unibuild.arch
-      );
+        _.isString(self.sourceRoot) &&
+        self.processor.isopackCache.uses(
+            self.unibuild.pkg,
+            "modules",
+            self.unibuild.arch
+        );
+
+    const isDevelopment = self.processor.buildMode === 'development';
+    const usesHMRPackage = self.unibuild.pkg.name !== "hot-module-replacement" &&
+        self.processor.isopackCache.uses(
+            self.unibuild.pkg,
+            "hot-module-replacement",
+            self.unibuild.arch
+        );
+    const supportedArch = archinfo.matches(self.unibuild.arch, 'web');
+
+    self.hmrAvailable = self.useMeteorInstall && isDevelopment
+        && usesHMRPackage && supportedArch;
+
+    // These are the options that should be passed as the second argument
+    // to meteorInstall when modules in this source batch are installed.
+    self.meteorInstallOptions = self.useMeteorInstall ? {
+      extensions: self.importExtensions,
+    } : null;
+  }
+
+  async compileOneJsResource(resource) {
+    const slot = await this.makeResourceSlot({
+      type: "source",
+      extension: "js",
+      // Need { data, path, hash } here, at least.
+      ...resource,
+      fileOptions: {
+        lazy: true,
+        ...resource.fileOptions,
+      }
+    });
+
+    if (slot) {
+      // If the resource was not handled by a source processor, it will be
+      // added directly to slot.jsOutputResources by makeResourceSlot,
+      // meaning we do not need to compile it.
+      if (slot.jsOutputResources.length > 0) {
+        return slot.jsOutputResources;
+      }
+
+      const inputFile = new InputFile(slot);
+      inputFile.supportsLazyCompilation = false;
+
+      if (slot.sourceProcessor) {
+        const { userPlugin } = slot.sourceProcessor;
+        if (userPlugin) {
+          const markedMethod = buildmessage.markBoundary(
+            userPlugin.processFilesForTarget,
+            userPlugin
+          );
+          try {
+            await markedMethod([inputFile]);
+          } catch (e) {
+            buildmessage.exception(e);
+          }
+        }
+      }
+
+      return slot.jsOutputResources;
+    }
+
+    return [];
+  }
+
+ async makeResourceSlot(resource) {
+    let sourceProcessor = null;
+    if (resource.type === "source") {
+      var extension = resource.extension;
+      if (extension === null) {
+        const filename = files.pathBasename(resource.path);
+        sourceProcessor = (await this._getSourceProcessorSet()).getByFilename(filename);
+        if (! sourceProcessor) {
+          buildmessage.error(
+            `no plugin found for ${ resource.path } in ` +
+              `${ this.unibuild.pkg.displayName() }; a plugin for ${ filename } ` +
+              `was active when it was published but none is now`);
+          return null;
+          // recover by ignoring
+        }
+      } else {
+        sourceProcessor = (await this._getSourceProcessorSet()).getByExtension(extension);
+        // If resource.extension === 'js', it's ok for there to be no
+        // sourceProcessor, since we #HardcodeJs in ResourceSlot.
+        if (! sourceProcessor && extension !== 'js') {
+          buildmessage.error(
+            `no plugin found for ${ resource.path } in ` +
+              `${ this.unibuild.pkg.displayName() }; a plugin for *.${ extension } ` +
+              `was active when it was published but none is now`);
+          return null;
+          // recover by ignoring
+        }
+
+        this.addImportExtension(extension);
+      }
+    }
+
+   return new ResourceSlot(resource, sourceProcessor, this);
   }
 
   addImportExtension(extension) {
@@ -886,55 +1266,59 @@ export class PackageSourceBatch {
     }
   }
 
-  getResolver() {
-    if (this._resolver) {
-      return this._resolver;
-    }
-
-    const nmds = this.unibuild.nodeModulesDirectories;
-    const nodeModulesPaths = [];
-
-    _.each(nmds, (nmd, path) => {
-      if (! nmd.local) {
-        nodeModulesPaths.push(
-          files.convertToOSPath(path.replace(/\/$/g, "")));
-      }
-    });
-
-    return this._resolver = Resolver.getOrCreate({
+  getResolver(options = {}) {
+    return Resolver.getOrCreate({
       caller: "PackageSourceBatch#getResolver",
       sourceRoot: this.sourceRoot,
       targetArch: this.processor.arch,
       extensions: this.importExtensions,
-      nodeModulesPaths,
+      nodeModulesPaths: this._getNodeModulesPaths(),
+      ...options,
     });
   }
 
-  _getSourceProcessorSet() {
-    const self = this;
+  _getNodeModulesPaths() {
+    if (! this._nodeModulesPaths) {
+      const nmds = this.unibuild.nodeModulesDirectories;
+      this._nodeModulesPaths = [];
 
-    buildmessage.assertInJob();
+      _.each(nmds, (nmd, path) => {
+        if (! nmd.local) {
+          this._nodeModulesPaths.push(
+            files.convertToOSPath(path.replace(/\/$/g, "")));
+        }
+      });
+    }
 
-    var isopack = self.unibuild.pkg;
-    const activePluginPackages = compiler.getActivePluginPackages(isopack, {
-      uses: self.unibuild.uses,
-      isopackCache: self.processor.isopackCache
-    });
-    const sourceProcessorSet = new buildPluginModule.SourceProcessorSet(
-      isopack.displayName(), { hardcodeJs: true });
+    return this._nodeModulesPaths;
+  }
 
-    _.each(activePluginPackages, function (otherPkg) {
-      otherPkg.ensurePluginsInitialized();
+  async _getSourceProcessorSet() {
+    if (! this._sourceProcessorSet) {
+      buildmessage.assertInJob();
 
-      sourceProcessorSet.merge(
-        otherPkg.sourceProcessors.compiler, {arch: self.processor.arch});
-    });
+      const isopack = this.unibuild.pkg;
+      const activePluginPackages = await compiler.getActivePluginPackages(isopack, {
+        uses: this.unibuild.uses,
+        isopackCache: this.processor.isopackCache
+      });
 
-    return sourceProcessorSet;
+      this._sourceProcessorSet = new buildPluginModule.SourceProcessorSet(
+        isopack.displayName(), { hardcodeJs: true });
+
+      for (const otherPkg of activePluginPackages) {
+        await otherPkg.ensurePluginsInitialized();
+        this._sourceProcessorSet.merge(otherPkg.sourceProcessors.compiler, {
+          arch: this.processor.arch,
+        });
+      }
+    }
+
+    return this._sourceProcessorSet;
   }
 
   // Returns a map from package names to arrays of JS output files.
-  static computeJsOutputFilesMap(sourceBatches) {
+  static async computeJsOutputFilesMap(sourceBatches) {
     const map = new Map;
 
     sourceBatches.forEach(batch => {
@@ -942,12 +1326,33 @@ export class PackageSourceBatch {
       const inputFiles = [];
 
       batch.resourceSlots.forEach(slot => {
+        // If a compiler plugin reported an error for a lazy source file but
+        // produced no output resource (e.g. a Blaze/Stylus template that
+        // fails to compile and aborts before calling addJavaScript), the
+        // error was deferred by InputFile#_reportError (because lazy files
+        // should not break the build unless they are actually imported).
+        // Without an output resource to carry that error, it is never handed
+        // to the ImportScanner, so reportPendingErrors() is never called and
+        // the error is silently swallowed -- the import resolves to "missing"
+        // and the only symptom is a runtime "Cannot find module" error. Emit
+        // a lazy stub JS resource that carries the deferred error so the
+        // ImportScanner can surface it (via reportPendingErrors) if and when
+        // the file is imported, while leaving unimported broken files
+        // harmless. See https://github.com/meteor/meteor/issues/10366.
+        if (slot.sourceProcessor &&
+            slot.errors.length > 0 &&
+            slot.jsOutputResources.length === 0) {
+          slot.addErrorPlaceholder();
+        }
+
         inputFiles.push(...slot.jsOutputResources);
       });
 
       map.set(name, {
         files: inputFiles,
-        importExtensions: batch.importExtensions,
+        mainModule: _.find(inputFiles, file => file.mainModule) || null,
+        batch,
+        importScannerWatchSet: new WatchSet(),
       });
     });
 
@@ -955,61 +1360,65 @@ export class PackageSourceBatch {
       // In the unlikely event that no package is using the modules
       // package, then the map is already complete, and we don't need to
       // do any import scanning.
-      return map;
+      return this._watchOutputFiles(map);
     }
 
     // Append install(<name>) calls to the install-packages.js file in the
     // modules package for every Meteor package name used.
-    map.get("modules").files.some(file => {
+    for (const file of map.get("modules").files) {
       if (file.sourcePath !== "install-packages.js") {
-        return false;
+        continue;
       }
 
       const meteorPackageInstalls = [];
-
       map.forEach((info, name) => {
         if (! name) return;
 
-        let mainModule = _.find(info.files, file => file.mainModule);
-        mainModule = mainModule ?
-          `meteor/${name}/${mainModule.targetPath}` : false;
+        const mainModule = info.mainModule &&
+            `meteor/${name}/${info.mainModule.targetPath}`;
 
         meteorPackageInstalls.push(
-          "install(" + JSON.stringify(name) +
+            "install(" + JSON.stringify(name) +
             (mainModule ? ", " + JSON.stringify(mainModule) : '') +
-          ");\n"
+            ");\n"
         );
       });
 
       if (meteorPackageInstalls.length === 0) {
-        return false;
+        continue;
       }
 
-      file.data = new Buffer(
-        file.data.toString("utf8") + "\n" +
+      const fileData = await file.data;
+      const bufferData = Buffer.from(
+          fileData.toString("utf8") + "\n" +
           meteorPackageInstalls.join(""),
-        "utf8"
+          "utf8"
       );
+      const fileHash = sha1(bufferData);
 
-      file.hash = sha1(file.data);
+      // The getter's from file (file.data and file.hash) are async, unfortunately.
+      // That's why we need the Object.assign here.
+      Object.assign(file, { data: bufferData, hash: fileHash });
+      break;
+    }
 
-      return true;
-    });
+    // Map from module identifiers that previously could not be imported
+    // to lists of info objects describing the failed imports.
+    const allMissingModules = Object.create(null);
 
-    const allMissingNodeModules = Object.create(null);
-    // Records the subset of allMissingNodeModules that were successfully
+    // Records the subset of allMissingModules that were successfully
     // relocated to a source batch that could handle them.
-    const allRelocatedNodeModules = Object.create(null);
-    const scannerMap = new Map;
+    const allRelocatedModules = Object.create(null);
+    const scannerMap = new Map();
 
-    sourceBatches.forEach(batch => {
+    for (const batch of sourceBatches) {
       const name = batch.unibuild.pkg.name || null;
       const isApp = ! name;
 
       if (! batch.useMeteorInstall && ! isApp) {
         // If this batch represents a package that does not use the module
         // system, then we don't need to scan its dependencies.
-        return;
+        continue;
       }
 
       const nodeModulesPaths = [];
@@ -1022,116 +1431,132 @@ export class PackageSourceBatch {
         }
       });
 
+      const entry = map.get(name);
+
       const scanner = new ImportScanner({
         name,
         bundleArch: batch.processor.arch,
         extensions: batch.importExtensions,
         sourceRoot: batch.sourceRoot,
         nodeModulesPaths,
-        watchSet: batch.unibuild.watchSet,
+        watchSet: entry.importScannerWatchSet,
+        cacheDir: batch.scannerCacheDir,
       });
 
-      scanner.addInputFiles(map.get(name).files);
+      await scanner.addInputFiles(entry.files);
 
       if (batch.useMeteorInstall) {
-        scanner.scanImports();
-        _.extend(allMissingNodeModules, scanner.allMissingNodeModules);
+        await scanner.scanImports();
+        await ImportScanner.mergeMissing(
+            allMissingModules,
+            scanner.allMissingModules
+        );
       }
 
       scannerMap.set(name, scanner);
-    });
+    }
 
-    function handleMissing(missingNodeModules) {
+    async function handleMissing(missingModules) {
       const missingMap = new Map;
 
-      _.each(missingNodeModules, (info, id) => {
+      for (let [id, importInfoList] of Object.entries(missingModules)) {
         const parts = id.split("/");
         let name = null;
 
         if (parts[0] === "meteor") {
+          let found = false;
+          name = parts[1];
+
           if (parts.length > 2) {
-            name = parts[1];
             parts[1] = ".";
             id = parts.slice(1).join("/");
+            found = true;
+
           } else {
-            return;
+            const entry = map.get(name);
+            const mainModule = entry && entry.mainModule;
+            if (mainModule) {
+              id = "./" + mainModule.sourcePath;
+              found = true;
+            }
+          }
+
+          if (! found) {
+            continue;
           }
         }
 
         if (! scannerMap.has(name)) {
-          return;
+          continue;
         }
 
         if (! missingMap.has(name)) {
-          missingMap.set(name, {});
+          missingMap.set(name, Object.create(null));
         }
 
-        const missing = missingMap.get(name);
-        if (! _.has(missing, id) ||
-            ! info.possiblySpurious) {
-          // Allow any non-spurious identifier to replace an existing
-          // possibly spurious identifier.
-          missing[id] = info;
-        }
-      });
+        await ImportScanner.mergeMissing(
+            missingMap.get(name),
+            { [id]: importInfoList }
+        );
+      }
 
-      const nextMissingNodeModules = Object.create(null);
+      const nextMissingModules = Object.create(null);
 
-      missingMap.forEach((ids, name) => {
+      for (const [name, missing] of missingMap) {
         const { newlyAdded, newlyMissing } =
-          scannerMap.get(name).addNodeModules(ids);
-        _.extend(allRelocatedNodeModules, newlyAdded);
-        _.extend(nextMissingNodeModules, newlyMissing);
-      });
+            await scannerMap.get(name).scanMissingModules(missing);
+        await ImportScanner.mergeMissing(allRelocatedModules, newlyAdded);
+        await ImportScanner.mergeMissing(nextMissingModules, newlyMissing);
+      }
 
-      if (! _.isEmpty(nextMissingNodeModules)) {
-        handleMissing(nextMissingNodeModules);
+      if (! _.isEmpty(nextMissingModules)) {
+        await handleMissing(nextMissingModules);
       }
     }
 
-    handleMissing(allMissingNodeModules);
+    await handleMissing(allMissingModules);
 
-    _.each(allRelocatedNodeModules, (info, id) => {
-      delete allMissingNodeModules[id];
+    Object.keys(allRelocatedModules).forEach(id => {
+      delete allMissingModules[id];
     });
 
-    this._warnAboutMissingModules(allMissingNodeModules);
-
-    const meteorProvidesBabelRuntime = map.has("babel-runtime");
+    this._warnAboutMissingModules(allMissingModules);
 
     scannerMap.forEach((scanner, name) => {
       const isApp = ! name;
-      const isWeb = scanner.isWeb();
       const outputFiles = scanner.getOutputFiles();
+      const entry = map.get(name);
+
+      if (entry.batch.useMeteorInstall) {
+        outputFiles.forEach(file => {
+          // Give every file the same meteorInstallOptions object, so the
+          // linker can emit one meteorInstall call per options object.
+          file.meteorInstallOptions = entry.batch.meteorInstallOptions;
+        });
+      }
 
       if (isApp) {
         const appFilesWithoutNodeModules = [];
+        const modulesEntry = map.get("modules");
 
         outputFiles.forEach(file => {
-          const parts = file.installPath.split("/");
-
-          if (meteorProvidesBabelRuntime || ! isWeb) {
-            // If the Meteor babel-runtime package is installed, it will
-            // provide implementations for babel-runtime/helpers/* and
-            // babel-runtime/regenerator at runtime, so we should filter
-            // out any node_modules/babel-runtime/* modules from the app.
-            // If the Meteor babel-runtime package is not installed, then
-            // we should rely on node_modules/babel-runtime/* instead. On
-            // the server that still means removing bundled files here and
-            // relying on programs/server/npm/node_modules/babel-runtime,
-            // but on the web these bundled files are all we have, so we'd
-            // better not remove them.
-            if (checkBabelRuntimeHelper(file.installPath)) {
-              return;
-            }
-          }
-
+          const parts = file.absModuleId.split("/");
+          assert.strictEqual(parts[0], "");
           const nodeModulesIndex = parts.indexOf("node_modules");
 
-          if (nodeModulesIndex === -1 || (nodeModulesIndex === 0 &&
-                                          parts[1] === "meteor")) {
+          if (nodeModulesIndex === -1 || (nodeModulesIndex === 1 &&
+                                          parts[2] === "meteor")) {
             appFilesWithoutNodeModules.push(file);
           } else {
+            // There's a chance the application does not use the module
+            // system, which means entry.batch.useMeteorInstall will be
+            // false and file.meteorInstallOptions will not have been
+            // defined above. In that case, just use meteorInstallOptions
+            // from the modules source batch, since we're moving this file
+            // into the modules bundle.
+            file.meteorInstallOptions = file.meteorInstallOptions ||
+              modulesEntry.batch.meteorInstallOptions;
+
             // This file is going to be installed in a node_modules
             // directory, so we move it to the modules bundle so that it
             // can be imported by any package that uses the modules
@@ -1140,26 +1565,71 @@ export class PackageSourceBatch {
             // client/node_modules will not be importable by Meteor
             // packages, because it's important for all npm packages in
             // the app to share the same limited scope (i.e. the scope of
-            // the modules package).
-            map.get("modules").files.push(file);
+            // the modules package). However, these relocated files have
+            // their own meteorInstallOptions, and will be installed with
+            // a separate call to meteorInstall in the modules bundle.
+            modulesEntry.files.push(file);
           }
         });
 
-        map.get(null).files = appFilesWithoutNodeModules;
+        entry.files = appFilesWithoutNodeModules;
 
       } else {
-        map.get(name).files = outputFiles;
+        entry.files = outputFiles;
       }
     });
 
-    return map;
+    return this._watchOutputFiles(map);
   }
 
-  static _warnAboutMissingModules(missingNodeModules) {
+  static _watchOutputFiles(jsOutputFilesMap) {
+    // Watch all output files produced by computeJsOutputFilesMap.
+    jsOutputFilesMap.forEach(entry => {
+      entry.files.forEach(file => {
+        // Output resources are not directly marked as definitely used. Instead,
+        // its input resource might be if its content was used by a build plugin.
+        // This is checked in Target#_emitResources
+        if (file instanceof OutputResource) {
+          return;
+        }
+
+        const {
+          sourcePath,
+          absPath = sourcePath &&
+            files.pathJoin(entry.batch.sourceRoot, sourcePath),
+        } = file;
+        const { importScannerWatchSet } = entry;
+        if (
+          typeof absPath === "string" &&
+          // Blindly calling importScannerWatchSet.addFile would be
+          // logically correct here, but we can save the cost of calling
+          // optimisticHashOrNull(absPath) if the importScannerWatchSet
+          // already knows about the file and it has not been marked as
+          // potentially unused.
+          ! importScannerWatchSet.isDefinitelyUsed(absPath)
+        ) {
+          // If this file was previously added to the importScannerWatchSet
+          // using the addPotentiallyUnusedFile method (see compileUnibuild),
+          // calling addFile here will update its usage status to reflect that
+          // the ImportScanner did, in fact, end up "using" the file.
+          importScannerWatchSet.addFile(absPath, optimisticHashOrNull(absPath));
+        }
+      });
+    });
+    return jsOutputFilesMap;
+  }
+
+  static _warnAboutMissingModules(missingModules) {
     const topLevelMissingIDs = {};
     const warnings = [];
 
-    _.each(missingNodeModules, (info, id) => {
+    Object.keys(missingModules).forEach(id => {
+      // Issue at most one warning per module identifier, even if there
+      // are multiple parent modules that failed to import it.
+      missingModules[id].some(info => maybeWarn(id, info));
+    });
+
+    function maybeWarn(id, info) {
       if (info.packageName) {
         // Silence warnings generated by Meteor packages, since package
         // authors can be trusted to test their packages, and may have
@@ -1174,6 +1644,11 @@ export class PackageSourceBatch {
         // Silence warnings for missing dependencies in Browserify/Webpack
         // bundles, since we can reasonably conclude at this point that
         // they are false positives.
+        return;
+      }
+
+      if (id.startsWith("#")) {
+        // CSS fragment identifiers are not JS modules.
         return;
       }
 
@@ -1196,15 +1671,12 @@ export class PackageSourceBatch {
       const parts = id.split("/");
 
       if ("./".indexOf(id.charAt(0)) < 0) {
-        const packageDir = parts[0];
+        const packageDir = parts[0].startsWith("@")
+          ? parts[0] + "/" + parts[1]
+          : parts[0];
+
         if (packageDir === "meteor") {
           // Don't print warnings for uninstalled Meteor packages.
-          return;
-        }
-
-        if (packageDir === "babel-runtime") {
-          // Don't print warnings for babel-runtime/helpers/* modules,
-          // since we provide most of those.
           return;
         }
 
@@ -1230,7 +1702,9 @@ export class PackageSourceBatch {
 
       warnings.push(`  ${JSON.stringify(id)} in ${
         info.parentPath} (${info.bundleArch})`);
-    });
+
+      return true;
+    }
 
     if (warnings.length > 0) {
       Console.rawWarn("\nUnable to resolve some modules:\n\n");
@@ -1251,28 +1725,21 @@ export class PackageSourceBatch {
   // that end up in the program for this package.  By this point, it knows what
   // its dependencies are and what their exports are, so it can set up
   // linker-style imports and exports.
-  getResources({
-    files: jsResources,
-    importExtensions = [".js", ".json"],
-  }) {
+  async getResources(jsResources, onCacheKey) {
     buildmessage.assertInJob();
 
-    function flatten(arrays) {
-      return Array.prototype.concat.apply([], arrays);
-    }
+    const resources = [];
 
-    const resources = flatten(_.pluck(this.resourceSlots, 'outputResources'));
+    this.resourceSlots.forEach(slot => {
+      resources.push(...slot.outputResources);
+    });
 
-    resources.push(...this._linkJS(jsResources || flatten(
-      _.pluck(this.resourceSlots, 'jsOutputResources')
-    ), this.useMeteorInstall && {
-      extensions: importExtensions
-    }));
+    resources.push(...await this._linkJS(jsResources, onCacheKey));
 
     return resources;
   }
 
-  _linkJS(jsResources, meteorInstallOptions) {
+  async _linkJS(jsResources, onCacheKey = () => {}) {
     const self = this;
     buildmessage.assertInJob();
 
@@ -1282,8 +1749,8 @@ export class PackageSourceBatch {
     const isApp = ! self.unibuild.pkg.name;
     const isWeb = archinfo.matches(self.unibuild.arch, "web");
     const linkerOptions = {
-      useGlobalNamespace: isApp,
-      meteorInstallOptions,
+      isApp,
+      bundleArch,
       // I was confused about this, so I am leaving a comment -- the
       // combinedServePath is either [pkgname].js or [pluginName]:plugin.js.
       // XXX: If we change this, we can get rid of source arch names!
@@ -1296,47 +1763,56 @@ export class PackageSourceBatch {
       declaredExports: _.pluck(self.unibuild.declaredExports, 'name'),
       imports: self.importedSymbolToPackageName,
       // XXX report an error if there is a package called global-imports
-      importStubServePath: isApp && '/packages/global-imports.js',
       includeSourceMapInstructions: isWeb,
-      noLineNumbers: !isWeb
+      deps: self.deps
     };
 
-    const cacheKey = sha1(JSON.stringify({
-      LINKER_CACHE_SALT,
+    const fileHashes = [];
+    const cacheKeyPrefix = sha1(JSON.stringify({
       linkerOptions,
-      files: jsResources.map((inputFile) => {
-        return {
-          hash: inputFile.hash,
-          installPath: inputFile.installPath,
-          sourceMap: !! inputFile.sourceMap,
-          mainModule: inputFile.mainModule,
-          imported: inputFile.imported,
-          lazy: inputFile.lazy,
-          bare: inputFile.bare,
-        };
-      })
+      files: await Promise.all(
+        jsResources.map(async (inputFile) => {
+          fileHashes.push(await inputFile.hash);
+          return {
+            meteorInstallOptions: inputFile.meteorInstallOptions,
+            absModuleId: inputFile.absModuleId,
+            sourceMap: !!(await inputFile.sourceMap),
+            mainModule: inputFile.mainModule,
+            imported: inputFile.imported,
+            alias: inputFile.alias,
+            lazy: inputFile.lazy,
+            bare: inputFile.bare,
+          };
+        })
+      )
     }));
+    const cacheKeySuffix = sha1(JSON.stringify({
+      LINKER_CACHE_SALT,
+      fileHashes
+    }));
+    const cacheKey = `${cacheKeyPrefix}_${cacheKeySuffix}`;
+    await onCacheKey(cacheKey, jsResources);
 
-    {
-      const inMemoryCached = LINKER_CACHE.get(cacheKey);
-      if (inMemoryCached) {
-        if (CACHE_DEBUG) {
-          console.log('LINKER IN-MEMORY CACHE HIT:',
-                      linkerOptions.name, bundleArch);
-        }
-        return inMemoryCached;
+    if (LINKER_CACHE.has(cacheKey)) {
+      if (CACHE_DEBUG) {
+        console.log('LINKER IN-MEMORY CACHE HIT:',
+                    linkerOptions.name, bundleArch);
       }
+      return LINKER_CACHE.get(cacheKey);
     }
 
-    const cacheFilename = self.linkerCacheDir && files.pathJoin(
-      self.linkerCacheDir, cacheKey + '.cache');
+    const cacheFilename = self.linkerCacheDir &&
+      files.pathJoin(self.linkerCacheDir, cacheKey + '.cache');
+
+    const wildcardCacheFilename = cacheFilename &&
+      files.pathJoin(self.linkerCacheDir, cacheKeyPrefix + "_*.cache");
 
     // The return value from _linkJS includes Buffers, but we want everything to
     // be JSON for writing to the disk cache. This function converts the string
     // version to the Buffer version.
     function bufferifyJSONReturnValue(resources) {
       resources.forEach((r) => {
-        r.data = new Buffer(r.data, 'utf8');
+        r.data = Buffer.from(r.data, 'utf8');
       });
     }
 
@@ -1371,8 +1847,8 @@ export class PackageSourceBatch {
     // mutate anything from it.
     let canCache = true;
     let linkedFiles = null;
-    buildmessage.enterJob('linking', () => {
-      linkedFiles = linker.fullLink(jsResources, linkerOptions);
+    await buildmessage.enterJob('linking', async () => {
+      linkedFiles = await linker.fullLink(jsResources, linkerOptions);
       if (buildmessage.jobHasMessages()) {
         canCache = false;
       }
@@ -1387,6 +1863,7 @@ export class PackageSourceBatch {
         // before returning from the method (but after writing
         // to cache).
         data: file.source,
+        hash: file.hash,
         servePath: file.servePath,
         sourceMap: sm
       };
@@ -1404,7 +1881,11 @@ export class PackageSourceBatch {
       LINKER_CACHE.set(cacheKey, ret);
       if (cacheFilename) {
         // Write asynchronously.
-        Fiber(() => files.writeFileAtomically(cacheFilename, retAsJSON)).run();
+        try {
+          await files.rm_recursive_deferred(wildcardCacheFilename);
+        } finally {
+          await files.writeFileAtomically(cacheFilename, retAsJSON);
+        }
       }
     }
 
@@ -1425,7 +1906,8 @@ _.each([
 
 // static methods to measure in profile
 _.each([
-  "computeJsOutputFilesMap"
+  "computeJsOutputFilesMap",
+  "_watchOutputFiles"
 ], method => {
   PackageSourceBatch[method] = Profile(
     "PackageSourceBatch." + method,

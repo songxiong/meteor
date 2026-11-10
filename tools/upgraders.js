@@ -1,11 +1,10 @@
 /* eslint no-console: 0 */
 
 var _ = require('underscore');
-var files = require('./fs/files.js');
+var files = require('./fs/files');
 var Console = require('./console/console.js').Console;
-import main from './cli/main.js';
 import buildmessage from './utils/buildmessage.js';
-import * as cordova from './cordova';
+import { convertPluginVersions } from './cordova/index.js';
 
 // This file implements "upgraders" --- functions which upgrade a Meteor app to
 // a new version. Each upgrader has a name (registered in upgradersByName).
@@ -53,37 +52,41 @@ var upgradersByName = {
 
      if (files.exists(smartJsonPath)) {
        // Meteorite apps:
-       console.log(
-"0.9.0: Welcome to the new Meteor package system! You can now add any Meteor\n" +
-"       package to your app (from more than 1800 packages available on the\n" +
-"       Meteor Package Server) just by typing 'meteor add <packagename>', no\n" +
-"       Meteorite required.\n" +
-"\n" +
-"       It looks like you have been using Meteorite with this project. To\n" +
-"       migrate your project automatically to the new system:\n" +
-"         (1) upgrade your Meteorite with 'npm install -g meteorite', then\n" +
-"         (2) run 'mrt migrate-app' inside the project.\n" +
-"       Having done this, you no longer need 'mrt' and can just use 'meteor'.\n");
+       Console.info(
+         "Welcome to the new Meteor package system! You can now add any Meteor\n",
+         "package to your app (from more than 1800 packages available on the\n",
+         "Meteor Package Server) just by typing 'meteor add <packagename>', no\n",
+         "Meteorite required.\n\n",
+         "It looks like you have been using Meteorite with this project. To\n",
+         "migrate your project automatically to the new system:\n",
+         "(1) upgrade your Meteorite with 'npm install -g meteorite', then\n",
+         "(2) run 'mrt migrate-app' inside the project.\n",
+         "Having done this, you no longer need 'mrt' and can just use 'meteor'.\n",
+         Console.options({ bulletPoint: "0.9.1: " })
+       );
      } else {
        // Non-Meteorite apps:
-       console.log(
-"0.9.0: Welcome to the new Meteor package system! You can now add any Meteor\n" +
-"       package to your app (from more than 1800 packages available on the\n" +
-"       Meteor Package Server) just by typing 'meteor add <packagename>'. Check\n" +
-"       out the available packages by typing 'meteor search <term>' or by\n" +
-"       visiting atmospherejs.com.\n");
+       Console.info(
+         "Welcome to the new Meteor package system! You can now add any Meteor\n",
+         "package to your app (from more than 1800 packages available on the\n",
+         "Meteor Package Server) just by typing 'meteor add <packagename>'. Check\n",
+         "out the available packages by typing 'meteor search <term>' or by\n",
+         "visiting atmospherejs.com.\n", Console.options({ bulletPoint: "0.9.0: " })
+       );
      }
-    console.log();
+    Console.info();
   },
 
   "notices-for-0.9.1": function () {
     maybePrintNoticeHeader();
-    console.log(
-"0.9.1: Meteor 0.9.1 includes changes to the Blaze API, in preparation for 1.0.\n" +
-"       Many previously undocumented APIs are now public and documented. Most\n" +
-"       changes are backwards compatible, except that templates can no longer\n" +
-"       be named \"body\" or \"instance\".\n");
-    console.log();
+    Console.info(
+      "Meteor 0.9.1 includes changes to the Blaze API, in preparation for 1.0.\n",
+      "Many previously undocumented APIs are now public and documented. Most\n",
+      "changes are backwards compatible, except that templates can no longer\n",
+      "be named \"body\" or \"instance\".\n",
+      Console.options({ bulletPoint: "0.9.1: " })
+    );
+    Console.info();
   },
 
   // In 0.9.4, the platforms file contains "server" and "browser" as platforms,
@@ -183,7 +186,7 @@ var upgradersByName = {
       messages = buildmessage.capture(
         { title: `converting Cordova plugins` }, () => {
         let pluginVersions = pluginsFile.getPluginVersions();
-        pluginVersions = cordova.convertPluginVersions(pluginVersions);
+        pluginVersions = convertPluginVersions(pluginVersions);
         pluginsFile.write(pluginVersions);
       });
     }
@@ -239,6 +242,96 @@ the guide about breaking changes here:`,
     packagesFile.writeIfModified();
   },
 
+  "1.4.3-split-account-service-packages": function (projectContext) {
+
+    maybePrintNoticeHeader();
+    Console.info(
+`The account packages for different services (e.g. facebook, twitter, \
+google, etc.) have been split and now make it possible to avoid bundling Blaze \
+in the client bundle for projects not using Blaze. If found in the \
+.meteor/packages file, these packages have been split automatically. Assuming \
+there are no other Blaze dependencies, the "<service>-config-ui" package can \
+be removed if there is no need for the Blaze configuration interface.`,
+      Console.options({ bulletPoint: "1.4.3: " })
+    );
+
+    const packagesFile = projectContext.projectConstraintsFile;
+
+    // The transformations to be made here are:
+    //   * Existence of `accounts-<service>` **adds** `<service>-config-ui`
+    //   * Existence of `<service>` **changes to** `<service>-oauth`
+    // https://github.com/meteor/meteor/issues/7715#issuecomment-276529351
+
+    const servicesAffected = [
+      'facebook',
+      'github',
+      'google',
+      'meetup',
+      'meteor-developer',
+      'twitter',
+      'weibo',
+    ];
+
+    servicesAffected.forEach(service => {
+      // If `accounts-<service>`, we just add the configuration UI
+      if (packagesFile.getConstraint(`accounts-${service}`)) {
+        packagesFile.addPackages([`${service}-config-ui`]);
+      }
+
+      // If `<service>`, it changes to `<service>-oauth`
+      if (packagesFile.getConstraint(service)) {
+        packagesFile.removePackages([service]);
+        packagesFile.addPackages([`${service}-oauth`]);
+      }
+    });
+
+    packagesFile.writeIfModified();
+  },
+
+  "1.5-add-dynamic-import-package": function (projectContext) {
+    const packagesFile = projectContext.projectConstraintsFile;
+    packagesFile.addPackages(["dynamic-import"]);
+    packagesFile.writeIfModified();
+  },
+
+  '1.7-split-underscore-from-meteor-base': function (projectContext) {
+    const packagesFile = projectContext.projectConstraintsFile;
+    if (! packagesFile.getConstraint(`underscore`) &&
+      packagesFile.getConstraint(`meteor-base`)) {
+
+      maybePrintNoticeHeader();
+      Console.info(
+`The underscore package has been removed as a dependency of all packages in \
+meteor-base. Since some apps may have been using underscore through this \
+dependency without having it listed in their .meteor/packages files, it has \
+been added automatically. If your app is not using underscore, then you can \
+safely remove it using 'meteor remove underscore'.`,
+        Console.options({ bulletPoint: "1.7: " })
+      );
+      packagesFile.addPackages([`underscore`]);
+      packagesFile.writeIfModified();
+    }
+  },
+
+  '1.8.3-split-jquery-from-blaze': function (projectContext) {
+    const packagesFile = projectContext.projectConstraintsFile;
+    if (! packagesFile.getConstraint(`jquery`) &&
+      packagesFile.getConstraint(`blaze-html-templates`)) {
+
+      maybePrintNoticeHeader();
+      Console.info(
+`The jquery package has become a weak dependency of the blaze package. \
+Since you will most likely need jquery as the commonly used blaze backend \
+and it was not listed in your .meteor/packages files, it has \
+been added automatically. If your app is not using jquery, then you can \
+safely remove it using 'meteor remove jquery'.`,
+        Console.options({ bulletPoint: "1.8.3: " })
+      );
+      packagesFile.addPackages([`jquery`]);
+      packagesFile.writeIfModified();
+    }
+  }
+
   ////////////
   // PLEASE. When adding new upgraders that print mesasges, follow the
   // examples for 0.9.0 and 0.9.1 above. Specifically, formatting
@@ -265,7 +358,7 @@ exports.upgradersToRun = function (projectContext) {
   var finishedUpgraders = projectContext.finishedUpgraders.readUpgraders();
   // This relies on the fact that Node guarantees object iteration ordering.
   _.each(upgradersByName, function (func, name) {
-    if (! _.contains(finishedUpgraders, name)) {
+    if (! finishedUpgraders.includes(name)) {
       ret.push(name);
     }
   });
@@ -273,5 +366,5 @@ exports.upgradersToRun = function (projectContext) {
 };
 
 exports.allUpgraders = function () {
-  return _.keys(upgradersByName);
+  return Object.keys(upgradersByName);
 };

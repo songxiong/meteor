@@ -1,72 +1,94 @@
-var Fiber = Npm.require('fibers');
-var handlesForRun = {};
-var reportsForRun = {};
+import { Tinytest } from "./tinytest.js";
+import { check, Match } from "meteor/check";
+import { Random } from "meteor/random";
+import { Meteor } from "meteor/meteor";
+import {
+  ServerTestResultsSubscription,
+  ServerTestResultsCollection,
+} from "./model.js";
 
-Meteor.publish(Meteor._ServerTestResultsSubscription, function (runId) {
+export { Tinytest };
+
+const handlesForRun = new Map;
+const reportsForRun = new Map;
+
+Meteor.publish(ServerTestResultsSubscription, async function (runId) {
   check(runId, String);
-  var self = this;
-  if (!_.has(handlesForRun, runId))
-    handlesForRun[runId] = [self];
-  else
-    handlesForRun[runId].push(self);
-  self.onStop(function () {
-    handlesForRun[runId] = _.without(handlesForRun[runId], self);
-  });
-  if (_.has(reportsForRun, runId)) {
-    self.added(Meteor._ServerTestResultsCollection, runId,
-               reportsForRun[runId]);
-  } else {
-    self.added(Meteor._ServerTestResultsCollection, runId, {});
+
+  if (! handlesForRun.has(runId)) {
+    handlesForRun.set(runId, new Set);
   }
-  self.ready();
+
+  handlesForRun.get(runId).add(this);
+
+  this.onStop(() => {
+    handlesForRun.get(runId).delete(this);
+  });
+
+  if (reportsForRun.has(runId)) {
+    this.added(ServerTestResultsCollection, runId,
+               reportsForRun.get(runId));
+  } else {
+    this.added(ServerTestResultsCollection, runId, {});
+  }
+
+  this.ready();
 });
 
 Meteor.methods({
-  'tinytest/run': function (runId, pathPrefix) {
+  async 'tinytest/run'(runId, pathPrefix) {
     check(runId, String);
     check(pathPrefix, Match.Optional([String]));
+
+    const collections = await MongoInternals.defaultRemoteCollectionDriver().mongo.db.collections();
+
+    for (const collection of collections) {
+      await collection.deleteMany({});
+    }
+
     this.unblock();
 
-    reportsForRun[runId] = {};
+    reportsForRun.set(runId, Object.create(null));
 
-    var addReport = function (key, report) {
+    function addReport(key, report) {
       var fields = {};
       fields[key] = report;
-      _.each(handlesForRun[runId], function (handle) {
-        handle.changed(Meteor._ServerTestResultsCollection, runId, fields);
-      });
-      // Save for future subscriptions.
-      reportsForRun[runId][key] = report;
-    };
-
-    var onReport = function (report) {
-      if (! Fiber.current) {
-        Meteor._debug("Trying to report a test not in a fiber! "+
-                      "You probably forgot to wrap a callback in bindEnvironment.");
-        console.trace();
+      const handles = handlesForRun.get(runId);
+      if (handles) {
+        handles.forEach(handle => {
+          handle.changed(ServerTestResultsCollection, runId, fields);
+        });
       }
+      // Save for future subscriptions.
+      reportsForRun.get(runId)[key] = report;
+    }
+
+    function onReport(report) {
       var dummyKey = Random.id();
       addReport(dummyKey, report);
-    };
+    }
 
-    var onComplete = function() {
+    function onComplete() {
       // We send an object for current and future compatibility,
       // though we could get away with just sending { complete: true }
       var report = { done: true };
       var key = 'complete';
       addReport(key, report);
-    };
+    }
 
     Tinytest._runTests(onReport, onComplete, pathPrefix);
   },
-  'tinytest/clearResults': function (runId) {
+
+  'tinytest/clearResults'(runId) {
     check(runId, String);
-    _.each(handlesForRun[runId], function (handle) {
+
+    handlesForRun.get(runId)?.forEach(handle => {
       // XXX this doesn't actually notify the client that it has been
       // unsubscribed.
       handle.stop();
     });
-    delete handlesForRun[runId];
-    delete reportsForRun[runId];
+
+    handlesForRun.delete(runId);
+    reportsForRun.delete(runId);
   }
 });

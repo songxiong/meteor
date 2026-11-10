@@ -1,12 +1,15 @@
 Package.describe({
-  summary: "Manage the configuration for third-party services",
-  version: "1.0.11-rc.0"
+  summary: 'Manage the configuration for third-party services',
+  version: '1.3.6',
 });
 
 Package.onUse(function(api) {
   api.use('accounts-base', ['client', 'server']);
   api.use('mongo', ['client', 'server']);
+  api.use('ecmascript', ['client', 'server']);
   api.export('ServiceConfiguration');
   api.addFiles('service_configuration_common.js', ['client', 'server']);
   api.addFiles('service_configuration_server.js', 'server');
+  api.addAssets('service-configuration.d.ts', 'server');
+  api.types('service-configuration.native.d.ts');
 });

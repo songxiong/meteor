@@ -1,138 +1,232 @@
-var streamBuffers = Npm.require('stream-buffers');
+import { Email } from 'meteor/email';
+import { smokeEmailTest } from './email_test_helpers';
+import { TEST_CASES } from './email_tests_data';
 
-var devWarningBanner = "(Mail not sent; to enable " +
-  "sending, set the MAIL_URL environment variable.)\n";
+const CUSTOM_TRANSPORT_SETTINGS = {
+  email: { service: '1on1', user: 'test', password: 'pwd' },
+};
 
-function smokeEmailTest(testFunction) {
-  // This only tests dev mode, so don't run the test if this is deployed.
-  if (process.env.MAIL_URL) return;
+// Create dynamic async tests
+TEST_CASES.forEach(({ title, options, testCalls }) => {
+  Tinytest.addAsync(`${title}`, async function (test, onComplete) {
+    let resolver;
+    const promise = new Promise(r => resolver = r);
+    smokeEmailTest((stream) => {
+      const allPromises = Object.entries(options).map(([key, option]) => {
+        const testCall = testCalls[key];
+        return Email.sendAsync({ ...option, stream }).then(() => {
+          testCall(test, stream);
+        });
+      });
+      Promise.all(allPromises).then(() => resolver()).catch(console.error);
+    });
+    await promise;
+  });
+});
 
-  try {
-    var stream = new streamBuffers.WritableStreamBuffer;
-    EmailTest.overrideOutputStream(stream);
+// Individual Async tests
 
-    testFunction(stream);
+Tinytest.addAsync(
+  'email - alternate API is used for sending gets data',
+  function (test, onComplete) {
+    const allPromises = [];
+    smokeEmailTest((stream) => {
+      Email.customTransport = (options) => {
+        test.equal(options.from, 'foo@example.com');
+      };
+      allPromises.push(
+        Email.sendAsync({
+          from: 'foo@example.com',
+          to: 'bar@example.com',
+          text: '*Cool*, man',
+          html: '<i>Cool</i>, man',
+          stream,
+        }).then(() => {
+          test.equal(stream.getContentsAsString('utf8'), false);
+        })
+      );
+    });
 
-  } finally {
-    EmailTest.restoreOutputStream();
+    smokeEmailTest(function (stream) {
+      Meteor.settings.packages = CUSTOM_TRANSPORT_SETTINGS;
+      Email.customTransport = (options) => {
+        test.equal(options.from, 'foo@example.com');
+        test.equal(options.packageSettings?.service, '1on1');
+      };
+
+      allPromises.push(
+        Email.sendAsync({
+          from: 'foo@example.com',
+          to: 'bar@example.com',
+          text: '*Cool*, man',
+          html: '<i>Cool</i>, man',
+          stream,
+        }).then(() => {
+          test.equal(stream.getContentsAsString('utf8'), false);
+        })
+      );
+    });
+    Promise.all(allPromises).then(() => {
+      Email.customTransport = undefined;
+      Meteor.settings.packages = undefined;
+      onComplete();
+    });
   }
-}
+);
 
-Tinytest.add("email - fully customizable", function (test) {
-  smokeEmailTest(function(stream) {
-    Email.send({
-      from: "foo@example.com",
-      to: "bar@example.com",
-      cc: ["friends@example.com", "enemies@example.com"],
-      subject: "This is the subject",
-      text: "This is the body\nof the message\nFrom us.",
-      headers: {
-        'X-Meteor-Test': 'a custom header',
-        'Date': 'dummy',
-      },
+Tinytest.addAsync(
+  'email - hooks stop the sending',
+  function (test, onComplete) {
+    // Register hooks
+    const hook1 = Email.hookSend((options) => {
+      // Test that we get options through
+      test.equal(options.from, 'foo@example.com');
+      console.log('EXECUTE');
+      return true;
     });
-    // XXX brittle if mailcomposer changes header order, etc
-    test.equal(stream.getContentsAsString("utf8"),
-               "====== BEGIN MAIL #0 ======\n" +
-               devWarningBanner +
-               "MIME-Version: 1.0\r\n" +
-               "X-Meteor-Test: a custom header\r\n" +
-               "Date: dummy\r\n" +
-               "From: foo@example.com\r\n" +
-               "To: bar@example.com\r\n" +
-               "Cc: friends@example.com, enemies@example.com\r\n" +
-               "Subject: This is the subject\r\n" +
-               "Content-Type: text/plain; charset=utf-8\r\n" +
-               "Content-Transfer-Encoding: quoted-printable\r\n" +
-               "\r\n" +
-               "This is the body\r\n" +
-               "of the message\r\n" +
-               "From us.\r\n" +
-               "====== END MAIL #0 ======\n");
+    const hook2 = Email.hookSend(() => {
+      console.log('STOP');
+      return false;
+    });
+    const hook3 = Email.hookSend(() => {
+      console.log('FAIL');
+    });
+    smokeEmailTest((stream) => {
+      Email.sendAsync({
+        from: 'foo@example.com',
+        to: 'bar@example.com',
+        text: '*Cool*, man',
+        html: '<i>Cool</i>, man',
+        stream,
+      }).then(() => {
+        test.equal(stream.getContentsAsString('utf8'), false);
+        hook1.stop();
+        hook2.stop();
+        hook3.stop();
+        onComplete();
+      });
+    });
+  }
+);
+
+// Another tests
+
+Tinytest.add('email - URL string for known hosts', function (test) {
+  const oneTransport = EmailTest.knowHostsTransport({
+    service: '1und1',
+    user: 'test',
+    password: 'pwd',
   });
+  test.equal(oneTransport.transporter.auth.type, 'LOGIN');
+  test.equal(oneTransport.transporter.auth.user, 'test');
+
+  const aolUrlTransport = EmailTest.knowHostsTransport(
+    null,
+    'AOL://test:pwd@aol.com'
+  );
+  test.equal(aolUrlTransport.transporter.auth.user, 'test');
+  test.equal(aolUrlTransport.transporter.auth.type, 'LOGIN');
+
+  const outlookTransport = EmailTest.knowHostsTransport(
+    null,
+    'Outlook365://firstname.lastname%40hotmail.com:password@hotmail.com'
+  );
+  const outlookTransport2 = EmailTest.knowHostsTransport(
+    undefined,
+    'Outlook365://firstname.lastname@hotmail.com:password@hotmail.com'
+  );
+  test.equal(
+    outlookTransport.transporter.auth.user,
+    'firstname.lastname%40hotmail.com'
+  );
+  test.equal(
+    outlookTransport.options.auth.user,
+    'firstname.lastname%40hotmail.com'
+  );
+  test.equal(outlookTransport.transporter.options.service, 'outlook365');
+  test.equal(
+    outlookTransport2.transporter.auth.user,
+    'firstname.lastname%40hotmail.com'
+  );
+  test.equal(outlookTransport2.transporter.options.service, 'outlook365');
+
+  const hotmailTransport = EmailTest.knowHostsTransport(
+    undefined,
+    'Hotmail://firstname.lastname@hotmail.com:password@hotmail.com'
+  );
+  console.dir(hotmailTransport);
+  test.equal(hotmailTransport.transporter.options.service, 'hotmail');
+
+  const falseService = CUSTOM_TRANSPORT_SETTINGS.email;
+  const errorMsg =
+    'Could not recognize e-mail service. See list at https://nodemailer.com/smtp/well-known/ for services that we can configure for you.';
+  test.throws(() => EmailTest.knowHostsTransport(falseService), errorMsg);
+  test.throws(
+    () => EmailTest.knowHostsTransport(null, 'smtp://bbb:bb@bb.com'),
+    errorMsg
+  );
 });
 
-Tinytest.add("email - undefined headers sends properly", function (test) {
-  smokeEmailTest(function (stream) {
-    Email.send({
-      from: "foo@example.com",
-      to: "bar@example.com",
-      subject: "This is the subject",
-      text: "This is the body\nof the message\nFrom us.",
+Tinytest.addAsync(
+  'email - with custom transport exception',
+  async function (test) {
+    Meteor.settings.packages = CUSTOM_TRANSPORT_SETTINGS;
+    Email.customTransport = (options) => {
+      test.equal(options.from, 'foo@example.com');
+      test.equal(options.packageSettings?.service, '1on1');
+      throw new Meteor.Error('Expected error');
+    };
+    await Email.sendAsync({
+      from: 'foo@example.com',
+      to: 'bar@example.com',
+    }).catch((err) => {
+      test.equal(err.error, 'Expected error');
     });
+    Meteor.settings.packages = undefined;
+    Email.customTransport = undefined;
+  }
+);
 
-    test.matches(stream.getContentsAsString("utf8"),
-      /^====== BEGIN MAIL #0 ======$[\s\S]+^To: bar@example.com$/m);
-  });
-});
-
-Tinytest.add("email - multiple e-mails same stream", function (test) {
-  smokeEmailTest(function (stream) {
-    Email.send({
-      from: "foo@example.com",
-      to: "bar@example.com",
-      subject: "This is the subject",
-      text: "This is the body\nof the message\nFrom us.",
+Tinytest.addAsync(
+  '[Async] email - with custom encryption',
+  function (test, onComplete) {
+    const allPromises = [];
+    smokeEmailTest((stream) => {
+      Email.customTransport = (options) => {
+        test.equal(options.encryptionKeys, ['-----BEGIN PGP PUBLIC KEY BLOCK-----…']);
+        test.equal(options.shouldSign, true);
+      };
+      allPromises.push(
+        Email.sendAsync({
+          from: 'foo@example.com',
+          to: 'bar@example.com',
+          text: '*Cool*, man',
+          html: '<i>Cool</i>, man',
+          encryptionKeys: ['-----BEGIN PGP PUBLIC KEY BLOCK-----…'],
+          shouldSign: true
+        }).then(() => {
+          test.equal(stream.getContentsAsString('utf8'), false);
+        })
+      );
+      Promise.all(allPromises).then(() => onComplete());
     });
+  }
+);
 
-    var contents;
-
-    contents = stream.getContentsAsString("utf8");
-    test.matches(contents, /^====== BEGIN MAIL #0 ======$/m);
-    test.matches(contents, /^From: foo@example.com$/m);
-    test.matches(contents, /^To: bar@example.com$/m);
-
-    Email.send({
-      from: "qux@example.com",
-      to: "baz@example.com",
-      subject: "This is important",
-      text: "This is another message\nFrom Qux.",
+Tinytest.addAsync(
+  'email - with custom transport long time running',
+  async function (test) {
+    Meteor.settings.packages = CUSTOM_TRANSPORT_SETTINGS;
+    Email.customTransport = async (options) => {
+      await Meteor._sleepForMs(3000);
+      test.equal(options.from, 'foo@example.com');
+      test.equal(options.packageSettings?.service, '1on1');
+    };
+    await Email.sendAsync({
+      from: 'foo@example.com',
+      to: 'bar@example.com',
     });
-
-    contents = stream.getContentsAsString("utf8");
-    test.matches(contents, /^====== BEGIN MAIL #1 ======$/m);
-    test.matches(contents, /^From: qux@example.com$/m);
-    test.matches(contents, /^To: baz@example.com$/m);
-
-  });
-});
-
-Tinytest.add("email - using mail composer", function (test) {
-  smokeEmailTest(function (stream) {
-    // Test direct MailComposer usage.
-    var mc = new EmailInternals.NpmModules.mailcomposer.module.MailComposer;
-    mc.setMessageOption({
-      from: "a@b.com",
-      text: "body"
-    });
-    Email.send({mailComposer: mc});
-    test.equal(stream.getContentsAsString("utf8"),
-               "====== BEGIN MAIL #0 ======\n" +
-               devWarningBanner +
-               "MIME-Version: 1.0\r\n" +
-               "From: a@b.com\r\n" +
-               "Content-Type: text/plain; charset=utf-8\r\n" +
-               "Content-Transfer-Encoding: quoted-printable\r\n" +
-               "\r\n" +
-               "body\r\n" +
-               "====== END MAIL #0 ======\n");
-  });
-});
-
-Tinytest.add("email - date auto generated", function (test) {
-  smokeEmailTest(function (stream) {
-    // Test if date header is automaticall generated, if not specified
-    Email.send({
-      from: "foo@example.com",
-      to: "bar@example.com",
-      subject: "This is the subject",
-      text: "This is the body\nof the message\nFrom us.",
-      headers: {
-        'X-Meteor-Test': 'a custom header',
-      },
-    });
-
-    test.matches(stream.getContentsAsString("utf8"),
-                 /^Date: .+$/m);
-  });
-});
+    Meteor.settings.packages = undefined;
+    Email.customTransport = undefined;
+  }
+);

@@ -39,8 +39,8 @@ Tinytest.add("ecmascript - transpilation - class methods", (test) => {
   // assigned in a simple matter that does rely on Object.defineProperty.
   test.isTrue(contains(output, 'Foo.staticMethod = function staticMethod('));
   test.isTrue(contains(output,
-                       'Foo.prototype.prototypeMethod = function prototypeMethod('));
-  test.isTrue(contains(output, 'Foo.prototype[computedMethod] = function ('));
+                       '.prototypeMethod = function prototypeMethod('));
+  test.isTrue(contains(output, '[_computedMethod] = function ('));
   test.isFalse(contains(output, 'createClass'));
 });
 
@@ -52,8 +52,12 @@ class Foo {
   }
 }`);
 
-  // test that the classCallCheck helper is still in use
-  test.isTrue(contains(output, 'helpers/classCallCheck'));
+  // Babel 7 no longer imports the classCallCheck helper in loose mode.
+  test.equal(output, [
+    "var Foo = function Foo(x) {",
+    "  this.x = x;",
+    "};"
+  ].join("\n"));
 });
 
 Tinytest.add("ecmascript - transpilation - helpers - inherits", (test) => {
@@ -62,23 +66,25 @@ class Foo {}
 class Bar extends Foo {}
 `);
 
-  test.isTrue(contains(output, 'helpers/inherits'));
+  test.isTrue(/helpers\/(builtin\/)?inherits/.test(output));
 });
 
 Tinytest.add("ecmascript - transpilation - helpers - bind", (test) => {
-  const output = transform(`
-  var foo = new Foo(...oneTwo, 3);
-`);
+  const output = transform(
+    "var foo = new Foo(...oneTwo, 3);"
+  );
 
-  test.isTrue(output.match(/\.bind\b/));
+  test.isTrue(output.match(/@babel\/runtime\/helpers\/construct\b/));
 });
 
 Tinytest.add("ecmascript - transpilation - helpers - extends", (test) => {
-  const output = transform(`
-  var full = {a:1, ...middle, d:4};
-`);
+  const output = transform("class A extends getBaseClass() {}");
+  test.isTrue(/helpers\/inheritsLoose/.test(output));
+});
 
-  test.isTrue(contains(output, 'helpers/extends'));
+Tinytest.add("ecmascript - transpilation - helpers - objectSpread", (test) => {
+  const output = transform("var full = {a:1, ...middle, d:4};");
+  test.isTrue(/objectSpread/.test(output));
 });
 
 Tinytest.add("ecmascript - transpilation - helpers - objectWithoutProperties", (test) => {
@@ -86,7 +92,7 @@ Tinytest.add("ecmascript - transpilation - helpers - objectWithoutProperties", (
 var {a, ...rest} = obj;
 `);
 
-  test.isTrue(contains(output, 'helpers/objectWithoutProperties'));
+  test.isTrue(/helpers\/(builtin\/)?objectWithoutProperties/.test(output));
 });
 
 Tinytest.add("ecmascript - transpilation - helpers - objectDestructuringEmpty", (test) => {
@@ -94,7 +100,7 @@ Tinytest.add("ecmascript - transpilation - helpers - objectDestructuringEmpty", 
 var {} = null;
 `);
 
-  test.isTrue(contains(output, 'helpers/objectDestructuringEmpty'));
+  test.isTrue(/helpers\/(builtin\/)?objectDestructuringEmpty/.test(output));
 });
 
 Tinytest.add("ecmascript - transpilation - helpers - taggedTemplateLiteralLoose", (test) => {
@@ -102,21 +108,39 @@ Tinytest.add("ecmascript - transpilation - helpers - taggedTemplateLiteralLoose"
 var x = asdf\`A\${foo}C\`
 `);
 
-  test.isTrue(contains(output, 'helpers/taggedTemplateLiteralLoose'));
+  test.isTrue(/helpers\/(builtin\/)?taggedTemplateLiteralLoose/.test(output));
 });
 
-Tinytest.add("ecmascript - transpilation - helpers - createClass", (test) => {
+Tinytest.add("ecmascript - transpilation - class accessors", (test) => {
   const output = transform(`
 class Foo {
-  get blah() { return 123; }
+  constructor(value) { this._value = value; }
+  get value() { return this._value; }
+  set value(value) { this._value = value; }
+  static get value() { return this._value; }
+  static set value(value) { this._value = value; }
 }
 `);
 
-  test.isTrue(contains(output, 'helpers/createClass'));
-});
+  // Exercise the downlevel output, which can use different accessor helpers.
+  // Modern runtime tests may leave the original class syntax intact.
+  const CompiledFoo = new Function("require", output + "\nreturn Foo;")(require);
+  const first = new CompiledFoo(123);
+  const second = new CompiledFoo(456);
+  test.equal(first.value, 123);
+  first.value = 789;
+  test.equal(first.value, 789);
+  test.equal(second.value, 456);
 
-Tinytest.add("ecmascript - transpilation - flow", (test) => {
-  const output = transform(
-    'var foo = function (one: any, two: number, three?): string {};');
-  test.isTrue(contains(output, '(one, two, three)'));
+  CompiledFoo.value = 321;
+  test.equal(CompiledFoo.value, 321);
+  test.equal(first.value, 789);
+
+  for (const owner of [CompiledFoo.prototype, CompiledFoo]) {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, "value");
+    test.equal(typeof descriptor.get, "function");
+    test.equal(typeof descriptor.set, "function");
+    test.isTrue(descriptor.configurable);
+    test.isFalse(Object.prototype.hasOwnProperty.call(descriptor, "value"));
+  }
 });

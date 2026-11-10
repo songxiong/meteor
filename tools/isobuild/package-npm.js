@@ -1,17 +1,24 @@
 import { ensureOnlyValidVersions } from "../utils/utils.js";
 import buildmessage from "../utils/buildmessage.js";
-import NpmDiscards from "./npm-discards.js";
+import NpmDiscards from "./npm-discards";
 
 const nodeRequire = require;
 
-// == Class of the `Npm` object visible in package.js ==
-
+  /**
+   * @summary Class of the 'Npm' object visible in package.js
+   * @locus package.js
+   * @instanceName Npm
+   * @showInstanceName true
+   */
 export class PackageNpm {
   constructor() {
     // Files to be stripped from the installed NPM dependency tree. See
     // the Npm.strip comment below for further usage information.
     this._discards = new NpmDiscards;
     this._dependencies = null;
+    this._devDependencies = null;
+    this._dependenciesCalled = false;
+    this._devDependenciesCalled = false;
   }
 
   /**
@@ -20,7 +27,7 @@ export class PackageNpm {
    * @param  {Object} dependencies An object where the keys are package
    * names and the values are one of:
    *   1. Version numbers in string form
-   *   2. Http(s) URLs to a git commit by SHA.   
+   *   2. http(s) URLs of npm packages
    *   3. Git URLs in the format described [here](https://docs.npmjs.com/files/package.json#git-urls-as-dependencies)
    *
    * Https URL example:
@@ -41,23 +48,25 @@ export class PackageNpm {
    * });
    * ```
    * @locus package.js
-   * @memberOf  Npm
    */
   depends(dependencies) {
     // XXX make dependencies be separate between use and test, so that
     // production doesn't have to ship all of the npm modules used by test
     // code
-    if (this._dependencies) {
+    if (this._dependenciesCalled && this._dependencies) {
       buildmessage.error("Npm.depends may only be called once per package",
                          { useMyCaller: true });
       // recover by ignoring the Npm.depends line
       return;
     }
 
+    this._dependenciesCalled = true;
+
     if (typeof dependencies !== 'object') {
       buildmessage.error("the argument to Npm.depends should be an " +
-                         "object, like this: {gcd: '0.0.0'}",
-                         { useMyCaller: true });
+        "object, like this: {gcd: '0.0.0'}",
+        { useMyCaller: true }
+      );
       // recover by ignoring the Npm.depends line
       return;
     }
@@ -69,7 +78,7 @@ export class PackageNpm {
     // confidence we're running the same code?
     try {
       ensureOnlyValidVersions(dependencies, {
-        forCordova: false
+        forCordova: false,
       });
 
     } catch (e) {
@@ -82,7 +91,70 @@ export class PackageNpm {
       return;
     }
 
-    this._dependencies = dependencies;
+    this._dependencies = {
+      ...(this._dependencies || {}),
+      ...dependencies,
+    };
+  }
+
+  /**
+   * @summary Specify which [NPM](https://www.npmjs.org/) packages
+   * your Meteor package depends on for development only.
+   * @param  {Object} dependencies An object where the keys are package
+   * names and the values are version numbers in string form.
+   * 
+   * These dependencies will only be included during development and testing,
+   * but will be excluded when using "meteor build" or "meteor deploy" commands,
+   * reducing the size of the production bundle.
+   * 
+   * ```js
+   * Npm.devDepends({
+   *   "jest": "29.5.0",
+   *   "eslint": "8.36.0"
+   * });
+   * ```
+   * @locus package.js
+   */
+  devDepends(devDependencies) {
+    if (this._devDependenciesCalled && this._devDependencies) {
+      buildmessage.error("Npm.devDepends may only be called once per package",
+                         { useMyCaller: true });
+      // recover by ignoring the Npm.devDepends line
+      return;
+    }
+
+    this._devDependenciesCalled = true;
+
+    if (typeof devDependencies !== 'object') {
+      buildmessage.error("the argument to Npm.devDepends should be an " +
+        "object, like this: {jest: '29.5.0'}",
+        { useMyCaller: true }
+      );
+      // recover by ignoring the Npm.devDepends line
+      return;
+    }
+
+    // don't allow npm fuzzy versions so that there is complete
+    // consistency when deploying a meteor app
+    try {
+      ensureOnlyValidVersions(devDependencies, {
+        forCordova: false
+      });
+    } catch (e) {
+      buildmessage.error(e.message, {
+        useMyCaller: true,
+        downcase: true
+      });
+
+      // recover by ignoring the Npm.devDepends line
+      return;
+    }
+
+    // Add dev dependencies mode including dependencies
+    this._devDependencies = {
+      ...(this._dependencies || {}),
+      ...devDependencies,
+    };
   }
 
   // The `Npm.strip` method makes up for packages that have missing
@@ -98,6 +170,14 @@ export class PackageNpm {
   //   Npm.strip({
   //     connect: [/*\.wmv$/],
   //     useragent: ["tests/"]
+  //   });
+  //
+  // Alternatively, a single string or regular expression can be passed
+  // instead of an array:
+  //
+  //   Npm.strip({
+  //     connect: /*\.wmv$/,
+  //     useragent: "tests/"
   //   });
   //
   // This means (1) "remove any files with the `.wmv` extension from

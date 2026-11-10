@@ -7,7 +7,7 @@ var util = require('util');
 
 var _ = require('underscore');
 
-var files = require('../fs/files.js');
+var files = require('../fs/files');
 var auth = require('../meteor-services/auth.js');
 var config = require('../meteor-services/config.js');
 var release = require('../packaging/release.js');
@@ -54,7 +54,7 @@ var WritableWithProgress = function (writable, listener) {
   self._listener = listener;
 };
 
-_.extend(WritableWithProgress.prototype, {
+Object.assign(WritableWithProgress.prototype, {
   write: function (chunk, encoding, callback) {
     var self = this;
     self._listener(chunk.length, false);
@@ -113,7 +113,7 @@ var getUserAgent = function () {
 
 
 var httpHelpers = exports;
-_.extend(exports, {
+Object.assign(exports, {
   getUserAgent: getUserAgent,
 
   // A wrapper around request with the following improvements:
@@ -139,7 +139,7 @@ _.extend(exports, {
   // - You can provide a 'bodyStream' option which is a stream that
   //   will be used for the body of the request.
   //
-  // - For authenticated MDG services, you can set the
+  // - For authenticated Meteor Software services, you can set the
   //   'useSessionHeader' and/or 'useAuthHeader' options (to true) to
   //   send X-Meteor-Session/X-Meteor-Auth headers using values from
   //   the session file.
@@ -206,7 +206,7 @@ _.extend(exports, {
       }
     }
 
-    options.headers = _.extend({
+    options.headers = Object.assign({
       'User-Agent': getUserAgent()
     }, options.headers || {});
 
@@ -308,14 +308,21 @@ _.extend(exports, {
     Console.debug("Doing HTTP request: ", options.method || 'GET', options.url);
     var request = require('request');
     var req = request(options, function (error, response, body) {
-      if (! error && response && body) {
+      if (! error &&
+          response &&
+          (typeof body === "string" ||
+           Buffer.isBuffer(body))) {
         const contentLength = Number(response.headers["content-length"]);
-        if (contentLength > 0 && body.length < contentLength) {
+        const actualLength = Buffer.byteLength(body);
+
+        if (contentLength > 0 &&
+            actualLength < contentLength) {
           error = new Error(
             "Expected " + contentLength + " bytes in request body " +
-              "but received only " + body.length);
+              "but received only " + actualLength);
         }
       }
+
       return callback.call(this, error, response, body);
     });
 
@@ -356,13 +363,7 @@ _.extend(exports, {
     }
 
     if (promise) {
-      try {
-        return promise.await();
-      } finally {
-        if (progress) {
-          progress.reportProgressDone();
-        }
-      }
+      return promise.finally(() => progress && progress.reportProgressDone());
     } else {
       return req;
     }
@@ -403,9 +404,9 @@ _.extend(exports, {
   //
   // (This has gone through a few refactors and it might be possible
   // to fully roll it into httpHelpers.request() at this point.)
-  getUrl: function (urlOrOptions) {
+  getUrl: async function (urlOrOptions) {
     try {
-      var result = httpHelpers.request(urlOrOptions);
+      var result = await httpHelpers.request(urlOrOptions);
     } catch (e) {
       throw new files.OfflineError(e);
     }
@@ -429,7 +430,7 @@ _.extend(exports, {
   // We only use this for package downloads. In theory we could use it for
   // all requests but that seems like overkill and it isn't well tested in
   // other scenarioes.
-  getUrlWithResuming(urlOrOptions) {
+  async getUrlWithResuming(urlOrOptions) {
     const options = _.isObject(urlOrOptions) ? _.clone(urlOrOptions) : {
       url: urlOrOptions,
     };
@@ -456,7 +457,7 @@ _.extend(exports, {
       if (masterProgress &&
           masterProgress.addChildTask) {
         options.progress = masterProgress.addChildTask({
-          title: masterProgress._title
+          title: masterProgress.title
         });
       }
 
@@ -488,8 +489,8 @@ _.extend(exports, {
       }
     }
 
-    const result = attempt().await();
-    const response = result.response
+    const result = await attempt();
+    const response = result.response;
     if (response.statusCode >= 400 && response.statusCode < 600) {
       const href = response.request.href;
       throw Error(`Could not get ${href}; server returned [${response.statusCode}]`);

@@ -21,7 +21,7 @@ Tinytest is specifically designed for *unit testing*. From [wikipedia](https://e
 
 > ... Intuitively, one can view a unit as the smallest testable part of an application. In procedural programming, a unit could be an entire module, but it is more commonly an individual function or procedure. In object-oriented programming, a unit is often an entire interface, such as a class, but could be an individual method.
 
-> ... Ideally, each test case is independent from the others. Substitutes such as method stubs, mock objects, fakes, and test harnesses can be used to assist testing a module in isolation.
+> ... Ideally, each test case is independent of the others. Substitutes such as method stubs, mock objects, fakes, and test harnesses can be used to assist testing a module in isolation.
 
 The object of a unit test is to prove functionality you have written. It is not to prove third-party or other package or library code which may form a part of your codebase. This may require that you head up your tests with *stubs, mocks/spies* or *fakes* which satisfy the demands of your code, but are non-functional (or have limited functionality). Alternatively, instead of placing the stubs in your test file, you could put them into a separate `stubs.js` file, which you `api.addFiles`, or even create and add a stubs package which you then `api.use`.
 
@@ -93,14 +93,6 @@ Synchronous tests are more common, but asynchronous tests are useful occasionall
 ### Synchronous Tests
 
 ```javascript
-Tinytest.add(name, function(test) {
-  // test body
-});
-```
-
-ES6/2015 (recommended):
-
-```javascript
 Tinytest.add(name, (test) => {
   // test body
 });
@@ -109,22 +101,23 @@ Tinytest.add(name, (test) => {
 ### Asynchronous Tests
 
 ```javascript
-Tinytest.addAsync(name, function(test, onComplete) {
-  someAsyncRequest(function(error, result) {
+Tinytest.addAsync(name, (test, onComplete) => {
+  someAsyncRequest((error, result) => {
     // test body
     onComplete(); // invoke when async function completes.
   }
 });
 ```
 
-ES6/2015 (recommended):
+You can avoid having to call the `onComplete` callback explicitly by
+returning a `Promise` from the test function, which conveniently enables
+`async` test functions:
 
 ```javascript
-Tinytest.addAsync(name, (test, onComplete) => {
-  someAsyncRequest((error, result) => {
-    // test body
-    onComplete(); // invoke when async function completes.
-  }
+Tinytest.addAsync(name, async (test) => {
+  test.equal(shouldReturnFoo(), "foo");
+  const bar = await shouldReturnBarAsync();
+  test.equal(bar, "bar");
 });
 ```
 
@@ -137,6 +130,12 @@ Tests are executed by running the (development) application with the `test-packa
 `meteor test-packages her:package his:package` runs tests only on `her:package` and `his:package`.
 
 The results are presented on the browser (port 3000) as usual. When run as shown, the file watcher runs, so code may be edited and the tests will be re-run automatically. If this is undesirable, you may add the `--run-once` switch.
+
+### Executing only specific tests
+
+You can replace temporarily `Tinytest.add` or `Tinytest.addAsync` by `Tinytest.only` or `Tinytest.onlyAsync` so only the tests added using `only*` are going to be executed. 
+
+This is helpful when only a few tests are failing, so you can focus on them.
 
 ## Assertions
 
@@ -273,7 +272,13 @@ EXPERIMENTAL way to compare two strings that results in a nicer display in the t
 
 ### Assertions without optional fail messages
 
-`test.throws(func, expected);`
+`test.throws(func, expected[, message]);`
+
+`test.throwsAsync(func, expected[, message]);`
+
+`test.doesNotThrows(func[, failureMessage]);`
+
+`test.doesNotThrowsAsync(func[, failureMessage]);`
 
 `expected` can be:
 
@@ -281,6 +286,8 @@ EXPERIMENTAL way to compare two strings that results in a nicer display in the t
 - `string`: pass if the string is a substring of the exception message.
 - `regexp`: pass if the exception message passes the regexp.
 - `function`: call the function as a predicate with the exception.
+
+`doesNotThrows` and `doesNotThrowsAsync` assert that the function does not throw. If the function throws, the assertion fails. The optional `failureMessage` is only used to annotate the failure.
 
 Note: Node's `assert.throws` also accepts a constructor to test whether the error is of the expected class.  But since JavaScript can't distinguish between constructors and plain functions and Node's `assert.throws` also accepts a predicate function, if the error fails the `instanceof` test with the constructor then the constructor is then treated as a predicate and called (!)
 
@@ -304,6 +311,24 @@ Call this to fail the test with an exception that occurs inside asynchronous cal
 
 - the test doesn't call its callback (onComplete function).
 - the test function doesn't directly raise an exception.
+
+### fail
+
+`test.fail(doc);`
+
+Can be used to output a detailed message about a failure with path and value.
+
+Example call:
+```js
+test.fail({
+          type: 'match-error-path',
+          message: "The path of Match.Error doesn't match.",
+          pattern: JSON.stringify(pattern),
+          value: JSON.stringify(value),
+          path: err.path,
+          expectedPath,
+        });
+```        
 
 #### expect_fail
 

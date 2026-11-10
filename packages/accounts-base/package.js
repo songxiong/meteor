@@ -1,67 +1,71 @@
 Package.describe({
   summary: "A user account system",
-  version: "1.2.12-rc.0"
+  version: '3.4.0',
 });
 
-Package.onUse(function (api) {
-  api.use('underscore@1.0.9', ['client', 'server']);
-  api.use('ecmascript@0.5.7', ['client', 'server']);
-  api.use('ddp-rate-limiter@1.0.5');
-  api.use('localstorage@1.0.11', 'client');
-  api.use('tracker@1.1.0', 'client');
-  api.use('check@1.2.3', 'server');
-  api.use('random@1.0.10', ['client', 'server']);
-  api.use('ejson@1.0.12', 'server');
-  api.use('callback-hook@1.0.9', ['client', 'server']);
+Package.onUse((api) => {
+  api.use("ecmascript", ["client", "server"]);
+  api.use("ddp-rate-limiter");
+  api.use("localstorage", "client");
+  api.use("tracker", "client");
+  api.use("check", "server");
+  api.use("random", ["client", "server"]);
+  api.use("ejson", "server");
+  api.use("callback-hook", ["client", "server"]);
+  api.use("reactive-var", "client");
+  api.use("url", ["client", "server"]);
+  api.use("webapp", "server");
+  api.use("routepolicy", "server");
 
-  // use unordered to work around a circular dependency
-  // (service-configuration needs Accounts.connection)
-  api.use('service-configuration@1.0.10', ['client', 'server'], { unordered: true });
-
-  // needed for getting the currently logged-in user
-  api.use('ddp@1.2.5', ['client', 'server']);
+  // needed for getting the currently logged-in user and handling reconnects
+  api.use("ddp", ["client", "server"]);
 
   // need this because of the Meteor.users collection but in the future
   // we'd probably want to abstract this away
-  api.use('mongo@1.1.10', ['client', 'server']);
+  api.use("mongo", ["client", "server"]);
 
   // If the 'blaze' package is loaded, we'll define some helpers like
   // {{currentUser}}.  If not, no biggie.
-  api.use('blaze@2.1.8', 'client', {weak: true});
+  api.use("blaze@3.0.3", "client", { weak: true });
 
   // Allow us to detect 'autopublish', and publish some Meteor.users fields if
   // it's loaded.
-  api.use('autopublish@1.0.7', 'server', {weak: true});
+  api.use("autopublish", "server", { weak: true });
 
-  api.use('oauth-encryption@1.2.0', 'server', {weak: true});
+  api.use("oauth-encryption", "server", { weak: true });
 
   // Though this "Accounts" symbol is the only official Package export for
   // the accounts-base package, modules that import accounts-base will
   // have access to anything added to the exports object of the main
   // module, including AccountsClient and AccountsServer (those symbols
   // just won't be automatically imported as "global" variables).
-  api.export('Accounts');
+  api.export("Accounts");
 
   // These main modules import all the other modules that comprise the
   // accounts-base package, and define exports that will be accessible to
   // modules that import the accounts-base package.
-  api.mainModule('server_main.js', 'server');
-  api.mainModule('client_main.js', 'client');
+  api.mainModule("server_main.js", "server");
+  api.mainModule("client_main.js", "client");
+
+  api.addAssets("accounts-base.d.ts", "server");
+  api.types("accounts-base.native.d.ts");
 });
 
-Package.onTest(function (api) {
+Package.onTest((api) => {
   api.use([
-    'accounts-base',
-    'ecmascript',
-    'tinytest',
-    'random',
-    'test-helpers',
-    'oauth-encryption',
-    'underscore',
-    'ddp',
-    'accounts-password'
+    "accounts-base",
+    "ecmascript",
+    "tinytest",
+    "random",
+    "test-helpers",
+    "oauth-encryption",
+    "ddp",
+    "ddp-rate-limiter",
+    "accounts-password",
+    "accounts-2fa",
   ]);
 
-  api.mainModule('server_tests.js', 'server');
-  api.mainModule('client_tests.js', 'client');
+  api.addFiles("accounts_tests_setup.js", "server");
+  api.mainModule("server_tests.js", "server");
+  api.mainModule("client_tests.js", "client");
 });

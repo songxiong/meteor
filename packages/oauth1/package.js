@@ -1,29 +1,28 @@
 Package.describe({
   summary: "Common code for OAuth1-based login services",
-  version: "1.1.11-rc.0"
+  version: '1.5.4',
 });
 
-Package.onUse(function (api) {
+Package.onUse(api => {
+  api.use('ecmascript', ['client', 'server']);
   api.use('random');
   api.use('service-configuration', ['client', 'server']);
   api.use('oauth', ['client', 'server']);
-  api.use([
-    'underscore',
-    'check',
-    'http'
-  ], 'server');
+  api.use('check', 'server');
 
   api.use('mongo');
 
   api.export('OAuth1Binding', 'server');
-  api.export('OAuth1Test', 'server', {testOnly: true});
+  api.export('OAuth1Test', 'server', { testOnly: true });
+  api.types('oauth1.d.ts');
 
   api.addFiles('oauth1_binding.js', 'server');
   api.addFiles('oauth1_server.js', 'server');
   api.addFiles('oauth1_pending_request_tokens.js', 'server');
 });
 
-Package.onTest(function (api) {
+Package.onTest(api => {
+  api.use('ecmascript', 'server');
   api.use('tinytest');
   api.use('random');
   api.use('service-configuration', 'server');

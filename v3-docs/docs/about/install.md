@@ -1,0 +1,212 @@
+# Install
+
+You need to install the Meteor command line tool to create, run, and manage your Meteor.js projects. Check the prerequisites and follow the installation process below.
+
+```bash
+npx meteor
+```
+
+To create your meteor project you can run:
+
+```bash
+meteor create
+```
+
+And it will prompt you to choose a project name and frontend framework.
+
+## Prerequisites {#prereqs}
+
+### Operating System (OS) {#prereqs-os}
+
+- Meteor currently supports **OS X, Windows, and Linux**. Only 64-bit is supported.
+- Starting with Meteor 3.6, running the bundled MongoDB 8.0 locally on Windows requires **Windows 11 or Windows Server 2022 (x64)**. Windows 10, Windows Server 2019, and earlier versions are not supported by the bundled MongoDB. See [MongoDB 8.0 platform support](https://www.mongodb.com/docs/v8.0/tutorial/install-mongodb-on-windows/#platform-support).
+- Apple M1 is natively supported from Meteor 2.5.1 onward (for older versions, rosetta terminal is required).
+- If you are using Meteor <= 3.0.4 and you are on a Mac M1 (Arm64 version) you need to have Rosetta 2 installed, as Meteor uses it for running MongoDB. Check how to install it [here](https://osxdaily.com/2020/12/04/how-install-rosetta-2-apple-silicon-mac/). *No longer needed in Meteor 3.1*.
+- As of Meteor 3.4.1, the dev-bundle fast path works correctly on Apple Silicon, improving startup performance on arm64 Macs.
+- Disabling antivirus (Windows Defender, etc.) will improve performance.
+- Starting with Meteor 3.6, the bundled MongoDB 8.0 on Linux requires glibc 2.34 or newer on x86_64, or glibc 2.35 or newer on ARM64. It also needs the shared libraries `libcurl.so.4`, `libssl.so.3`, and `libcrypto.so.3` (OpenSSL 3). These requirements apply to the bundled local database; apps using an external database through `MONGO_URL` must meet their database provider's requirements as well as Meteor's runtime requirements.
+
+### Mobile Development {#prereqs-mobile}
+
+- iOS development requires the latest Xcode.
+
+## Installation
+
+Install the latest official version of Meteor.js from your terminal by running one of the commands below. You can check our [changelog](/history) for the release notes.
+
+For Windows, Linux and OS X, you can run the following command:
+
+```bash
+npx meteor
+```
+
+::: tip
+
+If you get an error with the installation `npx` you can try running `npx clear-npx-cache`
+
+or `rm -rf ~/.npm/_npx`
+
+if the error persists, please try to install Meteor using `npm`:
+
+```bash
+npm install -g meteor --foreground-script
+```
+
+Make sure you have Node.js v24 or higher installed.
+
+#### Node.js Version Compatibility
+
+Different Meteor versions bundle different Node.js runtimes:
+
+| Meteor Version | Bundled Node.js Version |
+| -------------- | ----------------------- |
+| Meteor 3.3     | Node.js 20              |
+| Meteor 3.4     | Node.js 22              |
+| Meteor 3.5     | Node.js 24              |
+| Meteor 3.6     | Node.js 26.12.1          |
+
+Meteor 3.6's development bundle also includes npm 11.20.0. To confirm the
+runtime bundled with the Meteor release installed on your machine, run
+`meteor node -v` and `meteor npm -v`.
+
+:::
+
+An alternative for Linux and OS X, is to install Meteor by using curl:
+
+```bash
+curl https://install.meteor.com/ | sh
+```
+
+You can also install a specific Meteor.js version by using curl:
+
+```bash
+curl https://install.meteor.com/\?release\=2.8 | sh
+```
+
+> Do not install the npm Meteor Tool in your project's package.json. This library is just an installer.
+
+## Updating an existing local database {#updating-local-database}
+
+Meteor 3.6 bundles MongoDB 8.0. Before opening existing MongoDB 7 data with this release, back up your local data and check its feature compatibility version (FCV) while still running MongoDB 7. Fresh databases do not need this preparation. External databases configured through `MONGO_URL` are upgraded separately by their administrator or provider.
+
+Start the app with its previous Meteor release. With `mongosh` installed, open another terminal in the app directory and connect to the running local database:
+
+```bash
+meteor mongo
+```
+
+In the database shell, confirm the server version and check FCV:
+
+```javascript
+db.version()
+db.adminCommand({ getParameter: 1, featureCompatibilityVersion: 1 })
+```
+
+If the server is older than MongoDB 7, follow MongoDB's [upgrade prerequisites](https://www.mongodb.com/docs/v8.0/release-notes/8.0-upgrade-replica-set/#prerequisites) to upgrade through the required major versions first.
+
+For a MongoDB 7 server, FCV must be `"7.0"` before upgrading to MongoDB 8. If it is older, run this command on the local replica set's primary, then repeat the check:
+
+```javascript
+db.adminCommand({ setFeatureCompatibilityVersion: "7.0", confirm: true })
+```
+
+Exit the database shell and stop the app. Then update to Meteor 3.6 and restart the app.
+
+```bash
+meteor update --release 3.6
+meteor run
+```
+
+Changing the Meteor release back is not a database rollback procedure.
+
+::: warning Local data
+`meteor reset` preserves the local database. `meteor reset --db` deletes it; use that option only when the data is disposable, not as a migration step for data you want to keep.
+:::
+
+## Build with AI coding assistants {#ai-docs}
+
+[Meteor Agent Skills](/ai/agent-skills) give compatible AI coding assistants Meteor-specific guidance for creating, debugging, testing, migrating, securing, and deploying applications. Choose and install skills interactively:
+
+```bash
+npx skills add meteor/agent-skills
+```
+
+The Agent Skills guide also covers Codex and Claude Code plugin installation, individual skills, and the complete catalog.
+
+For documentation context, Meteor also publishes [`llms.txt`](https://docs.meteor.com/llms.txt) and [`llms-full.txt`](https://docs.meteor.com/llms-full.txt). Use `llms.txt` to discover relevant pages, or download the complete documentation:
+
+```bash
+curl https://docs.meteor.com/llms-full.txt -o meteor-docs.txt
+```
+
+## Troubleshooting {#troubleshooting}
+
+If your user doesn't have permission to install global binaries, and you need to use sudo, it's necessary to append _--unsafe-perm_ to the above command:
+
+```bash
+sudo npm install -g meteor --unsafe-perm
+```
+
+We strongly discourage the usage of Node.js or Meteor with root permissions.
+Only run the above command with sudo if you know what you are doing.
+
+If you only use sudo because of a distribution default permission system, [check this link for fixing it](https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally).
+
+In some cases you can get this error `npm WARN checkPermissions Missing write access to /usr/local/lib/node_modules` because your Node.js installation was performed with wrong permissions. An easy way to fix this is to install Node.js using [nvm](https://github.com/nvm-sh/nvm) and forcing it to be used in your terminal. You can force it in the current session of your terminal by running `nvm use 14`.
+
+## PATH management {#path-management}
+
+By default, the Meteor installer adds its install path (by default, `~/.meteor/`) to your PATH by updating either your `.bashrc`, `.bash_profile`, or `.zshrc` as appropriate. To disable this behavior, install Meteor by running:
+
+```bash
+npm install -g meteor --ignore-meteor-setup-exec-path --foreground-script
+```
+
+(or by setting the environment variable `npm_config_ignore_meteor_setup_exec_path=true`)
+
+## Old Versions on Apple M1 {#old-versions-m1}
+
+For Apple M1 computers, you can append Rosetta prefix as following, if you need to run older versions of Meteor (before 2.5.1):
+
+```bash
+arch -x86_64 npm install -g meteor
+```
+
+or select Terminal in the Applications folder, press CMD(⌘)+I and check the "Open using Rosetta" option.
+
+## Meteor Docker image {#meteor-docker}
+
+You can also use a Docker container for running Meteor inside your CI, or even in your local development toolchain.
+
+We do provide the meteor/meteor-base ubuntu-based Docker image, that comes pre-bundled with Node.JS and Meteor, and runs it as a local user (not as root).
+
+You can refer to our meteor/galaxy-images repository to see how to use it, and the latest version. [More about meteor-base here.](https://github.com/meteor/galaxy-images/blob/master/meteor-base/README.md)
+
+## Note for Windows users {#windows}
+
+On Windows, the installer runs faster when [Windows Developer Mode](https://docs.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development) is enabled. The installation extracts a large number of small files, which Windows Defender can cause to be very slow.
+
+## Node version manager {#nvm}
+
+If you use a node version manager that uses a separate global `node_modules` folder for each Node version, you will need to re-install the `meteor` npm package when changing to a Node version for the first time. Otherwise, the `meteor` command will no longer be found.
+
+## Note for fish shell users (Linux) {#fish-shell}
+
+To be able to use the `meteor` command from fish it's needed to include `/home/<user>/.meteor` in `$PATH`; to do that just add this line in `/home/<user>/.config/fish/config.fish` file (replace `<user>` with your username):
+
+`set PATH /home/<user>/.meteor $PATH`
+
+## Uninstalling Meteor {#uninstall}
+
+If you installed Meteor using npx, you can remove it by running:
+
+```bash
+npx meteor uninstall
+```
+
+If you installed Meteor using curl or as a fallback solution, run:
+
+```bash
+rm -rf ~/.meteor
+sudo rm /usr/local/bin/meteor
+```

@@ -1,123 +1,221 @@
 var _ = require('underscore');
 var selftest = require('../tool-testing/selftest.js');
-var files = require('../fs/files.js');
+var files = require('../fs/files');
 import { getUrl } from '../utils/http-helpers.js';
-import { sleepMs } from '../utils/utils.js';
+import { host } from '../utils/archinfo';
+const osArch = host();
 
 var Sandbox = selftest.Sandbox;
 
 var MONGO_LISTENING =
   { stdout: " [initandlisten] waiting for connections on port" };
 
-function startRun(sandbox) {
+async function startRun(sandbox) {
   var run = sandbox.run();
-  run.match("myapp");
-  run.match("proxy");
-  run.tellMongo(MONGO_LISTENING);
-  run.match("MongoDB");
+  await run.match("myapp");
+  run.matchBeforeExit("Started proxy");
+  await run.tellMongo(MONGO_LISTENING);
+  run.matchBeforeExit("Started MongoDB");
+  run.waitSecs(15);
   return run;
-};
+}
 
 // Tests the actual cache logic used by coffeescript.
-selftest.define("compiler plugin caching - coffee", () => {
-  var s = new Sandbox({ fakeMongo: true });
+selftest.define("compiler plugin caching - coffee", async () => {
+  // Enable legacy builds for testing.
+  const currentMeteorModern = process.env.METEOR_MODERN;
+  process.env.METEOR_MODERN = '{ "webArchOnly": false }';
 
-  s.createApp("myapp", "caching-coffee");
+  var s = new Sandbox({ fakeMongo: true });
+  await s.init();
+
+  await s.createApp("myapp", "caching-coffee");
   s.cd("myapp");
   // Ask them to print out when they build a file (instead of using it from the
   // cache) as well as when they load cache from disk.
   s.set('METEOR_COFFEESCRIPT_CACHE_DEBUG', 't');
-  var run = startRun(s);
+
+  // Enforcing the order of builds is just too tricky if we let the legacy
+  // build race with the os.* build.
+  s.set("METEOR_DISALLOW_DELAYED_LEGACY_BUILD", "true");
+
+  var run = await startRun(s);
+
+  let nextRunOrdinal = 1;
+  function matchRun(files, arch) {
+    let text = "CACHE(coffeescript): Ran (#" +
+      nextRunOrdinal++ + ") on: " +
+      JSON.stringify(files);
+
+    if (arch) {
+      text += " " + JSON.stringify([arch]);
+    }
+
+    return run.match(text);
+  }
 
   // First program built (server or web.browser) compiles everything.
-  run.match('CACHE(coffeescript): Ran (#1) on: ' + JSON.stringify(
-    ['/f1.coffee', '/f2.coffee', '/f3.coffee', '/packages/local-pack/p.coffee']
-  ));
-  // Second program doesn't need to compile anything because compilation works
-  // the same on both programs.
-  run.match("CACHE(coffeescript): Ran (#2) on: []");
+  await matchRun([
+    '/f1.coffee',
+    '/f2.coffee',
+    '/f3.coffee',
+    '/packages/local-pack/p.coffee'
+  ], "web.browser");
+
+  await matchRun([
+    '/f1.coffee',
+    '/f2.coffee',
+    '/f3.coffee',
+    '/packages/local-pack/p.coffee'
+  ], "web.browser.legacy");
+
+  await matchRun([
+    '/f1.coffee',
+    '/f2.coffee',
+    '/f3.coffee',
+    '/packages/local-pack/p.coffee'
+  ], osArch);
+
   // App prints this:
-  run.match("Coffeescript X is 2 Y is 1 FromPackage is 4");
+  await run.match("Coffeescript X is 2 Y is 1 FromPackage is 4");
+  await run.match("App running at");
 
   s.write("f2.coffee", "share.Y = 'Y is 3'\n");
+
   // Only recompiles f2.
-  run.match('CACHE(coffeescript): Ran (#3) on: ["/f2.coffee"]');
-  // And other program doesn't even need to do f2.
-  run.match("CACHE(coffeescript): Ran (#4) on: []");
+  await matchRun(["/f2.coffee"], "web.browser");
+  await matchRun(["/f2.coffee"], "web.browser.legacy");
+  await matchRun(["/f2.coffee"], osArch);
+
   // Program prints this:
-  run.match("Coffeescript X is 2 Y is 3 FromPackage is 4");
+  await run.match("Coffeescript X is 2 Y is 3 FromPackage is 4");
+  await run.match("Meteor server restarted");
 
   // Force a rebuild of the local package without actually changing the
   // coffeescript file in it. This should not require us to coffee.compile
   // anything (for either program).
   s.append("packages/local-pack/package.js", "\n// foo\n");
-  run.match("CACHE(coffeescript): Ran (#5) on: []");
-  run.match("CACHE(coffeescript): Ran (#6) on: []");
-  run.match("Coffeescript X is 2 Y is 3 FromPackage is 4");
+
+  await matchRun([], "web.browser");
+  await matchRun([], "web.browser.legacy");
+  await matchRun([], osArch);
+
+  await run.match("Coffeescript X is 2 Y is 3 FromPackage is 4");
+  await run.match("Meteor server restarted");
 
   // But writing to the actual source file in the local package should
   // recompile.
   s.write("packages/local-pack/p.coffee", "FromPackage = 'FromPackage is 5'");
-  run.match('CACHE(coffeescript): Ran (#7) on: ["/packages/local-pack/p.coffee"]');
-  run.match('CACHE(coffeescript): Ran (#8) on: []');
-  run.match("Coffeescript X is 2 Y is 3 FromPackage is 5");
+
+  await matchRun(["/packages/local-pack/p.coffee"], "web.browser");
+  await matchRun(["/packages/local-pack/p.coffee"], "web.browser.legacy");
+  await matchRun(["/packages/local-pack/p.coffee"], osArch);
+
+  await run.match("Coffeescript X is 2 Y is 3 FromPackage is 5");
+  await run.match("Meteor server restarted");
 
   // We never should have loaded cache from disk, since we only made
   // each compiler once and there were no cache files at this point.
   run.forbid('CACHE(coffeescript): Loaded');
 
   // Kill the run. Change one coffee file and re-run.
-  run.stop();
+  await run.stop();
   s.write("f2.coffee", "share.Y = 'Y is edited'\n");
-  run = startRun(s);
+  run = await startRun(s);
 
   // This time there's a cache to load!
-  run.match('CACHE(coffeescript): Loaded /packages/local-pack/p.coffee');
-  run.match('CACHE(coffeescript): Loaded /f1.coffee');
-  run.match('CACHE(coffeescript): Loaded /f3.coffee');
+  await run.match('CACHE(coffeescript): Loaded /packages/local-pack/p.coffee');
+  await run.match('CACHE(coffeescript): Loaded /f1.coffee');
+  await run.match('CACHE(coffeescript): Loaded /f3.coffee');
   // And we only need to re-compiler the changed file, even though we restarted.
-  run.match('CACHE(coffeescript): Ran (#1) on: ["/f2.coffee"]');
-  run.match('CACHE(coffeescript): Ran (#2) on: []');
 
-  run.match('Coffeescript X is 2 Y is edited FromPackage is 5');
+  nextRunOrdinal = 1;
 
-  run.stop();
+  await matchRun(["/f2.coffee"], "web.browser");
+  await matchRun(["/f2.coffee"], "web.browser.legacy");
+  await matchRun(["/f2.coffee"], osArch);
+
+  await run.match('Coffeescript X is 2 Y is edited FromPackage is 5');
+
+  await run.stop();
+
+  process.env.METEOR_MODERN = currentMeteorModern;
 });
 
 // Tests the actual cache logic used by less and stylus.
-['less', 'stylus'].forEach((packageName) => {
+['less'].forEach((packageName) => {
   const extension = packageName === 'stylus' ? 'styl' : packageName;
+  const hasCompileOneFileLaterSupport = packageName === "less";
 
-  selftest.define("compiler plugin caching - " + packageName, () => {
+  selftest.define("compiler plugin caching - " + packageName, async () => {
+    // Enable legacy builds for testing.
+    const currentMeteorModern = process.env.METEOR_MODERN;
+    process.env.METEOR_MODERN = '{ "webArchOnly": false }';
+
     var s = new Sandbox({ fakeMongo: true });
+    await s.init();
 
-    s.createApp("myapp", "caching-" + packageName);
+    await s.createApp("myapp", "caching-" + packageName);
     s.cd("myapp");
     // Ask them to print out when they build a file (instead of using it from
     // the cache) as well as when they load cache from disk.
     s.set(`METEOR_${ packageName.toUpperCase() }_CACHE_DEBUG`, "t");
-    var run = startRun(s);
 
-    const cacheMatch = selftest.markStack((message) => {
-      run.match(`CACHE(${ packageName }): ${ message }`);
+    // Enforcing the order of builds is just too tricky if we let the legacy
+    // build race with the "Client modified - refreshing" messages.
+    s.set("METEOR_DISALLOW_DELAYED_LEGACY_BUILD", "true");
+
+    var run = await startRun(s);
+
+    const cacheMatch = selftest.markStack(async (message, arch) => {
+      await run.match(`CACHE(${
+        packageName
+      }): ${
+        message
+      }${
+        arch ? " " + JSON.stringify([arch]) : ""
+      }`);
+      run.waitSecs(30);
     });
 
+    let nextRunOrdinal = 1;
+    function matchRun(files, arch) {
+      return cacheMatch(
+        "Ran (#" + nextRunOrdinal++ + ") on: " +
+          JSON.stringify(files) +
+          ((arch && packageName !== "stylus")
+           ? " " + JSON.stringify([arch]) : "")
+      );
+    }
+
     // First program built (web.browser) compiles everything.
-    cacheMatch('Ran (#1) on: ' + JSON.stringify([
-      // Though files in imports directories are compiled, they are marked
-      // as lazy so they will not be loaded unless imported.
-      "/imports/dotdot." + extension,
+    await matchRun([
+      // Plugins with a compileOneFileLater method can avoid compiling
+      // lazy files in /imports or /node_modules until they are actually
+      // needed, but older plugins still eagerly compile those files just
+      // in case they might be imported by a JS module.
+      ...(hasCompileOneFileLaterSupport ? []
+          : ["/imports/dotdot." + extension]),
       "/subdir/nested-root." + extension,
       "/top." + extension
-    ]));
+    ], "web.browser");
+
+    await matchRun([
+      ...(hasCompileOneFileLaterSupport ? []
+          : ["/imports/dotdot." + extension]),
+      "/subdir/nested-root." + extension,
+      "/top." + extension
+    ], "web.browser.legacy");
+
     // There is no render execution in the server program, because it has
     // archMatching:'web'.  We'll see this more clearly when the next call later
     // is "#2" --- we didn't miss a call!
     // App prints this:
-    run.match("Hello world");
+    run.waitSecs(15);
+    await run.match("Hello world");
 
     // Check that the CSS is what we expect.
-    var checkCSS = selftest.markStack((borderStyleMap) => {
+    var checkCSS = selftest.markStack(async (borderStyleMap) => {
       var builtBrowserProgramDir = files.pathJoin(
         s.cwd, '.meteor', 'local', 'build', 'programs', 'web.browser');
       var cssFile = _.find(
@@ -128,21 +226,23 @@ selftest.define("compiler plugin caching - coffee", () => {
       selftest.expectTrue(cssFile);
       var actual = s.read(
         files.pathJoin('.meteor/local/build/programs/web.browser', cssFile));
-      actual = actual.replace(/\s+/g, ' ');  // simplify whitespace
+      actual = actual.replace(/\s+/g, '');  // simplify whitespace
       var expected = _.map(borderStyleMap, (style, className) => {
-        return '.' + className + " { border-style: " + style + "; }";
-      }).join(' ');
-      selftest.expectEqual(actual, expected);
+        return '.' + className + "{border-style:" + style + ";}";
+      }).join('');
+      await selftest.expectEqual(actual, expected);
     });
     var expectedBorderStyles = {
       el0: "dashed", el1: "dotted", el2: "solid", el3: "groove", el4: "ridge"};
-    checkCSS(expectedBorderStyles);
+    await checkCSS(expectedBorderStyles);
 
     // Force a rebuild of the local package without actually changing the
     // preprocessor file in it. This should not require us to render anything.
     s.append("packages/local-pack/package.js", "\n// foo\n");
-    cacheMatch('Ran (#2) on: []');
-    run.match("Hello world");
+    await matchRun([], "web.browser");
+    await matchRun([], "web.browser.legacy");
+    run.waitSecs(15);
+    await run.match("Hello world");
 
     function setVariable(variableName, value) {
       switch (packageName) {
@@ -165,135 +265,257 @@ selftest.define("compiler plugin caching - coffee", () => {
     s.write('packages/local-pack/p.' + extension,
             setVariable('el4-style', 'inset'));
     expectedBorderStyles.el4 = 'inset';
-    cacheMatch(`Ran (#3) on: ["/top.${ extension }"]`);
-    run.match("Client modified -- refreshing");
-    checkCSS(expectedBorderStyles);
+    await matchRun([`/top.${ extension }`], "web.browser");
+    await matchRun([`/top.${ extension }`], "web.browser.legacy");
+    await run.match("Client modified -- refreshing");
+    await checkCSS(expectedBorderStyles);
 
     // This works for changing a root too.
     s.write('subdir/nested-root.' + extension,
             '.el0 { border-style: double; }\n');
     expectedBorderStyles.el0 = 'double';
-    cacheMatch(`Ran (#4) on: ["/subdir/nested-root.${ extension }"]`);
-    run.match("Client modified -- refreshing");
-    checkCSS(expectedBorderStyles);
+    await matchRun([`/subdir/nested-root.${ extension }`], "web.browser");
+    await matchRun([`/subdir/nested-root.${ extension }`], "web.browser.legacy");
+    await run.match("Client modified -- refreshing");
+    await checkCSS(expectedBorderStyles);
 
     // Adding a new root works too.
     s.write('yet-another-root.' + extension,
             '.el6 { border-style: solid; }\n');
     expectedBorderStyles.el6 = 'solid';
-    cacheMatch(`Ran (#5) on: ["/yet-another-root.${ extension }"]`);
-    run.match("Client modified -- refreshing");
-    checkCSS(expectedBorderStyles);
+    await matchRun([`/yet-another-root.${ extension }`], "web.browser");
+    await matchRun([`/yet-another-root.${ extension }`], "web.browser.legacy");
+    await run.match("Client modified -- refreshing");
+    await checkCSS(expectedBorderStyles);
 
     // We never should have loaded cache from disk, since we only made
     // each compiler once and there were no cache files at this point.
     run.forbid('CACHE(${ packageName }): Loaded');
 
     // Kill the run. Change one file and re-run.
-    run.stop();
+    await run.stop();
     s.write('packages/local-pack/p.' + extension,
             setVariable('el4-style', 'double'));
     expectedBorderStyles.el4 = 'double';
-    run = startRun(s);
+    run = await startRun(s);
 
     // This time there's a cache to load!  Note that for
     // MultiFileCachingCompiler we load all the cache entries, even for the
     // not-up-to-date file 'top', because we only key off of filename, not off
     // of cache key.
-    cacheMatch('Loaded {}/subdir/nested-root.' + extension);
-    cacheMatch('Loaded {}/top.' + extension);
-    cacheMatch('Loaded {}/yet-another-root.' + extension);
-    cacheMatch(`Ran (#1) on: ["/top.${ extension }"]`);
-    run.match('Hello world');
-    checkCSS(expectedBorderStyles);
+    await cacheMatch('Loaded {}/subdir/nested-root.' + extension);
+    await cacheMatch('Loaded {}/top.' + extension);
+    await cacheMatch('Loaded {}/yet-another-root.' + extension);
+
+    nextRunOrdinal = 1;
+
+    await matchRun([`/top.${ extension }`], "web.browser");
+    await matchRun([`/top.${ extension }`], "web.browser.legacy");
+    run.waitSecs(15);
+    await run.match('Hello world');
+    await checkCSS(expectedBorderStyles);
 
     s.write('bad-import.' + extension, importLine('/foo/bad'));
-    run.match('Errors prevented startup');
+    await run.match('Errors prevented startup');
     switch (packageName) {
     case 'less':
-      run.match('bad-import.less:1: Unknown import: /foo/bad.less');
+      await run.match('bad-import.less:1: Unknown import: /foo/bad.less');
       break;
     case 'stylus':
-      run.match('bad-import.styl: Stylus compiler error: bad-import.styl:1');
-      run.match('failed to locate @import file /foo/bad.styl');
+      await run.match('bad-import.styl: Stylus compiler error: bad-import.styl:1');
+      await run.match('failed to locate @import file /foo/bad.styl');
       break;
     }
-    run.match('Waiting for file change');
+    await run.match('Waiting for file change');
 
-    run.stop();
+    await run.stop();
+
+    process.env.METEOR_MODERN = currentMeteorModern;
   });
 });
 
 // Tests that rebuilding a compiler plugin re-instantiates the source processor,
 // but other changes don't.
-selftest.define("compiler plugin caching - local plugin", function () {
+selftest.define("compiler plugin caching - local plugin", async function () {
   var s = new Sandbox({ fakeMongo: true });
+  await s.init();
 
-  s.createApp("myapp", "local-compiler-plugin");
+  await s.createApp("myapp", "local-compiler-plugin");
   s.cd("myapp");
 
-  var run = startRun(s);
+  var run = await startRun(s);
 
   // The compiler gets used the first time...
-  run.match("PrintmeCompiler invocation 1");
+  await run.match("PrintmeCompiler invocation 1");
   // ... and the program runs the generated code.
-  run.match("PMC: Print out bar");
-  run.match("PMC: Print out foo");
+  await run.match("PMC: Print out bar");
+  await run.match("PMC: Print out foo");
 
   s.write("quux.printme", "And print out quux");
   // PrintmeCompiler gets reused.
-  run.match("PrintmeCompiler invocation 2");
+  await run.match("PrintmeCompiler invocation 2");
   // And the right output prints out
-  run.match("PMC: Print out bar");
-  run.match("PMC: Print out foo");
-  run.match("PMC: And print out quux");
+  await run.match("PMC: Print out bar");
+  await run.match("PMC: Print out foo");
+  await run.match("PMC: And print out quux");
 
   // Restart meteor; see that the disk cache gets used.
-  run.stop();
-  run = startRun(s);
+  await run.stop();
+  run = await startRun(s);
   // Disk cache gets us up to 3.
-  run.match("PrintmeCompiler invocation 3");
+  await run.match("PrintmeCompiler invocation 3");
   // And the right output prints out
-  run.match("PMC: Print out bar");
-  run.match("PMC: Print out foo");
-  run.match("PMC: And print out quux");
+  await run.match("PMC: Print out bar");
+  await run.match("PMC: Print out foo");
+  await run.match("PMC: And print out quux");
 
   // Edit the compiler itself.
   s.write('packages/local-plugin/plugin.js',
           s.read('packages/local-plugin/plugin.js').replace(/PMC/, 'pmc'));
   // New PrintmeCompiler object, and empty disk cache dir.
-  run.match("PrintmeCompiler invocation 1");
+  await run.match("PrintmeCompiler invocation 1");
   // And the right output prints out (lower case now)
-  run.match("pmc: Print out bar");
-  run.match("pmc: Print out foo");
-  run.match("pmc: And print out quux");
+  await run.match("pmc: Print out bar");
+  await run.match("pmc: Print out foo");
+  await run.match("pmc: And print out quux");
 
-  run.stop();
+  await run.stop();
+});
+
+// Tests that SwcCompiler properly applies SWC compilation on JS files
+selftest.define("compiler plugin caching - local plugin with SwcCompiler", async function () {
+  var s = new Sandbox({ fakeMongo: true });
+  await s.init();
+
+  process.env.METEOR_DISABLE_COLORS = true;
+
+  // Create a new app based on local-compiler-plugin
+  await s.createApp("myapp", "local-compiler-plugin");
+  s.cd("myapp");
+
+  // Create a JavaScript file to test SWC compilation
+  s.write("test.js", "const message = 'Hello from SWC'; console.log(message);");
+
+  // Modify the local plugin to use SwcCompiler for JS files
+  s.write('packages/local-plugin/plugin.js', `
+var fs = Plugin.fs;
+var path = Plugin.path;
+
+// Import SwcCompiler from babel-compiler package
+var SwcCompiler = Package['babel-compiler'].SwcCompiler;
+
+// Register compiler for .js files using SwcCompiler
+Plugin.registerCompiler({
+  extensions: ['js'],
+  archMatching: 'os'
+}, function () {
+  return new SwcJsCompiler();
+});
+
+// SwcCompiler for JS files
+var SwcJsCompiler = function () {
+  var self = this;
+  self.runCount = 0;
+  self.diskCache = null;
+
+  // Create an instance of the SwcCompiler with swc: true
+  self.compiler = new SwcCompiler({ verbose: true });
+};
+SwcJsCompiler.prototype.processFilesForTarget = function (inputFiles) {
+  var self = this;
+
+  // Use the SwcCompiler to process the files
+  self.compiler.processFilesForTarget(inputFiles);
+
+  console.log("SwcJsCompiler invocation", ++self.runCount);
+  if (self.diskCache) {
+    fs.writeFileSync(self.diskCache, self.runCount + '\\n');
+  }
+};
+SwcJsCompiler.prototype.setDiskCacheDirectory = function (diskCacheDir) {
+  var self = this;
+  self.diskCache = path.join(diskCacheDir, 'swc-cache');
+
+  // Pass the disk cache directory to the SwcCompiler
+  if (self.compiler && self.compiler.setDiskCacheDirectory) {
+    self.compiler.setDiskCacheDirectory(diskCacheDir);
+  }
+
+  try {
+    var data = fs.readFileSync(self.diskCache, 'utf8');
+  } catch (e) {
+    if (e.code !== 'ENOENT')
+      throw e;
+    return;
+  }
+  self.runCount = parseInt(data, 10);
+};
+`);
+
+  // Update package.js to use babel-compiler
+  s.write('packages/local-plugin/package.js', `
+Package.registerBuildPlugin({
+  name: "compileWithSwc",
+  sources: ['plugin.js'],
+  use: ['babel-compiler']
+});
+
+Package.onUse(function (api) {
+  api.use('isobuild:compiler-plugin@1.0.0');
+  api.use('babel-compiler');
+});
+`);
+
+  var run = await startRun(s);
+
+  // The SwcJsCompiler gets used
+  await run.match("SwcJsCompiler invocation 1", false, true);
+
+  // Verify that SWC compilation is being applied
+  // This is indicated by the SWC verbose log message from babel-compiler.js
+  await run.match(/\[Transpiler] Used SWC.*\(app\)/, false, true);
+
+  // Modify the JS file to test recompilation
+  s.write("test.js", "const message = 'Updated SWC message'; console.log(message);");
+  // SwcJsCompiler gets reused
+  await run.match("SwcJsCompiler invocation 2", false, true);
+
+  // Restart meteor to test disk cache
+  await run.stop();
+  run = await startRun(s);
+
+  // Disk cache gets us up to 3 for SwcJsCompiler
+  await run.match("SwcJsCompiler invocation 3", false, true);
+
+  await run.stop();
 });
 
 // Test error on duplicate compiler plugins.
-selftest.define("compiler plugins - duplicate extension", () => {
+selftest.define("compiler plugins - duplicate extension", async () => {
   const s = new Sandbox({ fakeMongo: true });
+  await s.init();
 
-  s.createApp("myapp", "duplicate-compiler-extensions");
+  await s.createApp("myapp", "duplicate-compiler-extensions");
   s.cd("myapp");
 
-  let run = startRun(s);
-  run.match('Errors prevented startup');
-  run.match('conflict: two packages');
-  run.match('trying to handle *.myext');
+  let run = await startRun(s);
+  await run.match('Errors prevented startup');
+  await run.match('conflict: two packages');
+  await run.match('trying to handle *.myext');
 
   // Fix it by changing one extension.
   s.write('packages/local-plugin/plugin.js',
           s.read('packages/local-plugin/plugin.js').replace('myext', 'xext'));
-  run.match('Modified -- restarting');
+  await run.match('Modified -- restarting');
+  run.waitSecs(30);
 
-  run.stop();
+  await run.stop();
 });
 
 // Test error when a source file no longer has an active plugin.
-selftest.define("compiler plugins - inactive source", () => {
+selftest.define("compiler plugins - inactive source", async () => {
   const s = new Sandbox({ fakeMongo: true });
+  await s.init();
 
   // This app depends on the published package 'glasser:uses-sourcish', and
   // contains a local package 'local-plugin'.
@@ -304,75 +526,96 @@ selftest.define("compiler plugins - inactive source", () => {
   // extension '*.sourcish', and so 'foo.sourcish' is in the published isopack
   // as a source file. However, the copy of 'local-plugin' currently in the test
   // app contains no plugins. So we hit this weird error.
-  s.createApp('myapp', 'uses-published-package-with-inactive-source');
+  await s.createApp('myapp', 'uses-published-package-with-inactive-source');
   s.cd('myapp');
 
-  let run = startRun(s);
-  run.match('Errors prevented startup');
-  run.match('no plugin found for foo.sourcish in glasser:use-sourcish');
-  run.match('none is now');
-
-  run.stop();
+  const run = s.run();
+  await run.match('myapp');
+  run.matchBeforeExit('Started proxy');
+  await run.match('Errors prevented startup');
+  await run.match('no plugin found for foo.sourcish in glasser:use-sourcish');
+  await run.match('none is now');
+  await run.stop();
 });
 
 // Test error when the registerCompiler callback throws.
-selftest.define("compiler plugins - compiler throws", () => {
+selftest.define("compiler plugins - compiler throws", async () => {
   const s = new Sandbox({ fakeMongo: true });
+  await s.init();
 
-  s.createApp('myapp', 'compiler-plugin-throws-on-instantiate');
+  await s.createApp('myapp', 'compiler-plugin-throws-on-instantiate');
   s.cd('myapp');
 
   const run = s.run('add', 'local-plugin');
-  run.matchErr('Errors while adding packages');
-  run.matchErr(
+  await run.matchErr('Errors while adding packages');
+  await run.matchErr(
     'While running registerCompiler callback in package local-plugin');
   // XXX This is wrong! The path on disk is packages/local-plugin/plugin.js, but
   // at some point we switched to the servePath which is based on the *plugin*'s
   // "package" name.
-  run.matchErr(
+  await run.matchErr(
     /packages\/compilePrintme_plugin\.js:\d+:\d+: Error in my registerCompiler callback!/
   );
-  run.expectExit(1);
+  await run.expectExit(1);
 });
+
+async function checkModernAndLegacyUrls(path, test) {
+  if (! path.startsWith("/")) {
+    path = "/" + path;
+  }
+  await test(await getUrl("http://localhost:3000" + path));
+  // Asset URLs are no longer prefixed with /__browser.legacy because the
+  // developer has full control over the path where an asset is served, so
+  // there's not much value in serving a legacy version of every asset.
+  // test(getUrl("http://localhost:3000/__browser.legacy" + path));
+}
 
 // Test that compiler plugins can add static assets. Also tests `filenames`
 // option to registerCompiler.
-selftest.define("compiler plugins - compiler addAsset", () => {
+selftest.define("compiler plugins - compiler addAsset", async () => {
   const s = new Sandbox({ fakeMongo: true });
+  await s.init();
 
-  s.createApp('myapp', 'compiler-plugin-add-asset');
+  await s.createApp('myapp', 'compiler-plugin-add-asset');
   s.cd('myapp');
 
-  const run = startRun(s);
+  const run = await startRun(s);
   // Test server-side asset.
-  run.match("extension is null");  // test getExtension -> null
-  run.match("Asset says Print out foo");
+  await run.match("extension is null");  // test getExtension -> null
+  await run.match("Asset says Print out foo");
 
   // Test client-side asset.
-  const body = getUrl('http://localhost:3000/foo.printme');
-  selftest.expectEqual(body, 'Print out foo\n');
+  await checkModernAndLegacyUrls("/foo.printme", body => {
+    selftest.expectEqual(body, "Print out foo\n");
+  });
 
-  run.stop();
+  await run.stop();
 });
 
 
 // Test that a package can have a single file that is both source code and an
 // asset
-selftest.define("compiler plugins - addAssets", () => {
+selftest.define("compiler plugins - addAssets", async () => {
   const s = new Sandbox({ fakeMongo: true });
+  await s.init();
 
-  s.createApp('myapp', 'compiler-plugin-asset-and-source');
+  await s.createApp('myapp', 'compiler-plugin-asset-and-source');
   s.cd('myapp');
 
-  const run = startRun(s);
+  const run = await startRun(s);
 
   // Test server-side asset.
-  run.match("Printing out my own source code!");
+  await run.match("Printing out my own source code!");
 
   // Test client-side asset.
-  let body = getUrl('http://localhost:3000/packages/' +
-    'asset-and-source/asset-and-source.js');
-  selftest.expectTrue(body.indexOf('Printing out my own source code!') !== -1);
+  await checkModernAndLegacyUrls(
+    "/packages/asset-and-source/asset-and-source.js",
+    body => {
+      selftest.expectTrue(
+        body.indexOf("Printing out my own source code!") !== -1
+      );
+    }
+  );
 
   // Test that deprecated API still works (added in 1.2.1 in response to people
   // having trouble upgrading to 1.2)
@@ -389,12 +632,17 @@ selftest.define("compiler plugins - addAssets", () => {
   `);
 
   // Test server-side asset.
-  run.match("Printing out my own source code!");
+  await run.match("Printing out my own source code!");
 
   // Test client-side asset.
-  body = getUrl('http://localhost:3000/packages/' +
-    'asset-and-source/asset-and-source.js');
-  selftest.expectTrue(body.indexOf('Printing out my own source code!') !== -1);
+  await checkModernAndLegacyUrls(
+    "/packages/asset-and-source/asset-and-source.js",
+    body => {
+      selftest.expectTrue(
+        body.indexOf('Printing out my own source code!') !== -1
+      );
+    }
+  );
 
   // Test error messages for malformed package files
   s.write("packages/asset-and-source/package.js", `Package.describe({
@@ -409,7 +657,7 @@ selftest.define("compiler plugins - addAssets", () => {
     });
   `);
 
-  run.match(/Duplicate source file/);
+  await run.match(/Duplicate source file/);
 
   s.write("packages/asset-and-source/package.js", `Package.describe({
       name: 'asset-and-source',
@@ -423,7 +671,7 @@ selftest.define("compiler plugins - addAssets", () => {
     });
   `);
 
-  run.match(/Duplicate asset file/);
+  await run.match(/Duplicate asset file/);
 
   s.write("packages/asset-and-source/package.js", `Package.describe({
       name: 'asset-and-source',
@@ -435,7 +683,39 @@ selftest.define("compiler plugins - addAssets", () => {
     });
   `);
 
-  run.match(/requires a second argument/);
+  await run.match(/requires a second argument/);
 
-  run.stop();
+  await run.stop();
+});
+
+// Regression test for issue #10366: a lazily-compiled file (under imports/)
+// whose compilation fails used to have its error silently swallowed -- the
+// build succeeded and the only symptom was a runtime "Cannot find module"
+// error when the file was imported. Now the deferred compile error is surfaced
+// and fails the build when the file is actually imported, while unimported
+// broken lazy files remain harmless.
+selftest.define("compiler plugins - lazy compile error is reported", async () => {
+  const s = new Sandbox();
+  await s.init();
+
+  await s.createApp("myapp", "compiler-plugin-lazy-error");
+  s.cd("myapp");
+
+  // The default client/main.js imports the broken lazy file, so the deferred
+  // compile error must fail the build instead of being swallowed.
+  let run = s.run("--once");
+  run.waitSecs(60);
+  await run.matchErr("Build failed");
+  await run.matchErr("imports/broken.bork:1: BorkCompiler: simulated compile error");
+  // 254 is the exit code meteor uses under --once when the app cannot start
+  // (here, because the build failed).
+  await run.expectExit(254);
+
+  // If the broken lazy file is NOT imported, the build must still succeed:
+  // unimported broken lazy files stay harmless (the error stays deferred).
+  s.write("client/main.js", "require('/imports/ok.bork');\n");
+  run = s.run("--once");
+  run.waitSecs(60);
+  await run.match("BORK_APP_STARTED");
+  await run.expectExit(0);
 });

@@ -1,10 +1,12 @@
 Package.describe({
   summary: "Common code for browser-policy packages",
-  version: "1.0.11-rc.0"
+  version: '1.0.14',
 });
 
 Package.onUse(function (api) {
   api.use('webapp', 'server');
   api.addFiles('browser-policy-common.js', 'server');
   api.export('BrowserPolicy', 'server');
+  api.addAssets('browser-policy-common.d.ts', 'server');
+  api.types('browser-policy-common.native.d.ts');
 });

@@ -1,21 +1,22 @@
 Package.describe({
   summary: "Reactive dictionary",
-  version: '1.1.8'
+  version: '1.3.3',
 });
 
 Package.onUse(function (api) {
-  api.use(['underscore', 'tracker', 'ejson', 'ecmascript']);
+  api.use(['tracker', 'ejson', 'ecmascript']);
   // If we are loading mongo-livedata, let you store ObjectIDs in it.
-  api.use('mongo', {weak: true});
+  api.use(['mongo', 'reload'], { weak: true });
+  api.mainModule('migration.js');
   api.export('ReactiveDict');
-  api.addFiles('reactive-dict.js');
-  api.addFiles('migration.js');
+  api.addAssets('reactive-dict.d.ts', 'server');
+  api.types('reactive-dict.native.d.ts');
 });
 
 Package.onTest(function (api) {
   api.use('tinytest');
   api.use('reactive-dict');
   api.use('tracker');
-  api.use('underscore');
+  api.use('reload');
   api.addFiles('reactive-dict-tests.js');
 });

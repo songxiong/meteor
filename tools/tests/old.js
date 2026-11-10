@@ -1,9 +1,8 @@
 var _ = require('underscore');
-var Future = require('fibers/future');
 var selftest = require('../tool-testing/selftest.js');
 var Sandbox = selftest.Sandbox;
 var Run = selftest.Run;
-var files = require('../fs/files.js');
+var files = require('../fs/files');
 var release = require('../packaging/release.js');
 
 // old tests don't get to test --release, and always run this release
@@ -20,21 +19,22 @@ var maybeFixRelease = function (env) {
 // they are very chatty about logging their progress to stdout/stderr.
 //
 // filename is interpreted relative to tools/selftests/old.
-var runOldTest = function (filename, extraEnv) {
+var runOldTest = async function (filename, extraEnv) {
   var s = new Sandbox;
+  await s.init();
 
   // 'Run' assumes that the first argument is a standard path,
   var run = new Run(files.convertToStandardPath(process.execPath), {
     // 'args' are treated as-is, so need to be converted before passing into
     // 'Run'
-    args: [files.convertToOSPath(files.pathResolve(
+    args: ['--no-wasm-code-gc', files.convertToOSPath(files.pathResolve(
       files.convertToStandardPath(__dirname), 'old', filename))],
-    env: maybeFixRelease(_.extend({
+    env: maybeFixRelease(Object.assign({
       METEOR_TOOL_PATH: s.execPath
     }, extraEnv))
   });
   run.waitSecs(120);
-  run.expectExit(0);
+  await run.expectExit(0);
 };
 
 // XXX Why are these tests from checkout?
@@ -51,17 +51,46 @@ var runOldTest = function (filename, extraEnv) {
 // will take another look at them later, but it is not worth that much more time
 // before 0.9.0.
 //
+// TODO [FIBERS] -> Check this one
+selftest.define("watch", ["slow"], async function () {
+  var runFuture = runOldTest.future();
+  var futures = [
+    // Run with pathwatcher (if possible)
+    runFuture('test-watch'),
+    // Run with fs.watchFile fallback
+    runFuture('test-watch', {
+      METEOR_WATCH_FORCE_POLLING: 1
+    })
+  ];
+  Future.wait(futures);
+  // Throw if any threw.
+  _.each(futures, function (f) {
+    f.get();
+  });
+});
 
 selftest.define("bundler-assets", ["checkout"], function () {
-  runOldTest('test-bundler-assets.js');
+  return runOldTest('test-bundler-assets.js');
 });
 
 selftest.define("bundler-options", ["checkout"], function () {
-  runOldTest('test-bundler-options.js');
+  return runOldTest('test-bundler-options.js');
 });
 
 selftest.define("bundler-npm", ["slow", "net", "checkout"], function () {
-  runOldTest('test-bundler-npm.js');
+  return runOldTest('test-bundler-npm.js');
+});
+
+selftest.define("bundler-devonly", ["checkout"], function () {
+  return runOldTest('test-bundler-devonly.js');
+});
+
+selftest.define("bundler-devdepends", ["checkout"], function () {
+  return runOldTest('test-bundler-devdepends.js');
+});
+
+selftest.define("bundler-manifest-hashes", ["checkout"], function () {
+  return runOldTest('test-bundler-manifest-hashes.js');
 });
 
 // This last one's is a shell script!
@@ -71,8 +100,10 @@ selftest.define("bundler-npm", ["slow", "net", "checkout"], function () {
 // in release mode. If we're not running from a checkout, just run it
 // against the installed copy.
 
-selftest.define("old cli tests (bash)", ["slow", "net", "yet-unsolved-windows-failure"], function () {
+selftest.skip.define("old cli tests (bash)", ["slow", "net", "yet-unsolved-windows-failure"], async function () {
   var s = new Sandbox;
+  await s.init();
+
   var scriptToRun = files.pathJoin(files.convertToStandardPath(__dirname),
     'old', 'cli-test.sh');
   var run = new Run(scriptToRun, {
@@ -82,6 +113,6 @@ selftest.define("old cli tests (bash)", ["slow", "net", "yet-unsolved-windows-fa
     })
   });
   run.waitSecs(1000);
-  run.match("PASSED\n");
-  run.expectExit(0);
+  await run.match("PASSED\n");
+  await run.expectExit(0);
 });

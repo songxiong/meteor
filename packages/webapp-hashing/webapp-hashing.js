@@ -1,4 +1,4 @@
-var crypto = Npm.require("crypto");
+import { createHash } from "crypto";
 
 WebAppHashing = {};
 
@@ -11,45 +11,46 @@ WebAppHashing = {};
 // (but the second is a performance enhancement, not a hard
 // requirement).
 
-WebAppHashing.calculateClientHash =
-  function (manifest, includeFilter, runtimeConfigOverride) {
-  var hash = crypto.createHash('sha1');
+WebAppHashing.calculateClientHash = function (manifest, includeFilter, runtimeConfigOverride) {
+  const hash = createHash("sha1");
 
   // Omit the old hashed client values in the new hash. These may be
   // modified in the new boilerplate.
-  var runtimeCfg = _.omit(__meteor_runtime_config__,
-    ['autoupdateVersion', 'autoupdateVersionRefreshable',
-     'autoupdateVersionCordova']);
+  const {
+    autoupdateVersion: _av,
+    autoupdateVersionRefreshable: _avr,
+    autoupdateVersionCordova: _avc,
+    ...runtimeCfgBase
+  } = __meteor_runtime_config__;
 
-  if (runtimeConfigOverride) {
-    runtimeCfg = runtimeConfigOverride;
-  }
+  const runtimeCfg = runtimeConfigOverride || runtimeCfgBase;
 
-  hash.update(JSON.stringify(runtimeCfg, 'utf8'));
+  hash.update(JSON.stringify(runtimeCfg, "utf8"));
 
-  _.each(manifest, function (resource) {
-      if ((! includeFilter || includeFilter(resource.type)) &&
-          (resource.where === 'client' || resource.where === 'internal')) {
+  manifest.forEach(function (resource) {
+    if (
+      (!includeFilter || includeFilter(resource.type, resource.replaceable)) &&
+      (resource.where === "client" || resource.where === "internal")
+    ) {
       hash.update(resource.path);
       hash.update(resource.hash);
     }
   });
-  return hash.digest('hex');
+  return hash.digest("hex");
 };
 
-WebAppHashing.calculateCordovaCompatibilityHash =
-  function(platformVersion, pluginVersions) {
-  const hash = crypto.createHash('sha1');
+WebAppHashing.calculateCordovaCompatibilityHash = function (platformVersion, pluginVersions) {
+  const hash = createHash("sha1");
 
   hash.update(platformVersion);
 
   // Sort plugins first so iteration order doesn't affect the hash
   const plugins = Object.keys(pluginVersions).sort();
-  for (let plugin of plugins) {
+  for (const plugin of plugins) {
     const version = pluginVersions[plugin];
     hash.update(plugin);
     hash.update(version);
   }
 
-  return hash.digest('hex');
+  return hash.digest("hex");
 };

@@ -1,8 +1,5 @@
 ECMAScript = {
-  compileForShell(command) {
-    const babelOptions = Babel.getDefaultOptions();
-    babelOptions.sourceMap = false;
-    babelOptions.ast = false;
-    return Babel.compile(command, babelOptions).code;
+  compileForShell() {
+    throw new Error('compileForShell was removed in Meteor 3. Use Babel.compileForShell instead from babel-compiler');
   }
 };

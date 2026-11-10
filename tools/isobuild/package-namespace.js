@@ -1,10 +1,14 @@
 import { each, size, compact } from "underscore";
-import { inCheckout } from "../fs/files.js";
+import { inCheckout } from "../fs/files";
 import buildmessage from "../utils/buildmessage.js";
 import packageVersionParser from "../packaging/package-version-parser.js";
 
-// == Class of the 'Package' object visible in package.js ==
-
+  /**
+   * @summary Class of the 'Package' object visible in package.js
+   * @locus package.js
+   * @instanceName Package
+   * @showInstanceName true
+   */
 export class PackageNamespace {
   constructor(packageSource) {
     this._packageSource = packageSource;
@@ -22,7 +26,7 @@ export class PackageNamespace {
   /**
    * @summary Provide basic package information.
    * @locus package.js
-   * @memberOf Package
+   * @memberOf PackageNamespace
    * @param {Object} options
    * @param {String} options.summary A concise 1-2 sentence description of
    * the package, required for publication.
@@ -42,6 +46,9 @@ export class PackageNamespace {
    * @param {String} options.documentation Optional Filepath to
    * documentation. Set to 'README.md' by default. Set this to null to submit
    * no documentation.
+   * @param {Boolean} options.devOnly A package with this flag set to true
+   * will ONLY be bundled as part of `meteor run`, and completely excluded
+   * from production builds with `meteor build`.
    * @param {Boolean} options.debugOnly A package with this flag set to true
    * will not be bundled into production builds. This is useful for packages
    * meant to be used in development only.
@@ -49,6 +56,8 @@ export class PackageNamespace {
    * will ONLY be bundled into production builds.
    * @param {Boolean} options.testOnly A package with this flag set to true
    * will ONLY be bundled as part of `meteor test`.
+   * @param {Boolean|String} options.deprecated A flag that will mark the
+   * package as deprecated. Provide string to override the default message.
    */
   describe(options) {
     const source = this._packageSource;
@@ -124,7 +133,7 @@ export class PackageNamespace {
       // * These flags CAN cause different package load orders in
       //   development and production!  We should probably fix this.
       //   Basically, packages that are excluded from the build using
-      //   these flags are also excluded fro the build order calculation,
+      //   these flags are also excluded from the build order calculation,
       //   and that's the problem
       //
       // * We should consider publicly documenting these flags, since they
@@ -135,13 +144,20 @@ export class PackageNamespace {
         source.prodOnly = !!value;
       } else if (key === "testOnly") {
         source.testOnly = !!value;
+      } else if (key === "devOnly") {
+        source.devOnly = !!value;
+      } else if (key === "deprecated") {
+        if (typeof(value) === "string") {
+          source.deprecatedMessage = value;
+        }
+        source.deprecated = !!value;
       } else {
         // Do nothing. We might want to add some keys later, and we should err
         // on the side of backwards compatibility.
       }
-      if (size(compact([source.debugOnly, source.prodOnly, source.testOnly])) > 1) {
+      if (size(compact([source.debugOnly, source.prodOnly, source.testOnly, source.devOnly])) > 1) {
         buildmessage.error(
-          "Package can't have more than one of: debugOnly, prodOnly, testOnly.");
+          "Package can't have more than one of: debugOnly, prodOnly, testOnly or devOnly.");
       }
     });
   }
@@ -149,7 +165,6 @@ export class PackageNamespace {
   /**
    * @summary Define package dependencies and expose package methods.
    * @locus package.js
-   * @memberOf Package
    * @param {Function} func A function that takes in the package control `api` object, which keeps track of dependencies and exports.
    */
   onUse(f) {
@@ -166,16 +181,8 @@ export class PackageNamespace {
   }
 
   /**
-   * @deprecated in 0.9.0
-   */
-  on_use(f) {
-    this.onUse(f);
-  }
-
-  /**
    * @summary Define dependencies and expose package methods for unit tests.
    * @locus package.js
-   * @memberOf Package
    * @param {Function} func A function that takes in the package control 'api' object, which keeps track of dependencies and exports.
    */
   onTest(f) {
@@ -201,13 +208,6 @@ export class PackageNamespace {
 
       this._fileAndDepLoader = f;
     }
-  }
-
-  /**
-   * @deprecated in 0.9.0
-   */
-  on_test(f) {
-    this.onTest(f);
   }
 
   // Define a plugin. A plugin extends the build process for
@@ -245,7 +245,6 @@ export class PackageNamespace {
    * @param {Object} options.npmDependencies An object where the keys
    * are NPM package names, and the values are the version numbers of
    * required NPM packages, just like in [Npm.depends](#Npm-depends).
-   * @memberOf Package
    * @locus package.js
    */
   registerBuildPlugin(options) {
@@ -284,13 +283,6 @@ export class PackageNamespace {
 
     // XXX probably want further type checking
     pluginInfo[options.name] = options;
-  }
-
-  /**
-   * @deprecated in 0.9.4
-   */
-  _transitional_registerBuildPlugin(options) {
-    this.registerBuildPlugin(options);
   }
 
   includeTool() {

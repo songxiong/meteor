@@ -11,15 +11,16 @@ DDPServer._Crossbar = function (options) {
   // keys 'trigger', 'callback'.  As a hack, the empty string means "no
   // collection".
   self.listenersByCollection = {};
+  self.listenersByCollectionCount = {};
   self.factPackage = options.factPackage || "livedata";
   self.factName = options.factName || null;
 };
 
-_.extend(DDPServer._Crossbar.prototype, {
+Object.assign(DDPServer._Crossbar.prototype, {
   // msg is a trigger or a notification
   _collectionForMessage: function (msg) {
     var self = this;
-    if (! _.has(msg, 'collection')) {
+    if (!('collection' in msg)) {
       return '';
     } else if (typeof(msg.collection) === 'string') {
       if (msg.collection === '')
@@ -46,25 +47,35 @@ _.extend(DDPServer._Crossbar.prototype, {
 
     var collection = self._collectionForMessage(trigger);
     var record = {trigger: EJSON.clone(trigger), callback: callback};
-    if (! _.has(self.listenersByCollection, collection)) {
+    if (! (collection in self.listenersByCollection)) {
       self.listenersByCollection[collection] = {};
+      self.listenersByCollectionCount[collection] = 0;
     }
     self.listenersByCollection[collection][id] = record;
+    self.listenersByCollectionCount[collection]++;
 
-    if (self.factName && Package.facts) {
-      Package.facts.Facts.incrementServerFact(
+    if (self.factName && Package['facts-base']) {
+      Package['facts-base'].Facts.incrementServerFact(
         self.factPackage, self.factName, 1);
     }
 
+    var stopped = false;
     return {
       stop: function () {
-        if (self.factName && Package.facts) {
-          Package.facts.Facts.incrementServerFact(
+        // Idempotent: a second stop() used to decrement the count (and the
+        // server fact) again — silently dropping the collection's remaining
+        // listeners when the count hit zero, then throwing on later stops.
+        if (stopped) return;
+        stopped = true;
+        if (self.factName && Package['facts-base']) {
+          Package['facts-base'].Facts.incrementServerFact(
             self.factPackage, self.factName, -1);
         }
         delete self.listenersByCollection[collection][id];
-        if (_.isEmpty(self.listenersByCollection[collection])) {
+        self.listenersByCollectionCount[collection]--;
+        if (self.listenersByCollectionCount[collection] === 0) {
           delete self.listenersByCollection[collection];
+          delete self.listenersByCollectionCount[collection];
         }
       }
     };
@@ -78,18 +89,18 @@ _.extend(DDPServer._Crossbar.prototype, {
   // listener callbacks will be called inside the write fence as well.
   //
   // The listeners may be invoked in parallel, rather than serially.
-  fire: function (notification) {
+  fire: async function (notification) {
     var self = this;
 
     var collection = self._collectionForMessage(notification);
 
-    if (! _.has(self.listenersByCollection, collection)) {
+    if (!(collection in self.listenersByCollection)) {
       return;
     }
 
     var listenersForCollection = self.listenersByCollection[collection];
     var callbackIds = [];
-    _.each(listenersForCollection, function (l, id) {
+    Object.entries(listenersForCollection).forEach(function ([id, l]) {
       if (self._matches(notification, l.trigger)) {
         callbackIds.push(id);
       }
@@ -104,11 +115,11 @@ _.extend(DDPServer._Crossbar.prototype, {
     // because the only way that stops being true is if listenersForCollection
     // first gets reduced down to the empty object (and then never gets
     // increased again).
-    _.each(callbackIds, function (id) {
-      if (_.has(listenersForCollection, id)) {
-        listenersForCollection[id].callback(notification);
+    for (const id of callbackIds) {
+      if (id in listenersForCollection) {
+        await listenersForCollection[id].callback(notification);
       }
-    });
+    }
   },
 
   // A notification matches a trigger if all keys that exist in both are equal.
@@ -145,10 +156,9 @@ _.extend(DDPServer._Crossbar.prototype, {
       return false;
     }
 
-    return _.all(trigger, function (triggerValue, key) {
-      return !_.has(notification, key) ||
-        EJSON.equals(triggerValue, notification[key]);
-    });
+    return Object.keys(trigger).every(function (key) {
+      return !(key in notification) || EJSON.equals(trigger[key], notification[key]);
+     });
   }
 });
 

@@ -1,30 +1,25 @@
 Package.describe({
-  summary: "CSS minifier",
-  version: "1.2.15-rc.0"
+  summary: 'CSS minifier',
+  version: '2.0.2',
 });
 
 Npm.depends({
-  "css-parse": "2.0.0",
-  "css-stringify": "2.0.0"
-});
-
-Npm.strip({
-  "css-parse": ["test/"],
-  "css-stringify": ["test/"]
+  postcss: '8.5.1',
+  cssnano: '5.1.15'
 });
 
 Package.onUse(function (api) {
-  api.use('underscore', 'server');
-  api.export(['CssTools']);
-  api.addFiles(['minification.js', 'minifier.js'], 'server');
+  api.use('ecmascript');
+  api.mainModule('minifier.js', 'server');
+  api.export('CssTools');
 });
 
 Package.onTest(function (api) {
-  api.use('minifier-css', 'server');
+  api.use('ecmascript');
   api.use('tinytest');
-
   api.addFiles([
     'minifier-tests.js',
+    'minifier-async-tests.js',
     'urlrewriting-tests.js'
   ], 'server');
 });

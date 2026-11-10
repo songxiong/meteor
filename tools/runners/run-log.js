@@ -1,5 +1,3 @@
-var _ = require('underscore');
-var isopackets = require('../tool-env/isopackets.js');
 var Console = require('../console/console.js').Console;
 var fiberHelpers = require('../utils/fiber-helpers.js');
 
@@ -18,9 +16,10 @@ var fiberHelpers = require('../utils/fiber-helpers.js');
 // anywhere that may overlap with use of runLog.
 
 let _Log;
-function getLoggingPackage() {
+async function getLoggingPackage() {
   if (! _Log) {
-    _Log = isopackets.load('logging').logging.Log;
+    const { loadIsopackage } = require("../tool-env/isopackets.js");
+    _Log = (await loadIsopackage('logging')).Log;
   }
 
   // Since no other process will be listening to stdout and parsing it,
@@ -28,7 +27,7 @@ function getLoggingPackage() {
   _Log.outputFormat = 'colored-text';
 
   return _Log;
-};
+}
 
 var RunLog = function () {
   var self = this;
@@ -50,7 +49,7 @@ var RunLog = function () {
   self.temporaryMessageLength = null;
 };
 
-_.extend(RunLog.prototype, {
+Object.assign(RunLog.prototype, {
   _record: function (msg) {
     var self = this;
 
@@ -84,10 +83,10 @@ _.extend(RunLog.prototype, {
     this.rawLogs = !!rawLogs;
   },
 
-  logAppOutput: function (line, isStderr) {
+  logAppOutput: async function (line, isStderr) {
     var self = this;
 
-    var Log = getLoggingPackage();
+    var Log = await getLoggingPackage();
 
     var obj = (isStderr ?
                Log.objFromText(line, { level: 'warn', stderr: true }) :
@@ -145,7 +144,7 @@ _.extend(RunLog.prototype, {
     self.temporaryMessageLength = msg.length;
   },
 
-  logRestart: function () {
+  logRestart: function (options) {
     var self = this;
 
     if (self.consecutiveRestartMessages) {
@@ -159,7 +158,7 @@ _.extend(RunLog.prototype, {
       self.consecutiveRestartMessages = 1;
     }
 
-    var message = "=> Meteor server restarted";
+    var message = "=> Meteor server restarted at " + options.rootUrl;
     if (self.consecutiveRestartMessages > 1) {
       message += " (x" + self.consecutiveRestartMessages + ")";
     }
@@ -221,9 +220,11 @@ _.extend(RunLog.prototype, {
 // Create a singleton instance of RunLog. Expose its public methods on the
 // object you get with require('./run-log.js').
 var runLogInstance = new RunLog;
-_.each(
-  ['log', 'logTemporary', 'logRestart', 'logClientRestart', 'logAppOutput',
-   'setRawLogs', 'finish', 'clearLog', 'getLog'],
+['log', 'logTemporary', 'logRestart', 'logClientRestart', 'logAppOutput',
+  'setRawLogs', 'finish', 'clearLog', 'getLog'].forEach(
   function (method) {
-    exports[method] = _.bind(runLogInstance[method], runLogInstance);
+    exports[method] = runLogInstance[method].bind(runLogInstance);
   });
+
+// Export the singleton instance for use in plugins
+exports.runLogInstance = runLogInstance;

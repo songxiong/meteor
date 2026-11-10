@@ -1,41 +1,50 @@
 const _ = require('underscore');
 
-const files = require('../fs/files.js');
+const files = require('../fs/files');
 const buildmessage = require('../utils/buildmessage.js');
 const utils = require('../utils/utils.js');
 const runLog = require('./run-log.js');
 const release = require('../packaging/release.js');
 
 const Console = require('../console/console.js').Console;
+const crypto = require('crypto');
 
 const Proxy = require('./run-proxy.js').Proxy;
 const Selenium = require('./run-selenium.js').Selenium;
 const AppRunner = require('./run-app.js').AppRunner;
 const MongoRunner = require('./run-mongo.js').MongoRunner;
-const Updater = require('./run-updater.js').Updater;
+const HMRServer = require('./run-hmr').HMRServer;
+const Updater = require('./run-updater').Updater;
 
 class Runner {
-  constructor({
-    appHost,
-    appPort,
-    banner,
-    disableOplog,
-    cordovaRunner,
-    mongoUrl,
-    onFailure,
-    oplogUrl,
-    projectContext,
-    proxyHost,
-    proxyPort,
-    quiet,
-    rootUrl,
-    selenium,
-    seleniumBrowser,
-    noReleaseCheck,
-    ...optionsForAppRunner
-  }) {
+  constructor(options) {
     const self = this;
-    self.projectContext = projectContext;
+    self.options = options;
+    self.projectContext = options.projectContext;
+  }
+
+  async init() {
+    const self = this;
+    let {
+          appHost,
+          appPort,
+          banner,
+          disableOplog,
+          cordovaRunner,
+          mongoUrl,
+          onFailure,
+          oplogUrl,
+          projectContext,
+          proxyHost,
+          proxyPort,
+          quiet,
+          rootUrl,
+          selenium,
+          seleniumBrowser,
+          noReleaseCheck,
+          cordovaServerPort,
+    ...optionsForAppRunner
+    } = self.options;
 
     if (typeof proxyPort === 'undefined') {
       throw new Error('no proxyPort?');
@@ -50,7 +59,7 @@ class Runner {
     self.noReleaseCheck = noReleaseCheck;
     self.quiet = quiet;
     self.banner = banner || files.convertToOSPath(
-      files.prettyPath(self.projectContext.projectDir)
+        files.prettyPath(self.projectContext.projectDir)
     );
 
     if (rootUrl) {
@@ -63,18 +72,32 @@ class Runner {
       });
     }
 
+    const basePath = utils.parseUrl(self.rootUrl).pathname || '';
+    const HMRPath = basePath + '/__meteor__hmr__/websocket';
+
     self.proxy = new Proxy({
       listenPort,
       listenHost: proxyHost,
       proxyToPort: self.appPort,
       proxyToHost: appHost,
-      onFailure
+      onFailure,
+      ignoredUrls: [HMRPath]
     });
 
+    await buildmessage.capture(async function () {
+      await self.projectContext.resolveConstraints();
+    });
+
+    const packageMap = self.projectContext.packageMap;
+    const hasMongoDevServerPackage =
+        packageMap && packageMap.getInfo('mongo-dev-server') != null;
     self.mongoRunner = null;
     if (mongoUrl) {
       oplogUrl = disableOplog ? null : oplogUrl;
-    } else {
+    } else if (hasMongoDevServerPackage
+        || process.env.METEOR_TEST_FAKE_MONGOD_CONTROL_PORT) {
+      // The mongo-dev-server package is required to start Mongo, but
+      // tests using fake-mongod are exempted.
       self.mongoRunner = new MongoRunner({
         projectLocalDir: self.projectContext.projectLocalDir,
         port: mongoPort,
@@ -86,6 +109,40 @@ class Runner {
 
       mongoUrl = self.mongoRunner.mongoUrl();
       oplogUrl = disableOplog ? null : self.mongoRunner.oplogUrl();
+    } else {
+      // Don't start a mongodb server.
+      // Set monogUrl to a specific value to prevent MongoDB connections
+      // and to allow a check for printing a message if `mongo-dev-server`
+      // is added while the app is running.
+      // The check and message is printed by the `mongo-dev-server` package.
+      mongoUrl = 'no-mongo-server';
+    }
+
+    // Note: the HMR server is started here whenever the app uses
+    // `hot-module-replacement`, regardless of build mode. That includes
+    // `meteor test` and `meteor test --full-app`, even though HMR is
+    // effectively a no-op in those runs. The compile layer
+    // (`tools/isobuild/compiler-plugin.js`, `hmrAvailable`) gates HMR on
+    // `buildMode === 'development'`, and test runs build with
+    // `buildMode: 'test'` (set in `tools/cli/commands.js` and preserved
+    // above in the NODE_ENV/buildMode block, which explicitly notes
+    // "We *never* override buildMode (it can be 'test')"). The client side
+    // of the `hot-module-replacement` package is responsible for bailing
+    // out of its WebSocket connection when `Meteor.isTest` or
+    // `Meteor.isAppTest` is set, so we don't need an extra guard here.
+    const hasHotModuleReplacementPackage = packageMap &&
+        packageMap.getInfo('hot-module-replacement') != null;
+    self.hmrServer = null;
+    let hmrSecret = null;
+    if (hasHotModuleReplacementPackage) {
+      hmrSecret = crypto.randomBytes(64).toString('hex');
+      self.hmrServer = new HMRServer({
+        proxy: self.proxy,
+        hmrPath: HMRPath,
+        secret: hmrSecret,
+        projectContext: self.projectContext,
+        cordovaServerPort
+      });
     }
 
     self.updater = new Updater();
@@ -100,7 +157,9 @@ class Runner {
       rootUrl: self.rootUrl,
       proxy: self.proxy,
       noRestartBanner: self.quiet,
-      cordovaRunner: cordovaRunner
+      cordovaRunner: cordovaRunner,
+      hmrServer: self.hmrServer,
+      hmrSecret
     });
 
     self.selenium = null;
@@ -111,12 +170,11 @@ class Runner {
       });
     }
   }
-
   // XXX leave a pidfile and check if we are already running
-  start() {
+  async start() {
     const self = this;
 
-    self.proxy.start();
+    await self.proxy.start();
 
     // print the banner only once we've successfully bound the port
     if (! self.quiet && ! self.stopped) {
@@ -125,16 +183,40 @@ class Runner {
     }
 
     var unblockAppRunner = self.appRunner.makeBeforeStartPromise();
-    self._startMongoAsync().then(unblockAppRunner);
+
+    function startMongo(tries = 3) {
+      self
+        ._startMongoAsync()
+        .then(() => unblockAppRunner())
+        .catch(async (error) => {
+          --tries;
+          const left = tries + (tries === 1 ? " try" : " tries");
+          Console.error(`Error starting Mongo (${left} left): ${error.message}`);
+          if (tries > 0) {
+            self.mongoRunner.stop();
+            setTimeout(() => startMongo(tries), 1000);
+          } else {
+            await self.mongoRunner._fail();
+          }
+        });
+    }
+
+    startMongo();
 
     if (!self.noReleaseCheck && ! self.stopped) {
       self.updater.start();
     }
 
+    if (!self.stopped && self.hmrServer) {
+      self.hmrServer.start();
+
+      if (!self.quiet && !self.stopped) {
+        runLog.log("Started HMR server.", { arrow: true });
+      }
+    }
+
     if (! self.stopped) {
-      buildmessage.enterJob({ title: "starting your app" }, function () {
-        self.appRunner.start();
-      });
+      await buildmessage.enterJob({ title: "starting your app" }, () => self.appRunner.start());
       if (! self.quiet && ! self.stopped) {
         runLog.log("Started your app.",  { arrow: true });
       }
@@ -142,7 +224,14 @@ class Runner {
 
     if (! self.stopped && ! self.quiet) {
       runLog.log("");
-      runLog.log("App running at: " + self.rootUrl,  { arrow: true });
+      if (process.env.UNIX_SOCKET_PATH) {
+        runLog.log(
+          `App running; UNIX domain socket: ${process.env.UNIX_SOCKET_PATH}`,
+          { arrow: true }
+        );
+      } else {
+        runLog.log("App running at " + self.rootUrl,  { arrow: true });
+      }
 
       if (process.platform === "win32") {
         runLog.log("   Type Control-C twice to stop.");
@@ -151,8 +240,8 @@ class Runner {
     }
 
     if (self.selenium && ! self.stopped) {
-      buildmessage.enterJob({ title: "starting Selenium" }, function () {
-        self.selenium.start();
+      await buildmessage.enterJob({ title: "starting Selenium" }, async function () {
+        return await self.selenium.start();
       });
       if (! self.quiet && ! self.stopped) {
         runLog.log("Started Selenium.", { arrow: true });
@@ -167,7 +256,7 @@ class Runner {
 
   async _startMongoAsync() {
     if (! this.stopped && this.mongoRunner) {
-      this.mongoRunner.start();
+      await this.mongoRunner.start();
       if (! this.stopped && ! this.quiet) {
         runLog.log("Started MongoDB.", { arrow: true });
       }
@@ -175,18 +264,18 @@ class Runner {
   }
 
   // Idempotent
-  stop() {
+  async stop() {
     const self = this;
     if (self.stopped) {
       return;
     }
 
     self.stopped = true;
-    self.proxy.stop();
-    self.updater.stop();
-    self.mongoRunner && self.mongoRunner.stop();
-    self.appRunner.stop();
-    self.selenium && self.selenium.stop();
+    await self.proxy.stop();
+    await self.updater.stop();
+    await self.mongoRunner && self.mongoRunner.stop();
+    await self.appRunner.stop();
+    await (self.selenium && self.selenium.stop());
     // XXX does calling this 'finish' still make sense now that runLog is a
     // singleton?
     runLog.finish();
@@ -240,6 +329,7 @@ class Runner {
 // - buildOptions: 'buildOptions' argument to bundler.bundle()
 // - settingsFile: path to file containing deploy-time settings
 // - once: see above
+// - onBuilt: callback to call when the app bundle is built
 // - banner: replace the application path that is normally printed on
 //   startup with an arbitrary string (eg, 'Tests')
 // - rootUrl: tell the app that traffic at this URL will be routed to
@@ -254,19 +344,19 @@ class Runner {
 // - recordPackageUsage: (default true) if set to false, don't send
 //   information about packages used by this app to the package stats
 //   server.
-exports.run = function (options) {
+exports.run = async function (options) {
   var runOptions = _.clone(options);
   var once = runOptions.once;
-  delete runOptions.once;
+  var onBuilt = runOptions.onBuilt;
 
   var promise = new Promise(function (resolve) {
-    runOptions.onFailure = function () {
+    runOptions.onFailure = async function () {
       // Ensure that runner stops now. You might think this is unnecessary
       // because the runner is stopped immediately after promise.await(), but if
       // the failure happens while runner.start() is still running, we want the
       // rest of start to stop, and it's not like resolve() magically makes
       // us jump to a promise.await() that hasn't happened yet!.
-      runner.stop();
+      await runner.stop();
       resolve({ outcome: 'failure' });
     };
 
@@ -319,9 +409,16 @@ exports.run = function (options) {
   }
 
   var runner = new Runner(runOptions);
-  runner.start();
-  var result = promise.await();
-  runner.stop();
+  await runner.init();
+  // don't wait this on to finish
+  if (runOptions.open) {
+    await runner.start();
+  } else {
+    setTimeout(() => runner.start(), 0);
+  }
+  onBuilt && onBuilt();
+  var result = await promise;
+  await runner.stop();
 
   if (result.outcome === "conflicting-versions") {
     Console.error(

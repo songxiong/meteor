@@ -1,196 +1,332 @@
-var Future = Npm.require('fibers/future');
-var urlModule = Npm.require('url');
+import { Meteor } from 'meteor/meteor';
+import { Log } from 'meteor/logging';
+import { Hook } from 'meteor/callback-hook';
 
-Email = {};
-EmailTest = {};
+import url from 'url';
+import nodemailer from 'nodemailer';
+import wellKnow from 'nodemailer/lib/well-known';
+import { openpgpEncrypt } from 'nodemailer-openpgp';
 
-EmailInternals = {
+export const Email = {};
+export const EmailTest = {};
+
+export const EmailInternals = {
   NpmModules: {
     mailcomposer: {
-      version: Npm.require('mailcomposer/package.json').version,
-      module: Npm.require('mailcomposer')
+      version: Npm.require('nodemailer/package.json').version,
+      module: Npm.require('nodemailer/lib/mail-composer'),
+    },
+    nodemailer: {
+      version: Npm.require('nodemailer/package.json').version,
+      module: Npm.require('nodemailer'),
+    },
+  },
+};
+
+const MailComposer = EmailInternals.NpmModules.mailcomposer.module;
+
+const makeTransport = function (mailUrlString, options) {
+  const mailUrl = new URL(mailUrlString);
+
+  if (mailUrl.protocol !== 'smtp:' && mailUrl.protocol !== 'smtps:') {
+    throw new Error(
+      'Email protocol in $MAIL_URL (' +
+        mailUrlString +
+        ") must be 'smtp' or 'smtps'"
+    );
+  }
+
+  if (mailUrl.protocol === 'smtp:' && mailUrl.port === '465') {
+    Log.debug(
+      "The $MAIL_URL is 'smtp://...:465'.  " +
+        "You probably want 'smtps://' (The 's' enables TLS/SSL) " +
+        "since '465' is typically a secure port."
+    );
+  }
+
+  // Allow overriding pool setting, but default to true.
+  if (!mailUrl.query) {
+    mailUrl.query = {};
+  }
+
+  if (!mailUrl.query.pool) {
+    mailUrl.query.pool = 'true';
+  }
+
+  const transport = nodemailer.createTransport(url.format(mailUrl));
+  if (options?.encryptionKeys || options?.shouldSign) {
+    transport.use('stream', openpgpEncrypt(options));
+  }
+  return transport;
+};
+
+// More info: https://nodemailer.com/smtp/well-known/
+const knownHostsTransport = function (settings = undefined, url = undefined, options) {
+  let service, user, password;
+
+  const hasSettings = settings && Object.keys(settings).length;
+
+  if (url && !hasSettings) {
+    let host = url.split(':')[0];
+    const urlObject = new URL(url);
+    if (host === 'http' || host === 'https') {
+      // Look to hostname for service
+      host = urlObject.hostname;
+      user = urlObject.username;
+      password = urlObject.password;
+    } else if (urlObject.protocol && urlObject.username && urlObject.password) {
+      // We have some data from urlObject
+      host = urlObject.protocol.split(':')[0];
+      user = urlObject.username;
+      password = urlObject.password;
+    } else {
+      // We need to disect the URL ourselves to get the data
+      // First get rid of the leading '//' and split to username and the rest
+      const temp = urlObject.pathname.substring(2)?.split(':');
+      user = temp[0];
+      // Now we split by '@' to get password and hostname
+      const temp2 = temp[1].split('@');
+      password = temp2[0];
+      host = temp2[1];
     }
-  }
-};
-
-var MailComposer = EmailInternals.NpmModules.mailcomposer.module.MailComposer;
-
-var makePool = function (mailUrlString) {
-  var mailUrl = urlModule.parse(mailUrlString);
-  if (mailUrl.protocol !== 'smtp:' && mailUrl.protocol !== 'smtps:')
-    throw new Error("Email protocol in $MAIL_URL (" +
-                    mailUrlString + ") must be 'smtp' or 'smtps'");
-
-  var port = +(mailUrl.port);
-  var auth = false;
-  if (mailUrl.auth) {
-    var parts = mailUrl.auth.split(':', 2);
-    auth = {user: parts[0],
-            pass: parts[1]};
+    service = host;
   }
 
-  var simplesmtp = Npm.require('simplesmtp');
-  var pool = simplesmtp.createClientPool(
-    port,  // Defaults to 25
-    mailUrl.hostname,  // Defaults to "localhost"
-    { secureConnection: (port === 465) || (mailUrl.protocol === 'smtps:'),
-      // XXX allow maxConnections to be configured?
-      auth: auth });
+  if (!wellKnow(settings?.service || service)) {
+    throw new Error(
+      'Could not recognize e-mail service. See list at https://nodemailer.com/smtp/well-known/ for services that we can configure for you.'
+    );
+  }
 
-  pool._future_wrapped_sendMail = _.bind(Future.wrap(pool.sendMail), pool);
-  return pool;
+  const transport = nodemailer.createTransport({
+    service: settings?.service || service,
+    auth: {
+      user: settings?.user || user,
+      pass: settings?.password || password,
+    },
+  });
+
+  if (options?.encryptionKeys || options?.shouldSign) {
+    transport.use('stream', openpgpEncrypt(options));
+  }
+  return transport;
 };
+EmailTest.knowHostsTransport = knownHostsTransport;
 
-var getPool = function() {
+const getTransport = function (options) {
+  const packageSettings = Meteor.settings.packages?.email || {};
   // We delay this check until the first call to Email.send, in case someone
   // set process.env.MAIL_URL in startup code. Then we store in a cache until
   // process.env.MAIL_URL changes.
-  var url = process.env.MAIL_URL;
-  if (this.cacheKey === undefined || this.cacheKey !== url) {
-    this.cacheKey = url;
-    this.cache = url ? makePool(url) : null;
+  const url = process.env.MAIL_URL;
+  if (
+    globalThis.cacheKey === undefined ||
+    globalThis.cacheKey !== url ||
+    globalThis.cacheKey !== packageSettings.service ||
+    globalThis.cacheKey !== 'settings'
+  ) {
+    if (
+      (packageSettings.service && wellKnow(packageSettings.service)) ||
+      (url && wellKnow(new URL(url).hostname)) ||
+      wellKnow(url?.split(':')[0] || '')
+    ) {
+      globalThis.cacheKey = packageSettings.service || 'settings';
+      globalThis.cache = knownHostsTransport(packageSettings, url, options);
+    } else {
+      globalThis.cacheKey = url;
+      globalThis.cache = url ? makeTransport(url, options) : null;
+    }
   }
-  return this.cache;
-}
+  return globalThis.cache;
+};
 
-var next_devmode_mail_id = 0;
-var output_stream = process.stdout;
+let nextDevModeMailId = 0;
+
+EmailTest._getAndIncNextDevModeMailId = function () {
+  return nextDevModeMailId++;
+};
 
 // Testing hooks
-EmailTest.overrideOutputStream = function (stream) {
-  next_devmode_mail_id = 0;
-  output_stream = stream;
+EmailTest.resetNextDevModeMailId = function () {
+  nextDevModeMailId = 0;
 };
 
-EmailTest.restoreOutputStream = function () {
-  output_stream = process.stdout;
-};
+const devModeSendAsync = function (mail, options) {
+  const stream = options?.stream || process.stdout;
+  return new Promise((resolve, reject) => {
+    let devModeMailId = EmailTest._getAndIncNextDevModeMailId();
 
-var devModeSend = function (mc) {
-  var devmode_mail_id = next_devmode_mail_id++;
-
-  var stream = output_stream;
-
-  // This approach does not prevent other writers to stdout from interleaving.
-  stream.write("====== BEGIN MAIL #" + devmode_mail_id + " ======\n");
-  stream.write("(Mail not sent; to enable sending, set the MAIL_URL " +
-               "environment variable.)\n");
-  mc.streamMessage();
-  mc.pipe(stream, {end: false});
-  var future = new Future;
-  mc.on('end', function () {
-    stream.write("====== END MAIL #" + devmode_mail_id + " ======\n");
-    future['return']();
+    // This approach does not prevent other writers to stdout from interleaving.
+    const output = ['====== BEGIN MAIL #' + devModeMailId + ' ======\n'];
+    output.push(
+      '(Mail not sent; to enable sending, set the MAIL_URL ' +
+      'environment variable.)\n'
+    );
+    const readStream = new MailComposer(mail).compile().createReadStream();
+    readStream.on('data', buffer => {
+      output.push(buffer.toString());
+    });
+    readStream.on('end', function () {
+      output.push('====== END MAIL #' + devModeMailId + ' ======\n');
+      stream.write(output.join(''), () => resolve());
+    });
+    readStream.on('error', (err) => reject(err));
   });
-  future.wait();
 };
 
-var smtpSend = function (pool, mc) {
-  pool._future_wrapped_sendMail(mc).wait();
-};
+const sendHooks = new Hook();
 
 /**
- * Mock out email sending (eg, during a test.) This is private for now.
+ * @summary Hook that runs before email is sent.
+ * @locus Server
  *
- * f receives the arguments to Email.send and should return true to go
+ * @param f {function} receives the arguments to Email.send and should return true to go
  * ahead and send the email (or at least, try subsequent hooks), or
  * false to skip sending.
+ * @returns {{ stop: function, callback: function }}
  */
-var sendHooks = [];
-EmailTest.hookSend = function (f) {
-  sendHooks.push(f);
+Email.hookSend = function (f) {
+  return sendHooks.register(f);
 };
 
-// Old comment below
 /**
- * Send an email.
- *
- * Connects to the mail server configured via the MAIL_URL environment
- * variable. If unset, prints formatted message to stdout. The "from" option
- * is required, and at least one of "to", "cc", and "bcc" must be provided;
- * all other options are optional.
- *
- * @param options
- * @param options.from {String} RFC5322 "From:" address
- * @param options.to {String|String[]} RFC5322 "To:" address[es]
- * @param options.cc {String|String[]} RFC5322 "Cc:" address[es]
- * @param options.bcc {String|String[]} RFC5322 "Bcc:" address[es]
- * @param options.replyTo {String|String[]} RFC5322 "Reply-To:" address[es]
- * @param options.subject {String} RFC5322 "Subject:" line
- * @param options.text {String} RFC5322 mail body (plain text)
- * @param options.html {String} RFC5322 mail body (HTML)
- * @param options.headers {Object} custom RFC5322 headers (dictionary)
+ * @summary Overrides sending function with your own.
+ * @locus Server
+ * @since 2.2
+ * @param f {function} function that will receive options from the send function and under `packageSettings` will
+ * include the package settings from Meteor.settings.packages.email for your custom transport to access.
  */
+Email.customTransport = undefined;
 
-// New API doc comment below
 /**
- * @summary Send an email. Throws an `Error` on failure to contact mail server
+ * @summary Send an email with asyncronous method. Capture  Throws an `Error` on failure to contact mail server
  * or if mail server returns an error. All fields should match
  * [RFC5322](http://tools.ietf.org/html/rfc5322) specification.
  *
  * If the `MAIL_URL` environment variable is set, actually sends the email.
  * Otherwise, prints the contents of the email to standard out.
  *
- * Note that this package is based on mailcomposer version `0.1.15`, so make
- * sure to refer to the documentation for that version if using the
- * `attachments` or `mailComposer` options.
- * [Click here to read the mailcomposer 0.1.15 docs](https://github.com/andris9/mailcomposer/blob/7c0422b2de2dc61a60ba27cfa3353472f662aeb5/README.md).
+ * Note that this package is based on **nodemailer**, so make sure to refer to
+ * [the documentation](http://nodemailer.com/)
+ * when using the `attachments` or `mailComposer` options.
  *
  * @locus Server
+ * @return {Promise}
  * @param {Object} options
  * @param {String} options.from "From:" address (required)
  * @param {String|String[]} options.to,cc,bcc,replyTo
  *   "To:", "Cc:", "Bcc:", and "Reply-To:" addresses
+ * @param {String} [options.inReplyTo] Message-ID this message is replying to
+ * @param {String|String[]} [options.references] Array (or space-separated string) of Message-IDs to refer to
+ * @param {String} [options.messageId] Message-ID for this message; otherwise, will be set to a random value
  * @param {String} [options.subject]  "Subject:" line
  * @param {String} [options.text|html] Mail body (in plain text and/or HTML)
- * @param {Object} [options.headers] Dictionary of custom headers
+ * @param {String} [options.watchHtml] Mail body in HTML specific for Apple Watch
+ * @param {String} [options.icalEvent] iCalendar event attachment
+ * @param {Object} [options.headers] Dictionary of custom headers - e.g. `{ "header name": "header value" }`. To set an object under a header name, use `JSON.stringify` - e.g. `{ "header name": JSON.stringify({ tracking: { level: 'full' } }) }`.
  * @param {Object[]} [options.attachments] Array of attachment objects, as
- * described in the [mailcomposer documentation](https://github.com/andris9/mailcomposer/blob/7c0422b2de2dc61a60ba27cfa3353472f662aeb5/README.md#add-attachments).
- * @param {MailComposer} [options.mailComposer] A [MailComposer](https://github.com/andris9/mailcomposer)
- * object representing the message to be sent. Overrides all other options. You
- * can access the `mailcomposer` npm module at
- * `EmailInternals.NpmModules.mailcomposer.module`.
+ * described in the [nodemailer documentation](https://nodemailer.com/message/attachments/).
+ * @param {MailComposer} [options.mailComposer] A [MailComposer](https://nodemailer.com/extras/mailcomposer/#e-mail-message-fields)
+ * object representing the message to be sent.  Overrides all other options.
+ * You can create a `MailComposer` object via
+ * `new EmailInternals.NpmModules.mailcomposer.module`.
  */
-Email.send = function (options) {
-  for (var i = 0; i < sendHooks.length; i++)
-    if (! sendHooks[i](options))
-      return;
+Email.sendAsync = async function (options) {
+  const email = options.mailComposer ? options.mailComposer.mail : options;
 
-  var mc;
-  if (options.mailComposer) {
-    mc = options.mailComposer;
-  } else {
-    mc = new MailComposer();
-
-    // setup message data
-    mc.setMessageOption({
-      from: options.from,
-      to: options.to,
-      cc: options.cc,
-      bcc: options.bcc,
-      replyTo: options.replyTo,
-      subject: options.subject,
-      text: options.text,
-      html: options.html
-    });
-
-    _.each(options.headers, function (value, name) {
-      mc.addHeader(name, value);
-    });
-
-    if (!options.headers || !options.headers.hasOwnProperty('Date')) {
-      mc.addHeader('Date', new Date().toUTCString().replace(/GMT/, '+0000'));
-    }
-
-    _.each(options.attachments, function(attachment){
-      mc.addAttachment(attachment);
-    });
+  let send = true;
+  await sendHooks.forEachAsync(async (sendHook) => {
+    send = await sendHook(email);
+    return send;
+  });
+  if (!send) {
+    return;
   }
 
-  var pool = getPool();
-  if (pool) {
-    smtpSend(pool, mc);
-  } else {
-    devModeSend(mc);
+  if (Email.customTransport) {
+    const packageSettings = Meteor.settings.packages?.email || {};
+    return Email.customTransport({ packageSettings, ...email });
   }
+
+  const mailUrlEnv = process.env.MAIL_URL;
+  const mailUrlSettings = Meteor.settings.packages?.email;
+
+  if (Meteor.isProduction && !mailUrlEnv && !mailUrlSettings) {
+    // This check is mostly necessary when using the flag --production when running locally.
+    // And it works as a reminder to properly set the mail URL when running locally.
+    throw new Error(
+      'You have not provided a mail URL. You can provide it by using the environment variable MAIL_URL or your settings. You can read more about it here: https://docs.meteor.com/api/email.html.'
+    );
+  }
+
+  // Check if 'from' address is still the unconfigured default.
+  // The default "example.com" domain (RFC 2606) will always fail to send emails
+  // since no SPF/DKIM/DMARC records can exist for it.
+  const isDefaultFrom = !email.from ||
+    email.from.includes('@example.com');
+
+  if (isDefaultFrom) {
+    console.warn(
+      '[Email] Warning: "from" address is not configured. ' +
+      'Using default "example.com" which will fail in production. ' +
+      'Set Accounts.emailTemplates.from to a valid email address.'
+    );
+  }
+
+  if (mailUrlEnv || mailUrlSettings) {
+    return getTransport().sendMail(email);
+  }
+
+  return devModeSendAsync(email, options);
+};
+
+/**
+ * @deprecated
+ * @summary Send an email with asyncronous method. Capture  Throws an `Error` on failure to contact mail server
+ * or if mail server returns an error. All fields should match
+ * [RFC5322](http://tools.ietf.org/html/rfc5322) specification.
+ *
+ * If the `MAIL_URL` environment variable is set, actually sends the email.
+ * Otherwise, prints the contents of the email to standard out.
+ *
+ * Note that this package is based on **nodemailer**, so make sure to refer to
+ * [the documentation](http://nodemailer.com/)
+ * when using the `attachments` or `mailComposer` options.
+ *
+ * @locus Server
+ * @return {Promise}
+ * @param {Object} options
+ * @param {String} options.from "From:" address (required)
+ * @param {String|String[]} options.to,cc,bcc,replyTo
+ *   "To:", "Cc:", "Bcc:", and "Reply-To:" addresses
+ * @param {String} [options.inReplyTo] Message-ID this message is replying to
+ * @param {String|String[]} [options.references] Array (or space-separated string) of Message-IDs to refer to
+ * @param {String} [options.messageId] Message-ID for this message; otherwise, will be set to a random value
+ * @param {String} [options.subject]  "Subject:" line
+ * @param {String} [options.text|html] Mail body (in plain text and/or HTML)
+ * @param {String} [options.watchHtml] Mail body in HTML specific for Apple Watch
+ * @param {String} [options.icalEvent] iCalendar event attachment
+ * @param {Object} [options.headers] Dictionary of custom headers - e.g. `{ "header name": "header value" }`. To set an object under a header name, use `JSON.stringify` - e.g. `{ "header name": JSON.stringify({ tracking: { level: 'full' } }) }`.
+ * @param {Object[]} [options.attachments] Array of attachment objects, as
+ * described in the [nodemailer documentation](https://nodemailer.com/message/attachments/).
+ * @param {MailComposer} [options.mailComposer] A [MailComposer](https://nodemailer.com/extras/mailcomposer/#e-mail-message-fields)
+ * object representing the message to be sent.  Overrides all other options.
+ * You can create a `MailComposer` object via
+ * `new EmailInternals.NpmModules.mailcomposer.module`.
+ * @param {String} [options.encryptionKeys] An array that holds the public keys used to encrypt.
+ * @param {String} [options.shouldSign] Enables you to allow or disallow email signing.
+*/
+Email.send = function(options) {
+  Email.sendAsync(options)
+    .then(() =>
+      console.warn(
+        `Email.send is no longer recommended, you should use Email.sendAsync`
+      )
+    )
+    .catch(e =>
+      console.error(
+        `Email.send is no longer recommended and an error happened`,
+        e
+      )
+    );
 };

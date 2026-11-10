@@ -1,6 +1,6 @@
-var archinfo = require('../utils/archinfo.js');
+var archinfo = require('../utils/archinfo');
 var buildmessage = require('../utils/buildmessage.js');
-var files = require('../fs/files.js');
+var files = require('../fs/files');
 var _ = require('underscore');
 import utils from '../utils/utils.js';
 
@@ -18,30 +18,30 @@ exports.SourceProcessor = function (options) {
   self.id = `${ options.isopack.displayName() }#${ nextId++ }`;
   self.userPlugin = null;
 };
-_.extend(exports.SourceProcessor.prototype, {
+Object.assign(exports.SourceProcessor.prototype, {
   // Call the user's factory function to get the actual build plugin object.
   // Note that we're supposed to have one userPlugin per project, so this
   // assumes that each Isopack object is specific to a project.  We don't run
   // this immediately on evaluating Plugin.registerCompiler; we instead wait
   // until the whole plugin file has been evaluated (so that it can use things
   // defined later in the file).
-  instantiatePlugin: function () {
+  instantiatePlugin: async function () {
     var self = this;
     buildmessage.assertInCapture();
     if (self.userPlugin) {
       throw Error("Called instantiatePlugin twice?");
     }
-    buildmessage.enterJob(
+    await buildmessage.enterJob(
       `running ${self.methodName} callback in package ` +
         self.isopack.displayName(),
-      () => {
+      async () => {
         try {
-          self.userPlugin = buildmessage.markBoundary(self.factoryFunction)
-            .call(null);
+          const markedFactoryFunction = buildmessage.markBoundary(self.factoryFunction);
+          self.userPlugin = await markedFactoryFunction.call(null);
           // If we have a disk cache directory and the plugin wants it, use it.
           if (self.isopack.pluginCacheDir &&
               self.userPlugin.setDiskCacheDirectory) {
-            buildmessage.markBoundary(function () {
+            await buildmessage.markBoundary(function () {
               self.userPlugin.setDiskCacheDirectory(
                 files.convertToOSPath(self.isopack.pluginCacheDir)
               );
@@ -208,6 +208,10 @@ export class SourceProcessorSet {
       });
     }
 
+    if (filename === ".meteorignore") {
+      return new SourceClassification("meteor-ignore");
+    }
+
     // Now check to see if a plugin registered for an extension. We prefer
     // longer extensions.
     const parts = filename.split('.');
@@ -254,6 +258,10 @@ export class SourceProcessorSet {
   isEmpty() {
     return _.isEmpty(this._byFilename) && _.isEmpty(this._byExtension) &&
       _.isEmpty(this._legacyHandlers);
+  }
+
+  isConflictsAllowed() {
+    return this._allowConflicts;
   }
 
   // Returns an options object suitable for passing to
@@ -303,8 +311,14 @@ class SourceClassification {
     legacyIsTemplate,
     arch,
   } = {}) {
-    const knownTypes = ['extension', 'filename', 'legacy-handler', 'wrong-arch',
-                        'unmatched'];
+    const knownTypes = [
+      'extension',
+      'filename',
+      'legacy-handler',
+      'wrong-arch',
+      'unmatched',
+      'meteor-ignore',
+    ];
     if (knownTypes.indexOf(type) === -1) {
       throw Error(`Unknown SourceClassification type ${ type }`);
     }

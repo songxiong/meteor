@@ -1,16 +1,17 @@
 var main = require('./main.js');
 var _ = require('underscore');
-var files = require('../fs/files.js');
+var files = require('../fs/files');
 var buildmessage = require('../utils/buildmessage.js');
 var auth = require('../meteor-services/auth.js');
 var config = require('../meteor-services/config.js');
 var utils = require('../utils/utils.js');
 var httpHelpers = require('../utils/http-helpers.js');
 var compiler = require('../isobuild/compiler.js');
+var PackageSource = require('../isobuild/package-source.js');
+var archinfo = require('../utils/archinfo');
 var catalog = require('../packaging/catalog/catalog.js');
 var catalogRemote = require('../packaging/catalog/catalog-remote.js');
 var isopack = require('../isobuild/isopack.js');
-var updater = require('../packaging/updater.js');
 var Console = require('../console/console.js').Console;
 var projectContextModule = require('../project-context.js');
 var colonConverter = require('../utils/colon-converter.js');
@@ -22,9 +23,28 @@ var updater = require('../packaging/updater.js');
 var packageMapModule = require('../packaging/package-map.js');
 var packageClient = require('../packaging/package-client.js');
 var tropohouse = require('../packaging/tropohouse.js');
+var {
+  TYPES_BUILD_DIR,
+  usePrebuiltTypeScriptDeclarations
+} = require('../packaging/typescript-declarations.js');
 
-import * as cordova from '../cordova';
+import {
+  ensureDevBundleDependencies,
+  newPluginId,
+  splitPluginsAndPackages,
+} from '../cordova/index.js';
 import { updateMeteorToolSymlink } from "../packaging/updater.js";
+import { execFileAsync } from '../utils/processes';
+import { isTypeScriptSourceEntry } from '../isobuild/types-generator';
+
+const {
+  isGitSourceLike,
+  parseGitUrl,
+  cloneRepo,
+  cloneSubdirectory,
+  validatePackageJs
+} = require('./git-clone.js');
+const inquirer = require('inquirer');
 
 // For each release (or package), we store a meta-record with its name,
 // maintainers, etc. This function takes in a name, figures out if
@@ -33,12 +53,12 @@ import { updateMeteorToolSymlink } from "../packaging/updater.js";
 // Specifically, it returns an object with the following keys:
 //  - record : (a package or version record)
 //  - isRelease : true if it is a release instead of a package.
-var getReleaseOrPackageRecord = function(name) {
-  var rec = catalog.official.getPackage(name);
+var getReleaseOrPackageRecord = async function(name) {
+  var rec = await catalog.official.getPackage(name);
   var rel = false;
   if (!rec) {
     // Not a package! But is it a release track?
-    rec = catalog.official.getReleaseTrack(name);
+    rec = await catalog.official.getReleaseTrack(name);
     if (rec) {
       rel = true;
     }
@@ -48,8 +68,9 @@ var getReleaseOrPackageRecord = function(name) {
 
 // Seriously, this dies if it can't refresh. Only call it if you're sure you're
 // OK that the command doesn't work while offline.
-var refreshOfficialCatalogOrDie = function (options) {
-  if (!catalog.refreshOrWarn(options)) {
+var refreshOfficialCatalogOrDie = async function (options) {
+  const isUpToDate = await catalog.refreshOrWarn(options);
+  if (!isUpToDate) {
     Console.error(
       "This command requires an up-to-date package catalog. Exiting.");
     throw new main.ExitWithCode(1);
@@ -90,7 +111,8 @@ main.registerCommand({
   options: {
     'allow-incompatible-update': { type: Boolean }
   }
-}, function (options) {
+}, async function (options) {
+
   // If we're in an app, make sure that we can build the current app. Otherwise
   // just make sure that we can build some fake app.
   var projectContext = new projectContextModule.ProjectContext({
@@ -99,8 +121,8 @@ main.registerCommand({
     neverWritePackageMap: true,
     allowIncompatibleUpdate: options['allow-incompatible-update']
   });
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.initializeCatalog();
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    await projectContext.initializeCatalog();
   });
 
   // Add every local package (including tests) and every release package to this
@@ -114,12 +136,12 @@ main.registerCommand({
   };
   addPackages(projectContext.localCatalog.getAllPackageNames());
   if (release.current.isProperRelease()) {
-    addPackages(_.keys(release.current.getPackages()));
+    addPackages(Object.keys(release.current.getPackages()));
   }
 
   // Now finish building and downloading.
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.prepareProjectForBuild();
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    await projectContext.prepareProjectForBuild();
   });
   // We don't display package changes because they'd include all these packages
   // not actually in the app!
@@ -139,14 +161,16 @@ main.registerCommand({
   options: {
     'allow-incompatible-update': { type: Boolean }
   }
-}, function (options) {
+}, async function (options) {
   var projectContext = new projectContextModule.ProjectContext({
     projectDir: options.appDir,
     allowIncompatibleUpdate: options['allow-incompatible-update']
   });
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.prepareProjectForBuild();
+
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    await projectContext.prepareProjectForBuild();
   });
+
   projectContext.packageMapDelta.displayOnConsole();
 });
 
@@ -161,13 +185,13 @@ main.registerCommand({
 //
 // Takes in a packageSource and a connection to the package server. Returns 0 on
 // success and an exit code on failure.
-var updatePackageMetadata = function (packageSource, conn) {
+var updatePackageMetadata = async function (packageSource, conn) {
     var name = packageSource.name;
     var version = packageSource.version;
 
     // You can't change the metadata of a record that doesn't exist.
     var existingRecord =
-          catalog.official.getVersion(name, version);
+          await catalog.official.getVersion(name, version);
     if (! existingRecord) {
       Console.error(
         "You can't call",  Console.command("`meteor publish --update`"),
@@ -178,7 +202,7 @@ var updatePackageMetadata = function (packageSource, conn) {
 
     // Load in the user's documentation, and check that it isn't blank.
     var readmeInfo;
-    main.captureAndExit(
+    await main.captureAndExit(
       "=> Errors while publishing:", "reading documentation",
       function () {
        readmeInfo = packageSource.processReadme();
@@ -194,11 +218,11 @@ var updatePackageMetadata = function (packageSource, conn) {
     };
 
     // Finally, call to the server.
-    main.captureAndExit(
+    await main.captureAndExit(
       "=> Errors while publishing:",
       "updating package metadata",
-      function () {
-        packageClient.updatePackageMetadata({
+      async function () {
+        await packageClient.updatePackageMetadata({
           packageSource: packageSource,
           readmeInfo: readmeInfo,
           connection: conn
@@ -211,9 +235,132 @@ var updatePackageMetadata = function (packageSource, conn) {
       "outside the current project directory.");
 
     // Refresh, so that we actually learn about the thing we just published.
-    refreshOfficialCatalogOrDie();
+    await refreshOfficialCatalogOrDie();
     return 0;
-}
+};
+
+// For a TypeScript-authored package (api.types('index.ts')), run tsc in the
+// package directory to emit declaration files under .types-build/, then
+// rewrite the PackageSource IN PLACE to the directory form of api.types():
+// typesDir = '.types-build' with typesEntry/typesModules pointed at the
+// generated .d.ts files.  The build that follows reads the very same
+// PackageSource instance (the local catalog caches it, and the compiler
+// fetches it through the package map), so the published isopack carries
+// plain directory-mode metadata — consumers never see the .ts entry.
+//
+// tsc resolution order: the package's own node_modules/typescript wins, so
+// authors can pin their compiler; otherwise the TypeScript bundled with
+// Meteor's dev bundle is used — no typescript dependency is required at
+// all.  Either way the compiler runs as lib/tsc.js executed with Meteor's
+// own node, never through the extensionless node_modules/.bin/tsc shim
+// (a POSIX shell script that Windows could only run via cmd.exe PATHEXT
+// resolution).  A tsconfig.json in the package directory is respected
+// (-p ./); without one, tsc compiles the entry file and the typesModules
+// files with its defaults.
+//
+// Returns 0 on success; on failure prints tsc's output and returns 1.
+var generateTypeScriptDeclarations = async function (packageSource, packageDir) {
+  // Normalize a leading './' the same way _addFiles would have: the
+  // rewritten paths must match the relPaths that the compile-time
+  // directory expansion produces.
+  var entry = packageSource.typesEntry.replace(/^\.\//, '');
+
+  if (! files.exists(files.pathJoin(packageDir, entry))) {
+    Console.error(
+      "api.types(): entry file '" + entry + "' does not exist in the " +
+      "package directory.");
+    return 1;
+  }
+
+  var command = files.convertToOSPath(
+    files.pathJoin(files.getCurrentNodeBinDir(), 'node'));
+  var localTscJs = files.pathJoin(
+    packageDir, 'node_modules', 'typescript', 'lib', 'tsc.js');
+  var args = [files.convertToOSPath(
+    files.exists(localTscJs)
+      ? localTscJs
+      : files.pathJoin(
+          files.getDevBundle(),
+          'lib', 'node_modules', 'typescript', 'lib', 'tsc.js'))];
+
+  // Start from a clean output directory so declarations of files deleted
+  // since a previous publish attempt cannot leak into this one.
+  await files.rm_recursive(files.pathJoin(packageDir, TYPES_BUILD_DIR));
+
+  args.push(
+    '--declaration',
+    '--emitDeclarationOnly',
+    '--noEmit', 'false',
+    '--declarationDir', TYPES_BUILD_DIR,
+    // Pin TypeScript's incremental state inside the directory that was
+    // just cleared: with "incremental"/"composite" in the author's
+    // tsconfig, a stale tsconfig.tsbuildinfo at the package root would
+    // otherwise make tsc skip re-emitting declarations it believes are
+    // current — silently publishing a partial (or empty) .types-build.
+    // Inert when the author uses no incremental compilation.
+    '--tsBuildInfoFile', TYPES_BUILD_DIR + '/.tsbuildinfo',
+    '--rootDir', './'
+  );
+  if (files.exists(files.pathJoin(packageDir, 'tsconfig.json'))) {
+    // Respect the author's compiler configuration.
+    args.push('-p', './');
+  } else {
+    // Without a tsconfig, tsc compiles only the files it is given (plus
+    // their import closure).  Sub-path module files are by design not
+    // imported by the entry, so they must be passed explicitly or their
+    // declarations would never be emitted.
+    args.push(entry);
+    _.each(packageSource.typesModules || {}, function (modulePath) {
+      args.push(modulePath.replace(/^\.\//, ''));
+    });
+  }
+
+  try {
+    // waitForClose so tsc's stdout/stderr are fully drained before the
+    // diagnostics below are captured — settling on 'exit' can truncate a
+    // large compile-error dump.
+    await execFileAsync(command, args, {
+      cwd: packageDir,
+      waitForClose: true,
+      quoteArgsOnWindows: true
+    });
+  } catch (err) {
+    Console.error(
+      'tsc failed to generate type declarations for ' +
+      packageSource.name + ':');
+    // tsc reports compile errors on stdout; spawn-level problems land on
+    // stderr.  Surface both verbatim.
+    if (err.stdout) {
+      Console.rawError(err.stdout + '\n');
+    }
+    if (err.stderr) {
+      Console.rawError(err.stderr + '\n');
+    }
+    return 1;
+  }
+
+  // Verify that every declaration the rewrite will point at was actually
+  // emitted — e.g. an author tsconfig whose include/files misses a module
+  // file would otherwise publish metadata pointing at nonexistent
+  // declarations, and consumers would silently lose those types.
+  var prebuiltResult = usePrebuiltTypeScriptDeclarations(
+    packageSource, packageDir);
+  if (! prebuiltResult.ok) {
+    var missing = prebuiltResult.missing.map(function (item) {
+      return item.label + " ('" + item.sourcePath + "' -> '" +
+        item.declarationPath + "')";
+    });
+    Console.error(
+      'api.types(): tsc did not emit declarations for: ' +
+      missing.join(', ') + '. If the package has a tsconfig.json, make ' +
+      'sure its "include"/"files" covers these files.');
+    return 1;
+  }
+
+  Console.info(
+    '[types] Generated declarations for ' + packageSource.name + ' with tsc');
+  return 0;
+};
 
 main.registerCommand({
   name: 'publish',
@@ -238,7 +385,7 @@ main.registerCommand({
   // obviously incorrect submissions before they ever hit the wire.
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false }),
   'allow-incompatible-update': { type: Boolean }
-}, function (options) {
+}, async function (options) {
   if (options.create && options['existing-version']) {
     // Make up your mind!
     Console.error(
@@ -295,16 +442,17 @@ main.registerCommand({
     });
   }
 
-  main.captureAndExit("=> Errors while initializing project:", function () {
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
     // Just get up to initializing the catalog. We're going to mutate the
     // constraints file a bit before we prepare the build.
-    projectContext.initializeCatalog();
+    await projectContext.initializeCatalog();
   });
 
+  let conn;
   if (!process.env.METEOR_TEST_NO_PUBLISH) {
     // Connect to the package server and log in.
     try {
-      var conn = packageClient.loggedInPackagesConnection();
+      conn = await packageClient.loggedInPackagesConnection();
     } catch (err) {
       packageClient.handlePackageServerConnectionError(err);
       return 1;
@@ -347,13 +495,13 @@ main.registerCommand({
   // need. Don't bother building the package, just update the metadata and
   // return the result.
   if (options.update) {
-    return updatePackageMetadata(packageSource, conn);
+    return await updatePackageMetadata(packageSource, conn);
   }
 
   // Fail early if the package record exists, but we don't think that it does
   // and are passing in the --create flag!
   if (options.create) {
-    var packageInfo = catalog.official.getPackage(packageName);
+    var packageInfo = await catalog.official.getPackage(packageName);
     if (packageInfo) {
       Console.error(
         "Package already exists. To create a new version of an existing "+
@@ -380,6 +528,30 @@ main.registerCommand({
     }
   }
 
+  // TypeScript-authored package: api.types() was called with a .ts/.tsx
+  // source entry.  Generate real .d.ts declarations with tsc now — after
+  // the cheap validation above, before the build below — and rewrite the
+  // PackageSource to the directory form (typesDir = '.types-build'), which
+  // the compile-time expansion in PackageSource.getFiles picks up.  The
+  // published isopack is therefore a plain directory-mode types package.
+  if (isTypeScriptSourceEntry(packageSource.typesEntry) &&
+      ! packageSource.typesDir) {
+    var typesExit = await generateTypeScriptDeclarations(
+      packageSource, options.packageDir);
+    if (typesExit !== 0) {
+      return typesExit;
+    }
+    // The rewrite above only mutates the in-memory PackageSource, and the
+    // isopack cached in .meteor/local/isopacks may have been built from
+    // the pre-rewrite (ts-src) source by a prior `meteor run`.  Nothing in
+    // isopack-buildinfo.json reflects the rewrite — the .types-build
+    // dot-directory is excluded from every watched directory listing — so
+    // the up-to-date check would happily republish the stale ts-src
+    // isopack.  Force a recompile of this package so the build below
+    // always stamps the rewritten directory-mode metadata.
+    projectContext.forceRebuildPackage(packageName);
+  }
+
   // Make sure that both the package and its test (if any) are actually built.
   _.each([packageName, packageSource.testName], function (name) {
     if (! name) {
@@ -396,14 +568,14 @@ main.registerCommand({
   });
 
   // Now resolve constraints and build packages.
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.prepareProjectForBuild();
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    await projectContext.prepareProjectForBuild();
   });
   // We don't display the package map delta here, because it includes adding the
   // package's test and all the test's dependencies.
 
   if (!options['no-lint']) {
-    const warnings = projectContext.getLintingMessagesForLocalPackages();
+    const warnings = await projectContext.getLintingMessagesForLocalPackages();
     if (warnings && warnings.hasMessages()) {
       Console.arrowError(
         "Errors linting your package; run with --no-lint to ignore.");
@@ -432,11 +604,11 @@ main.registerCommand({
 
   // We have initialized everything, so perform the publish operation.
   var binary = isopack.platformSpecific();
-  main.captureAndExit(
-    "=> Errors while publishing:",
+  await main.captureAndExit(
+    "=> Errors while publishing:" + packageSource.name,
     "publishing the package",
-    function () {
-      packageClient.publishPackage({
+    async function () {
+      await packageClient.publishPackage({
         projectContext: projectContext,
         packageSource: packageSource,
         connection: conn,
@@ -451,7 +623,7 @@ main.registerCommand({
 
   // We are only publishing one package, so we should close the connection, and
   // then exit with the previous error code.
-  conn.close();
+  await conn.close();
 
   // Warn the user if their package is not good for all architectures.
   if (binary && options['existing-version']) {
@@ -463,42 +635,25 @@ main.registerCommand({
   } else if (binary) {
     // Normal publish flow. Tell the user nicely.
     Console.warn();
-    Console.warn(
-      "You're not done publishing yet! This package contains binary code and",
-      "must be built on all of Meteor's architectures, including this",
-      "machine's architecture.");
+    Console.warn("This package contains binary code which must be",
+      "compiled on the architecture it will eventually run on.");
     Console.warn();
     Console.info(
-      "You can access Meteor provided build machines, pre-configured to",
-      "support older versions of MacOS and Linux, by running:");
-    _.each(["os.osx.x86_64", "os.linux.x86_64",
-            "os.linux.x86_32", "os.windows.x86_32"],
-      function (a) {
-        Console.info(
-          Console.command("meteor admin get-machine " + a),
-          Console.options({ indent: 2 }));
-    });
-
+      "Meteor 1.4 and higher will automatically compile packages",
+      "with binary dependencies when they are installed, assuming",
+      "the target machine has a basic compiler toolchain.");
     Console.info();
-    Console.info("On each machine, run:");
-    Console.info();
+    Console.info("To see the requirements for this compilation step,",
+      "consult the platform requirements for 'node-gyp':");
     Console.info(
-      Console.command(
-        "meteor publish-for-arch " +
-        packageSource.name + "@" + packageSource.version),
-      Console.options({ indent: 2 }));
-    Console.info();
-    Console.info(
-      "For more information on binary ABIs and consistent builds, see:");
-    Console.info(
-      Console.url("https://github.com/meteor/meteor/wiki/Build-Machines"),
+      Console.url("https://github.com/nodejs/node-gyp"),
       Console.options({ indent: 2 })
     );
     Console.info();
   }
 
   // Refresh, so that we actually learn about the thing we just published.
-  refreshOfficialCatalogOrDie();
+  await refreshOfficialCatalogOrDie();
 
   return 0;
 });
@@ -513,7 +668,7 @@ main.registerCommand({
   // publish-for-arch you want to reproduce the exact same setup as when
   // you ran 'publish', but support the option in case it comes up.
   'allow-incompatible-update': { type: Boolean }
-}, function (options) {
+}, async function (options) {
   // argument processing
   var all = options.args[0].split('@');
   if (all.length !== 2) {
@@ -524,7 +679,7 @@ main.registerCommand({
   var name = all[0];
   var versionString = all[1];
 
-  var packageInfo = catalog.official.getPackage(name);
+  var packageInfo = await catalog.official.getPackage(name);
   if (! packageInfo) {
     Console.error(
       "You can't call " + Console.command("`meteor publish-for-arch`") +
@@ -539,7 +694,7 @@ main.registerCommand({
     return 1;
   }
 
-  var pkgVersion = catalog.official.getVersion(name, versionString);
+  var pkgVersion = await catalog.official.getVersion(name, versionString);
   if (! pkgVersion) {
     Console.error(
       "You can't call",  Console.command("`meteor publish-for-arch`"),
@@ -602,8 +757,8 @@ main.registerCommand({
   // or we're running from the same release as the published package.
 
   // Download the source to the package.
-  var sourceTarball = buildmessage.enterJob("downloading package source", function () {
-    return httpHelpers.getUrlWithResuming({
+  var sourceTarball = await buildmessage.enterJob("downloading package source", async function () {
+    return await httpHelpers.getUrlWithResuming({
       url: pkgVersion.source.url,
       encoding: null
     });
@@ -614,9 +769,9 @@ main.registerCommand({
   }
 
   var sourcePath = files.mkdtemp('package-source');
-  buildmessage.enterJob("extracting package source", () => {
+  await buildmessage.enterJob("extracting package source", async () => {
     // XXX check tarballHash!
-    files.extractTarGz(sourceTarball, sourcePath);
+    await files.extractTarGz(sourceTarball, sourcePath);
   });
 
   // XXX Factor out with packageClient.bundleSource so that we don't
@@ -652,13 +807,43 @@ main.registerCommand({
   });
   // Just get up to initializing the catalog. We're going to mutate the
   // constraints file a bit before we prepare the build.
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.initializeCatalog();
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    await projectContext.initializeCatalog();
   });
   projectContext.projectConstraintsFile.addConstraints(
     [utils.parsePackageConstraint(name + "@=" + versionString)]);
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.prepareProjectForBuild();
+
+  // The source tarball's package.js still says api.types('index.ts'), but the
+  // initial publish includes its already-generated .types-build declarations.
+  // Reuse those exact files rather than running tsc again with a potentially
+  // different source/configuration closure on this architecture builder.
+  var archPackageSource = projectContext.localCatalog.getPackageSource(name);
+  if (archPackageSource &&
+      isTypeScriptSourceEntry(archPackageSource.typesEntry) &&
+      ! archPackageSource.typesDir) {
+    var prebuiltResult = usePrebuiltTypeScriptDeclarations(
+      archPackageSource, packageDir);
+    if (! prebuiltResult.ok) {
+      var missing = prebuiltResult.missing.map(function (item) {
+        return item.label + " ('" + item.sourcePath + "' -> '" +
+          item.declarationPath + "')";
+      });
+      Console.error(
+        'api.types(): source bundle is missing declarations generated by ' +
+        'the original publish: ' + missing.join(', ') + '. ' +
+        'publish-for-arch will not regenerate them with a different ' +
+        'TypeScript configuration. Republish the package source with a ' +
+        'Meteor release that includes prebuilt declarations.');
+      return 1;
+    }
+    Console.info(
+      '[types] Reusing declarations generated by the original publish for ' +
+      name);
+    projectContext.forceRebuildPackage(name);
+  }
+
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    await projectContext.prepareProjectForBuild();
   });
   projectContext.packageMapDelta.displayOnConsole({
     title: "Some package versions changed since this package was published!"
@@ -671,25 +856,25 @@ main.registerCommand({
 
   var conn;
   try {
-    conn = packageClient.loggedInPackagesConnection();
+    conn = await packageClient.loggedInPackagesConnection();
   } catch (err) {
     packageClient.handlePackageServerConnectionError(err);
     return 1;
   }
 
-  main.captureAndExit(
+  await main.captureAndExit(
     "=> Errors while publishing build:",
     ("publishing package " + name + " for architecture "
      + isopk.buildArchitectures()),
-    function () {
-      packageClient.createAndPublishBuiltPackage(
+    async function () {
+      await packageClient.createAndPublishBuiltPackage(
         conn, isopk, projectContext.isopackCache);
     }
   );
 
   Console.info('Published ' + name + '@' + versionString + '.');
 
-  refreshOfficialCatalogOrDie();
+  await refreshOfficialCatalogOrDie();
   return 0;
 });
 
@@ -699,14 +884,28 @@ main.registerCommand({
   maxArgs: 1,
   options: {
     'create-track': { type: Boolean },
-    'from-checkout': { type: Boolean }
+    'from-checkout': { type: Boolean },
+    // It is going to produce a fake error and nothing will be published
+    'dry-run': { type: Boolean },
+    // Normally the publish-release script will complain if the source of
+    // a core package differs in any way from what was previously
+    // published for the current version of the package. However, if the
+    // package was deliberately republished independently from a Meteor
+    // release, and those changes have not yet been merged to the master
+    // branch, then the complaint may be spurious. If you have verified
+    // that current release contains no meaningful changes (since the
+    // previous official release) to the packages that are being
+    // complained about, then you can pass the --skip-tree-hashing flag to
+    // disable the treeHash check.
+    'skip-tree-hashing': { type: Boolean },
   },
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
-}, function (options) {
+}, async function (options) {
+  let conn
   try {
-    var conn = packageClient.loggedInPackagesConnection();
+    conn = await packageClient.loggedInPackagesConnection();
   } catch (err) {
-    packageClient.handlePackageServerConnectionError(err);
+    await packageClient.handlePackageServerConnectionError(err);
     return 1;
   }
 
@@ -724,7 +923,7 @@ main.registerCommand({
   }
 
   // Fill in the order key and any other generated release.json fields.
-  main.captureAndExit(
+  await main.captureAndExit(
     "=> Errors in release schema:",
     "double-checking release schema",
     function () {
@@ -794,7 +993,7 @@ main.registerCommand({
   // authorized to publish before we do any complicated/long operations, and
   // before we publish its packages.
   if (! options['create-track']) {
-    var trackRecord = catalog.official.getReleaseTrack(relConf.track);
+    var trackRecord = await catalog.official.getReleaseTrack(relConf.track);
     if (!trackRecord) {
       Console.error(
         'There is no release track named ' + relConf.track +
@@ -804,7 +1003,7 @@ main.registerCommand({
 
     // Check with the server to see if we're organized (we can't due this
     // locally due to organizations).
-    if (!packageClient.amIAuthorized(relConf.track,conn,  true)) {
+    if (!await packageClient.amIAuthorized(relConf.track, conn, true)) {
       Console.error('You are not an authorized maintainer of ' +
                     relConf.track + ".");
       Console.error('Only authorized maintainers may publish new versions.');
@@ -822,8 +1021,8 @@ main.registerCommand({
   // version number, this will use buildmessage to error and exit.)
   //
   // Without any modifications about forks and package names, this particular
-  // option is not very useful outside of MDG. Right now, to run this option on
-  // a non-MDG fork of meteor, someone would probably need to go through and
+  // option is not very useful outside of Meteor Software. Right now, to run this option on
+  // a non-Meteor Software fork of meteor, someone would probably need to go through and
   // change the package names to have proper prefixes, etc.
   if (options['from-checkout']) {
     // You must be running from checkout to bundle up your checkout as a release.
@@ -854,15 +1053,17 @@ main.registerCommand({
       // though this temporary directory does not have any cordova platforms
       forceIncludeCordovaUnibuild: true
     });
-
     // Read metadata and initialize catalog.
-    main.captureAndExit("=> Errors while building for release:", function () {
-      projectContext.initializeCatalog();
+    await main.captureAndExit("=> Errors while building for release:", async function () {
+      await projectContext.initializeCatalog();
     });
 
     // Ensure that all packages and their tests are built. (We need to build
     // tests so that we can include their sources in source tarballs.)
     var allPackagesWithTests = projectContext.localCatalog.getAllPackageNames();
+    /**
+     * @type {Array<string>}
+     */
     var allPackages = projectContext.localCatalog.getAllNonTestPackageNames({
       includeNonCore: false,
     });
@@ -873,8 +1074,8 @@ main.registerCommand({
     );
 
     // Build!
-    main.captureAndExit("=> Errors while building for release:", function () {
-      projectContext.prepareProjectForBuild();
+    await main.captureAndExit("=> Errors while building for release:", async function () {
+      await projectContext.prepareProjectForBuild();
     });
     // No need to display the PackageMapDelta here, since it would include all
     // of the packages!
@@ -882,9 +1083,17 @@ main.registerCommand({
     relConf.packages = {};
     var toPublish = [];
 
-    main.captureAndExit("=> Errors in release packages:", function () {
-      _.each(allPackages, function (packageName) {
-        buildmessage.enterJob("checking consistency of " + packageName, function () {
+    await main.captureAndExit("=> Errors in release packages:", async function () {
+      const publishList = [];
+      for (const name of allPackages) {
+        if (name === "meteor-tool") { // to be sure that is the last so things do not break
+          continue;
+        }
+        publishList.push(name)
+      }
+      publishList.push("meteor-tool");
+      for (const packageName of publishList) {
+        await buildmessage.enterJob("checking consistency of " + packageName, async function () {
           var packageSource = projectContext.localCatalog.getPackageSource(
             packageName);
           if (! packageSource) {
@@ -901,7 +1110,7 @@ main.registerCommand({
           // Let's get the server version that this local package is
           // overwriting. If such a version exists, we will need to make sure
           // that the contents are the same.
-          var oldVersionRecord = catalog.official.getVersion(
+          var oldVersionRecord = await catalog.official.getVersion(
             packageName, packageSource.version);
 
           // Include this package in our release.
@@ -925,7 +1134,7 @@ main.registerCommand({
               return;
             }
             toPublish.push(packageName);
-            Console.info("Will publish new version for " + packageName);
+            Console.info(`Will publish new version for ${ packageName }: ${ packageSource.version }`);
             return;
           } else {
             var isopk = projectContext.isopackCache.getIsopack(packageName);
@@ -933,9 +1142,22 @@ main.registerCommand({
               throw Error("no isopack for " + packageName);
             }
 
-            var existingBuild =
-                  catalog.official.getBuildWithPreciseBuildArchitectures(
-                    oldVersionRecord, isopk.buildArchitectures());
+            const existingBuild =
+              // First try with the non-simplified build architecture
+              // list, which is likely to be something like
+              // os+web.browser+web.browser.legacy+web.cordova:
+              await catalog.official.getBuildWithPreciseBuildArchitectures(
+                oldVersionRecord,
+                isopk.buildArchitectures(),
+              ) ||
+              // If that fails, fall back to the simplified architecture
+              // list (e.g. os+web.browser+web.cordova), to match packages
+              // published before the web.browser.legacy architecture was
+              // introduced (in Meteor 1.7).
+              await catalog.official.getBuildWithPreciseBuildArchitectures(
+                oldVersionRecord,
+                isopk.buildArchitectures(true),
+              );
 
             var somethingChanged;
 
@@ -947,9 +1169,13 @@ main.registerCommand({
               // haven't bumped the version number yet; either way,
               // you should probably bump the version number.
               somethingChanged = true;
-            } else {
+            } else if (! options["skip-tree-hashing"] ||
+                       // Always check the treeHash of the meteor-tool
+                       // package, since it must have been modified if a
+                       // new release is being published.
+                       packageName === "meteor-tool") {
               // Save the isopack, just to get its hash.
-              var bundleBuildResult = packageClient.bundleBuild(
+              var bundleBuildResult = await packageClient.bundleBuild(
                 isopk,
                 projectContext.isopackCache,
               );
@@ -958,24 +1184,33 @@ main.registerCommand({
                 (bundleBuildResult.treeHash !== existingBuild.build.treeHash);
             }
 
-            if (somethingChanged) {
-              buildmessage.error(
-                "Something changed in package " + packageName + "@" +
-                  isopk.version + ". Please upgrade its version number.");
-            }
+            // if (somethingChanged) {
+            //   buildmessage.error(
+            //     "Something changed in package " + packageName + "@" +
+            //       isopk.version + ". Please upgrade its version number.");
+            // }
           }
         });
-      });
+      }
     });
+
+    if (options['dry-run']) {
+      await main.captureAndExit("=> Dry run", function () {
+          buildmessage.error(
+            "This is not an error but it was just a validation" +
+            " and nothing was published. Remove --dry-run to publish.");
+        }
+      )
+    }
 
     // We now have an object of packages that have new versions on disk that
     // don't exist in the server catalog. Publish them.
     var unfinishedBuilds = {};
-    _.each(toPublish, function (packageName) {
-      main.captureAndExit(
+    for (const packageName of toPublish) {
+      await main.captureAndExit(
         "=> Errors while publishing:",
         "publishing package " + packageName,
-        function () {
+        async function () {
           var isopk = projectContext.isopackCache.getIsopack(packageName);
           if (! isopk) {
             throw Error("no isopack for " + packageName);
@@ -987,17 +1222,16 @@ main.registerCommand({
           }
 
           var binary = isopk.platformSpecific();
-          packageClient.publishPackage({
+          await packageClient.publishPackage({
             projectContext: projectContext,
             packageSource: packageSource,
             connection: conn,
-            new: ! catalog.official.getPackage(packageName),
+            new: ! await catalog.official.getPackage(packageName),
             doNotPublishBuild: binary
           });
           if (buildmessage.jobHasMessages()) {
             return;
           }
-
           Console.info(
             'Published ' + packageName + '@' + packageSource.version + '.');
 
@@ -1005,7 +1239,7 @@ main.registerCommand({
             unfinishedBuilds[packageName] = packageSource.version;
           }
         });
-    });
+    }
 
     // Set the remaining release information. For now, when we publish from
     // checkout, we always set 'meteor-tool' as the tool. We don't include the
@@ -1014,24 +1248,24 @@ main.registerCommand({
     delete relConf.packages["meteor-tool"];
   }
 
-  main.captureAndExit(
+  await main.captureAndExit(
     "=> Errors while publishing release:",
     "publishing release",
-    function () {
+    async function () {
       // Create the new track, if we have been told to.
       if (options['create-track']) {
         // XXX maybe this job title should be left on the screen too?  some sort
         // of enterJob/progress option that lets you do that?
-        buildmessage.enterJob("creating a new release track", function () {
-          packageClient.callPackageServerBM(
-            conn, 'createReleaseTrack', { name: relConf.track } );
+        await buildmessage.enterJob("creating a new release track", async function () {
+          await packageClient.callPackageServerBM(
+            conn, 'createReleaseTrack', { name: relConf.track });
         });
         if (buildmessage.jobHasMessages()) {
           return;
         }
       }
 
-      buildmessage.enterJob("creating a new release version", function () {
+      await buildmessage.enterJob("creating a new release version", async function () {
         var record = {
           track: relConf.track,
           version: relConf.version,
@@ -1043,10 +1277,10 @@ main.registerCommand({
         };
 
         if (relConf.patchFrom) {
-          packageClient.callPackageServerBM(
+          await packageClient.callPackageServerBM(
             conn, 'createPatchReleaseVersion', record, relConf.patchFrom);
         } else {
-          packageClient.callPackageServerBM(
+          await packageClient.callPackageServerBM(
             conn, 'createReleaseVersion', record);
         }
       });
@@ -1054,7 +1288,7 @@ main.registerCommand({
   );
 
   // Learn about it.
-  refreshOfficialCatalogOrDie();
+  await refreshOfficialCatalogOrDie();
   Console.info("Done creating " + relConf.track  + "@" + relConf.version + "!");
   Console.info();
 
@@ -1071,13 +1305,13 @@ main.registerCommand({
       Console.info("Skipping git tag: bad format for git.");
     } else {
       Console.info("Creating git tag " + gitTag);
-      utils.runGitInCheckout('tag', gitTag);
+      await utils.runGitInCheckout('tag', gitTag);
       var fail = false;
       try {
         Console.info(
-          "Pushing git tag (this should fail if you are not from MDG)");
-        utils.runGitInCheckout('push', 'git@github.com:meteor/meteor.git',
-                             'refs/tags/' + gitTag);
+          "Pushing git tag (this should fail if you are not from Meteor Software)");
+        await utils.runGitInCheckout('push', 'git@github.com:meteor/meteor.git',
+          'refs/tags/' + gitTag);
       } catch (err) {
         Console.error(
           "Failed to push git tag. Please push git tag manually!");
@@ -1121,20 +1355,205 @@ main.registerCommand({
   name: 'list',
   requiresApp: true,
   options: {
+    'tree': { type: Boolean },
+    'json': { type: Boolean },
+    'weak': { type: Boolean },
+    'details': { type: Boolean },
     'allow-incompatible-update': { type: Boolean }
   },
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: true })
-}, function (options) {
+}, async function (options) {
   var projectContext = new projectContextModule.ProjectContext({
     projectDir: options.appDir,
     allowIncompatibleUpdate: options['allow-incompatible-update']
   });
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.prepareProjectForBuild();
+
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    return await projectContext.prepareProjectForBuild();
   });
+
   // No need to display the PackageMapDelta here, since we're about to list all
   // of the packages anyway!
+  const showJson = !!options['json'];
+  const showTree = !!options['tree'];
 
+  const suffixes = {
+    topLevel: '(top level)',
+    expandedAbove: '(expanded above)',
+    weak: '[weak]',
+    skipped: 'package skipped',
+    missing: 'missing?'
+  };
+
+  if (showJson && showTree) {
+    throw new Error('can only run for one option,found --json and --tree');
+  }
+
+  if (showTree || showJson) {
+    const jsonOut = showJson && {};
+    const showWeak = !!options['weak'];
+    const showDetails = !!options['details'];
+    // Load package details of all used packages (inc. dependencies)
+    const packageDetails = new Map;
+    await projectContext.packageMap.eachPackage(async function (name, info) {
+      packageDetails.set(name, await projectContext.projectCatalog.getVersion(name, info.version));
+    });
+
+    // Build a set of top level package names
+    const topLevelSet = new Set;
+    projectContext.projectConstraintsFile.eachConstraint(function (constraint) {
+      topLevelSet.add(constraint.package);
+    });
+
+    // Package that should not be expanded (top level or expanded already)
+    const dontExpand = new Set(topLevelSet.values());
+
+    // Recursive function that outputs each package
+    const printPackage = async function ({ packageToPrint, isWeak, indent1, indent2, parent }) {
+      const packageName = packageToPrint.packageName;
+      const depsObj = packageToPrint.dependencies || {};
+      let deps = Object.keys(depsObj).sort();
+      // Ignore references to a meteor version or isobuild marker packages
+      deps = deps.filter(dep => {
+        return dep !== 'meteor' && !compiler.isIsobuildFeaturePackage(dep);
+      });
+
+      if (!showWeak) {
+        // Filter out any weakly referenced dependencies
+        deps = deps.filter(dep => {
+          let references = depsObj[dep].references || [];
+          let weakRef = references.length > 0 && references.every(r => r.weak);
+          return !weakRef;
+        });
+      }
+
+      const expandedAlready = (deps.length > 0 && dontExpand.has(packageName));
+      const shouldExpand = (deps.length > 0 && !expandedAlready && !isWeak);
+
+      // with normal tree display we send the current info to stdout
+      if (showTree) {
+        if (indent1 !== '') {
+          indent1 += (shouldExpand ? '┬' : '─') + ' ';
+        }
+
+        let suffix = (isWeak ? suffixes.weak : '');
+        if (expandedAlready) {
+          suffix += topLevelSet.has(packageName)
+            ? ` ${suffixes.topLevel}`
+            : ` ${suffixes.expandedAbove}`
+        }
+
+        Console.info(indent1 + packageName + '@' + packageToPrint.version + suffix);
+      }
+
+      // with json we add detailed info to the json object
+      if (showJson) {
+        if (expandedAlready) {
+          // on expanded packages we only want to add minimal information to
+          // keep the json file compact, so we make the value a stirng
+          if (topLevelSet.has(packageName)) {
+            parent[packageName] = `${packageToPrint.version}-${suffixes.topLevel}`
+          } else {
+            parent[packageName] = `${packageToPrint.version}-${suffixes.expandedAbove}`
+          }
+        } else {
+          // on non-expanded packages we want detailed information but we
+          // omit falsy values in order to keep the output minimal and readable
+          const entry = {};
+          parent[packageName] = entry;
+
+          const mapInfo = projectContext.packageMap.getInfo(packageName);
+          const isLocal = mapInfo && mapInfo.kind === 'local';
+
+          const infoSource = Object.assign({}, showDetails ? packageToPrint : {}, {
+            version: packageToPrint.version,
+            local: isLocal,
+            weak: isWeak,
+            newerVersion: !isLocal && await getNewerVersion(packageName, packageToPrint.version, catalog.official)
+          });
+
+          Object.entries(infoSource).forEach(([key, value]) => {
+            if (value) {
+              entry[key] = value;
+            }
+          });
+
+          if (shouldExpand) {
+            entry.dependencies = {};
+          }
+        }
+      }
+
+      if (shouldExpand) {
+        dontExpand.add(packageName);
+        let index = 0;
+        for (const dep of deps) {
+          const references = depsObj[dep].references || [];
+          const weakRef = references.length > 0 && references.every(r => r.weak);
+          const last = ((index + 1) === deps.length);
+          const child = packageDetails.get(dep);
+
+          // with normal tree display we increase indentation
+          if (showTree) {
+            const newIndent1 = indent2 + (last ? '└─' : '├─');
+            const newIndent2 = indent2 + (last ? '  ' : '│ ');
+            if (child) {
+              await printPackage({
+                packageToPrint: child,
+                isWeak: weakRef,
+                indent1: newIndent1,
+                indent2: newIndent2
+              });
+            } else if (weakRef) {
+              Console.info(`${newIndent1}─ ${dep} ${suffixes.weak} ${suffixes.skipped}`);
+            } else {
+              Console.info(`${newIndent1}─ ${dep} ${suffixes.missing}`);
+            }
+          }
+
+          if (showJson) {
+            if (child) {
+              await printPackage({
+                packageToPrint: child,
+                isWeak: weakRef,
+                parent: parent[packageName].dependencies
+              });
+            } else if (weakRef) {
+              parent[packageName].dependencies[dep] = `${suffixes.weak} ${suffixes.skipped}`;
+            } else {
+              parent[packageName].dependencies = suffixes.missing;
+            }
+          }
+          index++;
+        }
+      }
+    };
+
+    const topLevelNames = Array.from(topLevelSet.values()).sort();
+    for (const dep of topLevelNames) {
+      const topLevelPackage = packageDetails.get(dep);
+      if (topLevelPackage) {
+        // Force top level packages to be expanded
+        dontExpand.delete(topLevelPackage.packageName);
+        await printPackage({
+          packageToPrint: topLevelPackage,
+          isWeak: false,
+          indent1: '',
+          indent2: '',
+          parent: jsonOut
+        })
+      }
+    }
+
+    if (showJson) {
+      // we can't use Console here, because it pretty prints the output with
+      // a wrap at 80 chars per line, which causes the json to break if details
+      // options is active and the package descriptions exceed the limit
+      console.info(JSON.stringify(jsonOut));
+    }
+
+    return 0;
+  }
 
   var items = [];
   var newVersionsAvailable = false;
@@ -1142,7 +1561,7 @@ main.registerCommand({
 
   // Iterate over packages that are used directly by this app (not indirect
   // dependencies).
-  projectContext.projectConstraintsFile.eachConstraint(function (constraint) {
+  await projectContext.projectConstraintsFile.eachConstraintAsync(async function (constraint) {
     var packageName = constraint.package;
 
     // Skip isobuild:* pseudo-packages.
@@ -1154,7 +1573,7 @@ main.registerCommand({
     if (! mapInfo) {
       throw Error("no version for used package " + packageName);
     }
-    var versionRecord = projectContext.projectCatalog.getVersion(
+    var versionRecord = await projectContext.projectCatalog.getVersion(
       packageName, mapInfo.version);
     if (! versionRecord) {
       throw Error("no version record for " + packageName + "@" +
@@ -1166,7 +1585,7 @@ main.registerCommand({
       versionAddendum = "+";
       anyBuiltLocally = true;
     } else if (mapInfo.kind === 'versioned') {
-      if (getNewerVersion(packageName, mapInfo.version, catalog.official)) {
+      if (await getNewerVersion(packageName, mapInfo.version, catalog.official)) {
         versionAddendum = "*";
         newVersionsAvailable = true;
       }
@@ -1211,7 +1630,7 @@ main.registerCommand({
   return 0;
 });
 
-var getNewerVersion = function (packageName, curVersion, whichCatalog) {
+var getNewerVersion = async function (packageName, curVersion, whichCatalog) {
   // Check to see if there are later versions available, returning the
   // latest version if there are.
   //
@@ -1224,9 +1643,9 @@ var getNewerVersion = function (packageName, curVersion, whichCatalog) {
   // that we'll find something when we look in the catalog.
   var latest;
   if (/-/.test(curVersion)) {
-    latest = whichCatalog.getLatestVersion(packageName);
+    latest = await whichCatalog.getLatestVersion(packageName);
   } else {
-    latest = whichCatalog.getLatestMainlineVersion(packageName);
+    latest = await whichCatalog.getLatestMainlineVersion(packageName);
   }
   if (! latest) {
     // Shouldn't happen: we've chosen a published version of this package,
@@ -1254,7 +1673,7 @@ var getNewerVersion = function (packageName, curVersion, whichCatalog) {
 // decided not to with good reason. Returns something other than 0, if it is not
 // safe to proceed (ex: our release track is fundamentally unsafe or there is
 // weird catalog corruption).
-var maybeUpdateRelease = function (options) {
+var maybeUpdateRelease = async function (options) {
   // We are only updating packages, so we are not updating the release.
   if (options["packages-only"]) {
      return 0;
@@ -1277,7 +1696,7 @@ var maybeUpdateRelease = function (options) {
   // XXX better error checking on release.current.name
   // XXX add a method to release.current.
   var releaseTrack = release.current ?
-        release.current.getReleaseTrack() : catalog.DEFAULT_TRACK;
+        await release.current.getReleaseTrack() : catalog.DEFAULT_TRACK;
 
   // Unless --release was passed (in which case we ought to already have
   // springboarded to that release), go get the latest release and switch to
@@ -1288,7 +1707,7 @@ var maybeUpdateRelease = function (options) {
   // double-springboard.  (We might miss an super recently published release,
   // but that's probably OK.)
   if (! release.forced) {
-    var latestRelease = release.latestKnown(releaseTrack);
+    var latestRelease = await release.latestKnown(releaseTrack);
 
     // Are we on some track without ANY recommended releases at all,
     // and the user ran 'meteor update' without specifying a release? We
@@ -1302,8 +1721,8 @@ var maybeUpdateRelease = function (options) {
 
     if (release.current && ! release.current.isRecommended() &&
         options.appDir && ! options.patch) {
-      var releaseVersion = release.current.getReleaseVersion();
-      var newerRecommendedReleases = getLaterReleaseVersions(
+      var releaseVersion = await release.current.getReleaseVersion();
+      var newerRecommendedReleases = await getLaterReleaseVersions(
         releaseTrack, releaseVersion);
       if (!newerRecommendedReleases.length) {
         // When running 'meteor update' without --release in an app,
@@ -1345,7 +1764,7 @@ var maybeUpdateRelease = function (options) {
     throw new Error("don't have a proper release?");
   }
 
-  updateMeteorToolSymlink(true);
+  await updateMeteorToolSymlink(true);
 
   // If we're not in an app, then we're basically done. The only thing left to
   // do is print out some messages explaining what happened (and advising the
@@ -1378,7 +1797,7 @@ var maybeUpdateRelease = function (options) {
       // We get here if the user ran 'meteor update' and we didn't
       // find a new version.
       Console.info(
-        "The latest version of Meteor, " + release.current.getReleaseVersion() +
+        "The latest version of Meteor, " + await release.current.getReleaseVersion() +
         ", is already installed on this computer. Run " +
         Console.command("'meteor update'") + " inside of a particular " +
         "project directory to update that project to " +
@@ -1396,8 +1815,8 @@ var maybeUpdateRelease = function (options) {
     alwaysWritePackageMap: true,
     allowIncompatibleUpdate: true // disregard `.meteor/versions` if necessary
   });
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.readProjectMetadata();
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    await projectContext.readProjectMetadata();
   });
 
   if (projectContext.releaseFile.fullReleaseName === release.current.name) {
@@ -1431,7 +1850,7 @@ var maybeUpdateRelease = function (options) {
         "Cannot patch update unless a release is set.");
       return 1;
     }
-    var record = catalog.official.getReleaseVersion(
+    var record = await catalog.official.getReleaseVersion(
       projectContext.releaseFile.releaseTrack,
       projectContext.releaseFile.releaseVersion);
     if (!record) {
@@ -1445,7 +1864,7 @@ var maybeUpdateRelease = function (options) {
         "You are at the latest patch version.");
       return 0;
     }
-    var patchRecord = catalog.official.getReleaseVersion(
+    var patchRecord = await catalog.official.getReleaseVersion(
       projectContext.releaseFile.releaseTrack, updateTo);
     // It looks like you are not at the latest patch version,
     // technically. But, in practice, we cannot update you to the latest patch
@@ -1465,14 +1884,17 @@ var maybeUpdateRelease = function (options) {
   } else if (release.explicit) {
     // You have explicitly specified a release, and we have springboarded to
     // it. So, we will use that release to update you to itself, if we can.
-    releaseVersion = release.current.getReleaseVersion();
+    releaseVersion = await release.current.getReleaseVersion();
   } else {
     // We are not doing a patch update, or a specific release update, so we need
     // to try all recommended releases on our track, whose order key is greater
     // than the app's.
-    releaseVersion = getLaterReleaseVersions(
-      projectContext.releaseFile.releaseTrack,
-      projectContext.releaseFile.releaseVersion)[0];
+    releaseVersion = (
+      await getLaterReleaseVersions(
+        projectContext.releaseFile.releaseTrack,
+        projectContext.releaseFile.releaseVersion
+      )
+    )[0];
 
     if (! releaseVersion) {
       // We could not find any releases newer than the one that we are on, on
@@ -1498,7 +1920,7 @@ var maybeUpdateRelease = function (options) {
 
   // Update every package in .meteor/packages to be (semver)>= the version
   // set for that package in the release we are updating to
-  var releaseRecord = catalog.official.getReleaseVersion(releaseTrack, releaseVersion);
+  var releaseRecord = await catalog.official.getReleaseVersion(releaseTrack, releaseVersion);
   projectContext.projectConstraintsFile.updateReleaseConstraints(releaseRecord);
 
   // Download and build packages and write the new versions to .meteor/versions.
@@ -1507,11 +1929,11 @@ var maybeUpdateRelease = function (options) {
   //     to upgrade packages and have to do it again. Maybe we shouldn't? Note
   //     that if we change this, that changes the upgraders interface, which
   //     expects a projectContext that is fully prepared for build.
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.prepareProjectForBuild();
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    await projectContext.prepareProjectForBuild();
   });
 
-  projectContext.writeReleaseFileAndDevBundleLink(releaseName);
+  await projectContext.writeReleaseFileAndDevBundleLink(releaseName);
 
   projectContext.packageMapDelta.displayOnConsole({
     title: ("Changes to your project's package version selections from " +
@@ -1534,13 +1956,32 @@ var maybeUpdateRelease = function (options) {
   return 0;
 };
 
-function getLaterReleaseVersions(releaseTrack, releaseVersion) {
-  var releaseInfo = catalog.official.getReleaseVersion(
+async function getLaterReleaseVersions(releaseTrack, releaseVersion) {
+  var releaseInfo = await catalog.official.getReleaseVersion(
     releaseTrack, releaseVersion);
   var orderKey = (releaseInfo && releaseInfo.orderKey) || null;
 
-  return catalog.official.getSortedRecommendedReleaseVersions(
+  return await catalog.official.getSortedRecommendedReleaseVersions(
     releaseTrack, orderKey);
+}
+
+async function compileMeteorApp(options) {
+  var projectContext = new projectContextModule.ProjectContext({
+    projectDir: options.appDir,
+    serverArchitectures: [archinfo.host()],
+    allowIncompatibleUpdate: options["allow-incompatible-update"],
+  });
+  await main.captureAndExit("=> Errors prevented the build:", async () => await projectContext.prepareProjectForBuild());
+  await buildmessage.capture({
+    title: "updating the application"
+  }, async function () {
+    var packageSource = new PackageSource();
+    packageSource.initFromAppDir(projectContext, [/~$/, /^\.#/, /^(\.meteor\/|\.git\/|Thumbs\.db|\.DS_Store\/?|Icon\r|ehthumbs\.db|\..*\.sw.|#.*#)$/]);
+    await compiler.compile(packageSource, {
+      packageMap: projectContext.packageMap,
+      isopackCache: projectContext.isopackCache,
+    });
+  });
 }
 
 main.registerCommand({
@@ -1549,7 +1990,8 @@ main.registerCommand({
     patch: { type: Boolean },
     "packages-only": { type: Boolean },
     "allow-incompatible-update": { type: Boolean },
-    "all-packages": { type: Boolean }
+    "all-packages": { type: Boolean },
+    npm: { type: Boolean },
   },
   // We have to be able to work without a release, since 'meteor
   // update' is how you fix apps that don't have a release.
@@ -1557,7 +1999,7 @@ main.registerCommand({
   minArgs: 0,
   maxArgs: Infinity,
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: true })
-}, function (options) {
+}, async function (options) {
   // If you are specifying packages individually, you probably don't want to
   // update the release.
   if (options.args.length > 0) {
@@ -1581,7 +2023,13 @@ main.registerCommand({
     return 1;
   }
 
-  var releaseUpdateStatus = maybeUpdateRelease(options);
+  // Compile the app to resolve NPM dependencies bump coming from plugins
+  if (options["npm"]) {
+    await compileMeteorApp(options);
+    return 0;
+  }
+
+  var releaseUpdateStatus = await maybeUpdateRelease(options);
   // If we encountered an error and cannot proceed, return.
   if (releaseUpdateStatus !== 0) {
     return releaseUpdateStatus;
@@ -1602,8 +2050,8 @@ main.registerCommand({
     alwaysWritePackageMap: true,
     allowIncompatibleUpdate: options["allow-incompatible-update"]
   });
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.readProjectMetadata();
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    await projectContext.readProjectMetadata();
   });
 
   // If no packages have been specified, then we will send in a request to
@@ -1619,7 +2067,7 @@ main.registerCommand({
     // `.meteor/packages`) alone.
     if (options["all-packages"]) {
       upgradePackageNames = _.filter(
-        _.keys(projectContext.packageMapFile.getCachedVersions()),
+        Object.keys(projectContext.packageMapFile.getCachedVersions()),
         packageName => ! compiler.isIsobuildFeaturePackage(packageName)
       );
     }
@@ -1638,10 +2086,37 @@ main.registerCommand({
     if (options["all-packages"]) {
       Console.error("You cannot both specify a list of packages to"
        + " update and pass --all-packages.");
-       exit(1)
+       process.exit(1)
     }
 
     upgradePackageNames = options.args;
+
+    if (upgradePackageNames.some(name => name.includes("@"))) {
+      Console.error(
+        "Package names can not contain \"@\". If you are trying to",
+        "update a package to a specific version, instead use",
+        Console.command('"meteor add"')
+      );
+      process.exit(1);
+    }
+  }
+  // We want to use the project's release for constraints even if we are
+  // currently running a newer release (eg if we ran 'meteor update --patch' and
+  // updated to an older patch release).  (If the project has release 'none'
+  // because this is just 'updating packages', this can be null. Also, if we're
+  // running from a checkout this should be null even if the file doesn't say
+  // 'none'.)
+  var releaseRecordForConstraints = null;
+  if (! files.inCheckout() &&
+      projectContext.releaseFile.normalReleaseSpecified()) {
+    releaseRecordForConstraints = await catalog.official.getReleaseVersion(
+      projectContext.releaseFile.releaseTrack,
+      projectContext.releaseFile.releaseVersion);
+    if (! releaseRecordForConstraints) {
+      console.log(projectContext.releaseFile, releaseRecordForConstraints)
+      throw Error("unknown release: " +
+                  projectContext.releaseFile.displayReleaseName);
+    }
   }
 
   const upgradePackagesWithoutCordova =
@@ -1673,14 +2148,15 @@ main.registerCommand({
   }
 
   // Try to resolve constraints, allowing the given packages to be upgraded.
-  projectContext.reset({
+  await projectContext.reset({
+    releaseForConstraints: releaseRecordForConstraints,
     upgradePackageNames: upgradePackageNames,
     upgradeIndirectDepPatchVersions: upgradeIndirectDepPatchVersions
   });
-  main.captureAndExit(
-    "=> Errors while upgrading packages:", "upgrading packages", function () {
-      projectContext.resolveConstraints();
-      if (buildmessage.jobHasMessages()) {
+  await main.captureAndExit(
+    "=> Errors while upgrading packages:", "upgrading packages", async function () {
+      await projectContext.resolveConstraints();
+      if (await buildmessage.jobHasMessages()) {
         return;
       }
 
@@ -1693,12 +2169,12 @@ main.registerCommand({
           }
         });
       }
-      if (buildmessage.jobHasMessages()) {
+      if (await buildmessage.jobHasMessages()) {
         return;
       }
 
       // Finish preparing the project.
-      projectContext.prepareProjectForBuild();
+      await projectContext.prepareProjectForBuild();
     }
   );
 
@@ -1725,10 +2201,11 @@ main.registerCommand({
 
     var nonlatestDirectDeps = [];
     var nonlatestIndirectDeps = [];
-    projectContext.packageMap.eachPackage(function (name, info) {
+    var deprecatedDeps = [];
+    await projectContext.packageMap.eachPackage(async function(name, info) {
       var selectedVersion = info.version;
       var catalog = projectContext.projectCatalog;
-      var latestVersion = getNewerVersion(name, selectedVersion, catalog);
+      var latestVersion = await getNewerVersion(name, selectedVersion, catalog);
       if (latestVersion) {
         var rec = { name: name, selectedVersion: selectedVersion,
                     latestVersion: latestVersion };
@@ -1738,6 +2215,13 @@ main.registerCommand({
           nonlatestIndirectDeps.push(rec);
         }
       }
+      if (info.packageSource && info.packageSource.deprecated) {
+        deprecatedDeps.push({
+          name: name,
+          selectedVersion: selectedVersion,
+          deprecatedMessage: info.packageSource.deprecatedMessage
+        })
+      }
     });
     var printItem = function (rec) {
       Console.info(" * " + rec.name + " " + rec.selectedVersion +
@@ -1746,15 +2230,28 @@ main.registerCommand({
     if (nonlatestDirectDeps.length) {
       Console.info("\nThe following top-level dependencies were not updated " +
                    "to the very latest version available:");
-      _.each(nonlatestDirectDeps, printItem);
+      nonlatestDirectDeps.forEach(printItem);
+    }
+    if(deprecatedDeps.length) {
+      Console.info("\nThe following packages have been DEPRECATED. Please consider finding replacements for them.");
+      deprecatedDeps.forEach(function (item) {
+        Console.info(" * " +  item.name + " " + item.selectedVersion + " " + (item.deprecatedMessage ? "(" + item.deprecatedMessage + ")" : ""));
+      })
     }
     if (nonlatestIndirectDeps.length) {
       Console.info("\nNewer versions of the following indirect dependencies" +
                    " are available:");
-      _.each(nonlatestIndirectDeps, printItem);
+      nonlatestIndirectDeps.forEach(printItem);
       Console.info([
-        "To update one or more of these packages, pass their names to ",
-        "`meteor update`, or just run `meteor update --all-packages`."
+        "These versions may not be compatible with your project.",
+        "To update one or more of these packages to their latest",
+        "compatible versions, pass their names to `meteor update`,",
+        "or just run `meteor update --all-packages`.",
+        "If the packages do not upgrade after this, this could mean",
+        "that there is a newer version of Meteor which the package",
+        "requires, but it not yet recommended or that some package",
+        "dependencies are not up to date and don't allow you to get",
+        "the latest package version."
       ].join("\n"));
     }
   }
@@ -1773,13 +2270,13 @@ main.registerCommand({
   requiresApp: true,
   catalogRefresh: new catalog.Refresh.Never(),
   'allow-incompatible-update': { type: Boolean }
-}, function (options) {
+}, async function (options) {
   var projectContext = new projectContextModule.ProjectContext({
     projectDir: options.appDir,
     allowIncompatibleUpdate: options['allow-incompatible-update']
   });
-  main.captureAndExit("=> Errors while initializing project:", function () {
-    projectContext.prepareProjectForBuild();
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
+    await projectContext.prepareProjectForBuild();
   });
   projectContext.packageMapDelta.displayOnConsole();
 
@@ -1800,8 +2297,8 @@ main.registerCommand({
   name: 'admin run-background-updater',
   hidden: true,
   catalogRefresh: new catalog.Refresh.Never()
-}, function (options) {
-  updater.tryToDownloadUpdate({
+}, async function (options) {
+  await updater.tryToDownloadUpdate({
     showBanner: true,
     printErrors: true
   });
@@ -1816,7 +2313,7 @@ main.registerCommand({
   name: 'admin wipe-all-packages',
   hidden: true,
   catalogRefresh: new catalog.Refresh.Never()
-}, function (options) {
+}, async function (options) {
   tropohouse.default.wipeAllPackages();
 });
 
@@ -1830,7 +2327,7 @@ main.registerCommand({
   name: 'admin check-package-versions',
   hidden: true,
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
-}, function (options) {
+}, async function (options) {
   if (!files.inCheckout()) {
     Console.error("Must run from checkout.");
     return 1;
@@ -1846,10 +2343,9 @@ main.registerCommand({
     // though this temporary directory does not have any cordova platforms
     forceIncludeCordovaUnibuild: true
   });
-
   // Read metadata and initialize catalog.
-  main.captureAndExit("=> Errors while building for release:", function () {
-    projectContext.initializeCatalog();
+  await main.captureAndExit("=> Errors while building for release:", async function () {
+    await projectContext.initializeCatalog();
   });
 
   var allPackages = projectContext.localCatalog.getAllNonTestPackageNames();
@@ -1857,14 +2353,14 @@ main.registerCommand({
   Console.info("Listing packages where the checkout version doesn't match the",
     "latest version on the package server.");
 
-  _.each(allPackages, function (packageName) {
-    var checkoutVersion = projectContext.localCatalog.getLatestVersion(packageName).version;
-    var remoteLatestVersion = catalog.official.getLatestVersion(packageName).version;
+  for (const packageName of allPackages) {
+    var checkout = projectContext.localCatalog.getLatestVersion(packageName);
+    var remote = await catalog.official.getLatestVersion(packageName);
 
-    if (checkoutVersion !== remoteLatestVersion) {
-      Console.info(packageName, checkoutVersion, remoteLatestVersion);
+    if (checkout.version !== remote.version) {
+      Console.info(packageName, checkout.version, remote.version);
     }
-  });
+  }
 });
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1874,56 +2370,252 @@ main.registerCommand({
 main.registerCommand({
   name: 'add',
   options: {
-    "allow-incompatible-update": { type: Boolean }
+    "allow-incompatible-update": { type: Boolean },
+    "search": { type: String },
+    "from": { type: String },
+    "from-branch": { type: String },
+    "from-dir": { type: String },
+    "to": { type: String },
+    "force": { type: Boolean },
   },
-  minArgs: 1,
+  minArgs: 0,
   maxArgs: Infinity,
   requiresApp: true,
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: true })
-}, function (options) {
+}, async function (options) {
+  if (
+    !options.from &&
+    options.args &&
+    options.args.length === 1 &&
+    isGitSourceLike(options.args[0])
+  ) {
+    options.from = options.args[0];
+    options.args = [];
+  }
+
+  if (
+    options.search &&
+    (options.from || options['from-branch'] || options['from-dir'] ||
+      options.to || options.force)
+  ) {
+    Console.error(
+      'meteor add: cannot combine --search with Git clone options.'
+    );
+    return 1;
+  }
+
+  // --from flow: clone a package from a Git repository
+  if (options['from-branch'] && !options.from) {
+    Console.error('--from-branch requires --from to specify the source repository.');
+    return 1;
+  }
+  if (options['from-dir'] && !options.from) {
+    Console.error('--from-dir requires --from to specify the source repository.');
+    return 1;
+  }
+  if (options.force && !options.from) {
+    Console.error('--force requires --from to specify the source repository.');
+    return 1;
+  }
+  if (options.to && !options.from) {
+    Console.error('--to requires --from to specify the source repository.');
+    return 1;
+  }
+
+  if (options.from) {
+    if (options.args && options.args.length > 0) {
+      Console.error('Cannot specify package names when using --from.');
+      return 1;
+    }
+
+    // Smart-parse the URL to extract repo, branch, and dir when possible.
+    // Explicit --from-branch / --from-dir always take precedence.
+    const parsed = parseGitUrl(options.from);
+    const repoUrl = parsed.repoUrl;
+    const branch = options['from-branch'] || parsed.branch || null;
+    const fromDir = options['from-dir'] || parsed.dir || null;
+
+    // Determine destination path
+    let destPath;
+    if (options.to) {
+      destPath = files.pathResolve(options.appDir, options.to);
+    } else {
+      // Derive name from the URL or --from-dir
+      let dirName;
+      if (fromDir) {
+        dirName = fromDir.split('/').filter(Boolean).pop();
+      } else {
+        dirName = repoUrl.split('/').filter(Boolean).pop().replace(/\.git$/, '');
+      }
+      destPath = files.pathJoin(options.appDir, 'packages', dirName);
+    }
+
+    // Check if destination already exists
+    if (files.exists(destPath)) {
+      if (options.force) {
+        await files.rm_recursive_async(destPath);
+      } else {
+        const prompt = inquirer.createPromptModule();
+        const { overwrite } = await prompt([{
+          type: 'confirm',
+          name: 'overwrite',
+          message: `Directory '${files.convertToOSPath(destPath)}' already exists. Overwrite? (use --force to skip this prompt)`,
+          default: false,
+        }]);
+        if (!overwrite) {
+          return 0;
+        }
+        await files.rm_recursive_async(destPath);
+      }
+    }
+
+    let clonedPackageName;
+    try {
+      if (fromDir) {
+        await cloneSubdirectory(repoUrl, branch, fromDir, destPath);
+      } else {
+        await cloneRepo(repoUrl, destPath, { branch });
+      }
+
+      const { name } = validatePackageJs(destPath);
+      if (!name) {
+        throw new Error(
+          `Could not determine the package name from package.js in '${files.convertToOSPath(destPath)}'.`
+        );
+      }
+      clonedPackageName = name;
+
+      Console.info(`Package cloned to ${files.convertToOSPath(destPath)}`);
+    } catch (err) {
+      // Clean up on failure
+      if (files.exists(destPath)) {
+        await files.rm_recursive_async(destPath);
+      }
+      Console.error(err.message);
+      return 1;
+    }
+
+    // Only auto-register the package when the destination is somewhere the
+    // local catalog will scan (the project's packages/ dir or any path in
+    // METEOR_PACKAGE_DIRS / PACKAGE_DIRS). Otherwise the constraint solver
+    // would fail with a generic "no such package" error.
+    const searchDirs = [files.pathJoin(options.appDir, 'packages')];
+    const envDirs = [
+      ...((process.env.METEOR_PACKAGE_DIRS || '')
+        .split(files.pathOsDelimiter).filter(Boolean)),
+      ...((process.env.PACKAGE_DIRS || '')
+        .split(':').filter(Boolean)),
+    ];
+    for (const dir of envDirs) {
+      searchDirs.push(files.pathResolve(dir));
+    }
+    const isDiscoverable = searchDirs.some(root => {
+      const rel = files.pathRelative(root, destPath);
+      return rel && !rel.startsWith('..' + files.pathSep) && rel !== '..';
+    });
+
+    if (!isDiscoverable) {
+      Console.warn(
+        `'${files.convertToOSPath(destPath)}' is outside the project's packages/ ` +
+        `directory and not covered by METEOR_PACKAGE_DIRS, so it cannot be ` +
+        `registered automatically.`
+      );
+      Console.info(
+        `Move it under packages/ or add its parent to METEOR_PACKAGE_DIRS, ` +
+        `then run: meteor add ${clonedPackageName}`
+      );
+      return 0;
+    }
+
+    // Fall through to the standard add flow so the cloned package is
+    // registered in .meteor/packages and resolved by the constraint solver.
+    options.args = [clonedPackageName];
+  }
+
+  if (!options.from && (options.args.length === 0 || options.search)) {
+    if (options.args.length > 0 && options.search) {
+      Console.error(
+        "meteor add: cannot combine --search with positional package names."
+      );
+      return 1;
+    }
+    if (!Console.isInteractive() || !process.stdin.isTTY) {
+      Console.error(
+        options.search
+          ? "meteor add --search requires an interactive terminal."
+          : "meteor add requires at least one package name in non-interactive mode."
+      );
+      return 1;
+    }
+    var search = require('./commands-packages-search.js');
+    var picked;
+    try {
+      picked = await search.runInteractivePackageSearch({
+        initialQuery: options.search,
+        installed: search.readInstalledPackageNames(options.appDir)
+      });
+    } catch (err) {
+      if (err instanceof search.MeteorSearchAbortedError) {
+        return 1;
+      }
+      Console.error("Package search failed: " + (err && err.message ? err.message : err));
+      return 1;
+    }
+    if (!picked || picked.length === 0) {
+      Console.info("No packages selected.");
+      return 0;
+    }
+    options.args = picked;
+  }
+
   var projectContext = new projectContextModule.ProjectContext({
     projectDir: options.appDir,
     allowIncompatibleUpdate: options["allow-incompatible-update"]
   });
 
-  main.captureAndExit("=> Errors while initializing project:", function () {
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
     // We're just reading metadata here --- we're not going to resolve
     // constraints until after we've made our changes.
-    projectContext.initializeCatalog();
+    return await projectContext.initializeCatalog();
   });
 
   let exitCode = 0;
 
   // Split arguments into Cordova plugins and packages
   const { plugins: pluginsToAdd, packages: packagesToAdd } =
-    cordova.splitPluginsAndPackages(options.args);
+    splitPluginsAndPackages(options.args);
 
   if (!_.isEmpty(pluginsToAdd)) {
-    let plugins = projectContext.cordovaPluginsFile.getPluginVersions();
-    let changed = false;
+    function cordovaPluginAdd() {
+      const plugins = projectContext.cordovaPluginsFile.getPluginVersions();
+      let changed = false;
 
-    for (target of pluginsToAdd) {
-      let [id, version] = target.split('@');
+      for (target of pluginsToAdd) {
+        const { id, version } =
+          require('../cordova/package-id-version-parser.js').parse(target);
+        const newId = newPluginId(id);
 
-      const newId = cordova.newPluginId(id);
-
-      if (!(version && utils.isValidVersion(version, {forCordova: true}))) {
-        Console.error(`${id}: Meteor requires either an exact version \
-(e.g. ${id}@1.0.0), a Git URL with a SHA reference, or a local path.`);
-        exitCode = 1;
-      } else if (newId) {
-        plugins[newId] = version;
-        Console.info(`Added Cordova plugin ${newId}@${version} \
-(plugin has been renamed as part of moving to npm).`);
-        changed = true;
-      } else {
-        plugins[id] = version;
-        Console.info(`Added Cordova plugin ${id}@${version}.`);
-        changed = true;
+        if (!(version && utils.isValidVersion(version, {forCordova: true}))) {
+          Console.error(`${id}: Meteor requires either an exact version \
+  (e.g. ${id}@1.0.0), a Git URL with a SHA reference, or a local path.`);
+          exitCode = 1;
+        } else if (newId) {
+          plugins[newId] = version;
+          Console.info(`Added Cordova plugin ${newId}@${version} \
+  (plugin has been renamed as part of moving to npm).`);
+          changed = true;
+        } else {
+          plugins[id] = version;
+          Console.info(`Added Cordova plugin ${id}@${version}.`);
+          changed = true;
+        }
       }
+
+      changed && projectContext.cordovaPluginsFile.write(plugins);
     }
 
-    changed && projectContext.cordovaPluginsFile.write(plugins);
+    await ensureDevBundleDependencies();
+    await cordovaPluginAdd();
   }
 
   if (_.isEmpty(packagesToAdd)) {
@@ -1938,9 +2630,9 @@ main.registerCommand({
   // constraints. Don't run the constraint solver until you have added all of
   // them -- add should be an atomic operation regardless of the package
   // order.
-  var messages = buildmessage.capture(function () {
-    _.each(packagesToAdd, function (packageReq) {
-      buildmessage.enterJob("adding package " + packageReq, function () {
+  var messages = await buildmessage.capture(async function () {
+    for (const packageReq of packagesToAdd) {
+      await buildmessage.enterJob("adding package " + packageReq, async function () {
         var constraint = utils.parsePackageConstraint(packageReq, {
           useBuildmessage: true
         });
@@ -1950,40 +2642,40 @@ main.registerCommand({
 
         // It's OK to make errors based on looking at the catalog, because this
         // is a OnceAtStart command.
-        var packageRecord = projectContext.projectCatalog.getPackage(
-          constraint.package);
+        var packageRecord = await projectContext.projectCatalog.getPackage(
+            constraint.package);
         if (! packageRecord) {
           buildmessage.error("no such package");
           return;
         }
 
-        _.each(constraint.versionConstraint.alternatives, function (subConstr) {
+        for (const subConstr of constraint.versionConstraint.alternatives) {
           if (subConstr.versionString === null) {
-            return;
+            continue;
           }
           // Figure out if this version exists either in the official catalog or
           // the local catalog. (This isn't the same as using the combined
           // catalog, since it's OK to type "meteor add foo@1.0.0" if the local
           // package is 1.1.0 as long as 1.0.0 exists.)
-          var versionRecord = projectContext.localCatalog.getVersion(
-            constraint.package, subConstr.versionString);
+          var versionRecord = await projectContext.localCatalog.getVersion(
+              constraint.package, subConstr.versionString);
           if (! versionRecord) {
             // XXX #2846 here's an example of something that might require a
             // refresh
-            versionRecord = catalog.official.getVersion(
-              constraint.package, subConstr.versionString);
+            versionRecord = await catalog.official.getVersion(
+                constraint.package, subConstr.versionString);
           }
           if (! versionRecord) {
             buildmessage.error("no such version " + constraint.package + "@" +
-                               subConstr.versionString);
+                subConstr.versionString);
           }
-        });
+        }
         if (buildmessage.jobHasMessages()) {
           return;
         }
 
         var current = projectContext.projectConstraintsFile.getConstraint(
-          constraint.package);
+            constraint.package);
 
         // Check that the constraint is new. If we are already using the package
         // at the same constraint in the app, we will log an info message later
@@ -1992,35 +2684,35 @@ main.registerCommand({
         if (! current) {
           constraintsToAdd.push(constraint);
         } else if (! current.constraintString &&
-                   ! constraint.constraintString) {
+            ! constraint.constraintString) {
           infoMessages.push(
-            constraint.package +
+              constraint.package +
               " without a version constraint has already been added.");
         } else if (current.constraintString === constraint.constraintString) {
           infoMessages.push(
-            constraint.package + " with version constraint " +
+              constraint.package + " with version constraint " +
               constraint.constraintString + " has already been added.");
         } else {
           // We are changing an existing constraint.
           if (current.constraintString) {
             infoMessages.push(
-              "Currently using " + constraint.package +
+                "Currently using " + constraint.package +
                 " with version constraint " + current.constraintString + ".");
           } else {
             infoMessages.push(
-              "Currently using " +  constraint.package +
+                "Currently using " +  constraint.package +
                 " without any version constraint.");
           }
           if (constraint.constraintString) {
             infoMessages.push("The version constraint will be changed to " +
-                              constraint.constraintString + ".");
+                constraint.constraintString + ".");
           } else {
             infoMessages.push("The version constraint will be removed.");
           }
           constraintsToAdd.push(constraint);
         }
       });
-    });
+    }
   });
   if (messages.hasMessages()) {
     Console.arrowError("Errors while parsing arguments:", 1);
@@ -2032,8 +2724,8 @@ main.registerCommand({
   projectContext.projectConstraintsFile.addConstraints(constraintsToAdd);
 
   // Run the constraint solver, download packages, etc.
-  messages = buildmessage.capture(function () {
-    projectContext.prepareProjectForBuild();
+  messages = await buildmessage.capture(function () {
+    return projectContext.prepareProjectForBuild();
   });
   if (messages.hasMessages()) {
     Console.arrowError("Errors while adding packages:", 1);
@@ -2049,14 +2741,23 @@ main.registerCommand({
 
   // Show descriptions of directly added packages.
   Console.info();
-  _.each(constraintsToAdd, function (constraint) {
+  for (const constraint of constraintsToAdd) {
     var version = projectContext.packageMap.getInfo(constraint.package).version;
-    var versionRecord = projectContext.projectCatalog.getVersion(
-      constraint.package, version);
+    var versionRecord = await projectContext.projectCatalog.getVersion(
+        constraint.package, version);
+    var deprecatedMessage = "";
+    if (versionRecord.deprecated) {
+      if (versionRecord.deprecatedMessage) {
+        deprecatedMessage = ` - DEPRECATED: ${versionRecord.deprecatedMessage}`
+      } else {
+        deprecatedMessage = ' - DEPRECATED';
+      }
+    }
     Console.info(
-      constraint.package +
-        (versionRecord.description ? (": " + versionRecord.description) : ""));
-  });
+        constraint.package +
+        (versionRecord.description ? (": " + versionRecord.description) : "") + deprecatedMessage
+    );
+  }
 
   return exitCode;
 });
@@ -2068,55 +2769,107 @@ main.registerCommand({
 main.registerCommand({
   name: 'remove',
   options: {
-    "allow-incompatible-update": { type: Boolean }
+    "allow-incompatible-update": { type: Boolean },
+    "search": { type: String }
   },
-  minArgs: 1,
+  minArgs: 0,
   maxArgs: Infinity,
   requiresApp: true,
   catalogRefresh: new catalog.Refresh.Never()
-}, function (options) {
+}, async function (options) {
+  if (options.args.length === 0 || options.search) {
+    if (options.args.length > 0 && options.search) {
+      Console.error(
+        "meteor remove: cannot combine --search with positional package names."
+      );
+      return 1;
+    }
+    if (!Console.isInteractive() || !process.stdin.isTTY) {
+      Console.error(
+        options.search
+          ? "meteor remove --search requires an interactive terminal."
+          : "meteor remove requires at least one package name in non-interactive mode."
+      );
+      return 1;
+    }
+    var search = require('./commands-packages-search.js');
+    var removeSearch = require('./commands-packages-remove-search.js');
+    var installed = search.readInstalledPackageNames(options.appDir);
+    if (installed.size === 0) {
+      Console.info("No packages installed.");
+      return 0;
+    }
+    var picked;
+    try {
+      picked = await removeSearch.runInteractiveRemoveSelection({
+        installed: installed,
+        initialQuery: options.search
+      });
+    } catch (err) {
+      if (err instanceof search.MeteorSearchAbortedError) {
+        return 1;
+      }
+      Console.error(
+        "Package selection failed: "
+        + (err && err.message ? err.message : err)
+      );
+      return 1;
+    }
+    if (!picked || picked.length === 0) {
+      Console.info("No packages selected.");
+      return 0;
+    }
+    options.args = picked;
+  }
+
   var projectContext = new projectContextModule.ProjectContext({
     projectDir: options.appDir,
     allowIncompatibleUpdate: options["allow-incompatible-update"]
   });
-  main.captureAndExit("=> Errors while initializing project:", function () {
+
+  await main.captureAndExit("=> Errors while initializing project:", async function () {
     // We're just reading metadata here --- we're not going to resolve
     // constraints until after we've made our changes.
-    projectContext.readProjectMetadata();
+   return await projectContext.readProjectMetadata();
   });
 
   let exitCode = 0;
 
   // Split arguments into Cordova plugins and packages
   const { plugins: pluginsToRemove, packages }  =
-    cordova.splitPluginsAndPackages(options.args);
+    splitPluginsAndPackages(options.args);
 
   if (!_.isEmpty(pluginsToRemove)) {
-    let plugins = projectContext.cordovaPluginsFile.getPluginVersions();
-    let changed = false;
+    function cordovaPluginRemove() {
+      const plugins = projectContext.cordovaPluginsFile.getPluginVersions();
+      let changed = false;
 
-    for (id of pluginsToRemove) {
-      const newId = cordova.newPluginId(id);
+      for (id of pluginsToRemove) {
+        const newId = newPluginId(id);
 
-      if (/@/.test(id)) {
-        Console.error(`${id}: do not specify version constraints.`);
-        exitCode = 1;
-      } else if (_.has(plugins, id)) {
-        delete plugins[id];
-        Console.info(`Removed Cordova plugin ${id}.`);
-        changed = true;
-      } else if (newId && _.has(plugins, newId)) {
-        delete plugins[newId];
-        Console.info(`Removed Cordova plugin ${newId} \
-(plugin has been renamed as part of moving to npm).`);
-        changed = true;
-      } else {
-        Console.error(`Cordova plugin ${id} is not in this project.`);
-        exitCode = 1;
+        if (/@/.test(id)) {
+          Console.error(`${id}: do not specify version constraints.`);
+          exitCode = 1;
+        } else if (_.has(plugins, id)) {
+          delete plugins[id];
+          Console.info(`Removed Cordova plugin ${id}.`);
+          changed = true;
+        } else if (newId && _.has(plugins, newId)) {
+          delete plugins[newId];
+          Console.info(`Removed Cordova plugin ${newId} \
+  (plugin has been renamed as part of moving to npm).`);
+          changed = true;
+        } else {
+          Console.error(`Cordova plugin ${id} is not in this project.`);
+          exitCode = 1;
+        }
       }
+
+      changed && projectContext.cordovaPluginsFile.write(plugins);
     }
 
-    changed && projectContext.cordovaPluginsFile.write(plugins);
+    await ensureDevBundleDependencies();
+    cordovaPluginRemove();
   }
 
   if (_.isEmpty(packages)) {
@@ -2150,8 +2903,8 @@ main.registerCommand({
 
   // Run the constraint solver, rebuild local packages, etc. This will write
   // our changes to .meteor/packages if it succeeds.
-  main.captureAndExit("=> Errors after removing packages", function () {
-    projectContext.prepareProjectForBuild();
+  await main.captureAndExit("=> Errors after removing packages", function () {
+    return projectContext.prepareProjectForBuild();
   });
   projectContext.packageMapDelta.displayOnConsole();
 
@@ -2173,7 +2926,7 @@ main.registerCommand({
 main.registerCommand({
   name: 'refresh',
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
-}, function (options) {
+}, async function (options) {
   // We already did it!
   return 0;
 });
@@ -2198,7 +2951,7 @@ main.registerCommand({
     list: { type: Boolean }
   },
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
-}, function (options) {
+}, async function (options) {
   var name = options.args[0];
 
   // Yay, checking that options are correct.
@@ -2215,12 +2968,12 @@ main.registerCommand({
   }
 
   // Now let's get down to business! Fetching the thing.
-  var fullRecord = getReleaseOrPackageRecord(name);
+  var fullRecord = await getReleaseOrPackageRecord(name);
   var record = fullRecord.record;
   if (!options.list) {
 
     try {
-      var conn = packageClient.loggedInPackagesConnection();
+      var conn = await packageClient.loggedInPackagesConnection();
     } catch (err) {
       packageClient.handlePackageServerConnectionError(err);
       return 1;
@@ -2230,19 +2983,19 @@ main.registerCommand({
       if (options.add) {
         Console.info("Adding a maintainer to " + name + "...");
         if (fullRecord.release) {
-          packageClient.callPackageServer(
+          await packageClient.callPackageServer(
             conn, 'addReleaseMaintainer', name, options.add);
         } else {
-          packageClient.callPackageServer(
+          await packageClient.callPackageServer(
             conn, 'addMaintainer', name, options.add);
         }
       } else if (options.remove) {
         Console.info("Removing a maintainer from " + name + "...");
         if (fullRecord.release) {
-          packageClient.callPackageServer(
+          await packageClient.callPackageServer(
             conn, 'removeReleaseMaintainer', name, options.remove);
         } else {
-          packageClient.callPackageServer(
+          await packageClient.callPackageServer(
             conn, 'removeMaintainer', name, options.remove);
         }
         Console.info("Success.");
@@ -2255,8 +3008,8 @@ main.registerCommand({
 
     // Update the catalog so that we have this information, and find the record
     // again so that the message below is correct.
-    refreshOfficialCatalogOrDie();
-    fullRecord = getReleaseOrPackageRecord(name);
+    await refreshOfficialCatalogOrDie();
+    fullRecord = await getReleaseOrPackageRecord(name);
     record = fullRecord.record;
   }
 
@@ -2301,7 +3054,7 @@ main.registerCommand({
   // we assume that all packages have been published (along with the release
   // obviously) and we want to be sure to only bundle the published versions.
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
-}, function (options) {
+}, async function (options) {
   var releaseNameAndVersion = options.args[0];
 
   // We get this as an argument, so it is an OS path. Make it a standard path.
@@ -2311,7 +3064,7 @@ main.registerCommand({
   var releaseTrack = trackAndVersion[0];
   var releaseVersion = trackAndVersion[1];
 
-  var releaseRecord = catalog.official.getReleaseVersion(
+  var releaseRecord = await catalog.official.getReleaseVersion(
     releaseTrack, releaseVersion);
   if (!releaseRecord) {
     // XXX this could also mean package unknown.
@@ -2327,7 +3080,7 @@ main.registerCommand({
   var toolPackage = toolPackageVersion.package;
   var toolVersion = toolPackageVersion.version;
 
-  var toolPkgBuilds = catalog.official.getAllBuilds(
+  var toolPkgBuilds = await catalog.official.getAllBuilds(
     toolPackage, toolVersion);
   if (!toolPkgBuilds) {
     // XXX this could also mean package unknown.
@@ -2357,8 +3110,8 @@ main.registerCommand({
   if (options['target-arch']) {
     // check if the passed arch is in the list
     var arch = options['target-arch'];
-    if (! _.contains(osArches, arch)) {
-      throw new Error(
+    if (! osArches.includes(arch)) {
+	      throw new Error(
         arch + ": the arch is not available for the release. Available arches: "
         + osArches.join(', '));
     }
@@ -2372,19 +3125,19 @@ main.registerCommand({
 
   // Before downloading anything, check that the catalog contains everything we
   // need for the OSes that the tool is built for.
-  main.captureAndExit("=> Errors finding builds:", function () {
-    _.each(osArches, function (osArch) {
-      _.each(releaseRecord.packages, function (pkgVersion, pkgName) {
-        buildmessage.enterJob({
+  await main.captureAndExit("=> Errors finding builds:", async function () {
+    for (const osArch of osArches) {
+      for (const [pkgName, pkgVersion] of Object.entries(releaseRecord.packages)) {
+        await buildmessage.enterJob({
           title: "looking up " + pkgName + "@" + pkgVersion + " on " + osArch
-        }, function () {
-          if (!catalog.official.getBuildsForArches(pkgName, pkgVersion, [osArch])) {
+        }, async function () {
+          if (!(await catalog.official.getBuildsForArches(pkgName, pkgVersion, [osArch]))) {
             buildmessage.error("missing build of " + pkgName + "@" + pkgVersion +
                                " for " + osArch);
           }
         });
-      });
-    });
+      }
+    }
   });
 
   files.mkdir_p(outputDirectory);
@@ -2394,11 +3147,11 @@ main.registerCommand({
   var tmpDataFile = files.pathJoin(dataTmpdir, 'packages.data.db');
 
   var tmpCatalog = new catalogRemote.RemoteCatalog();
-  tmpCatalog.initialize({
+  await tmpCatalog.initialize({
     packageStorage: tmpDataFile
   });
   try {
-    packageClient.updateServerPackageData(tmpCatalog, null);
+    await packageClient.updateServerPackageData(tmpCatalog, null);
   } catch (err) {
     packageClient.handlePackageServerConnectionError(err);
     return 2;
@@ -2408,8 +3161,8 @@ main.registerCommand({
   // so we should ensure that once it is downloaded, it knows it is recommended
   // rather than having a little identity crisis and thinking that a past
   // release is the latest recommended until it manages to sync.
-  tmpCatalog.forceRecommendRelease(releaseTrack, releaseVersion);
-  tmpCatalog.closePermanently();
+  await tmpCatalog.forceRecommendRelease(releaseTrack, releaseVersion);
+  await tmpCatalog.closePermanently();
   if (files.exists(tmpDataFile + '-wal')) {
     throw Error("Write-ahead log still exists for " + tmpDataFile
                 + " so the data file will be incomplete!");
@@ -2418,7 +3171,7 @@ main.registerCommand({
   var packageMap =
         packageMapModule.PackageMap.fromReleaseVersion(releaseRecord);
 
-  _.each(osArches, function (osArch) {
+  for (const osArch of osArches) {
     var tmpdir = files.mkdtemp();
     Console.info("Building tarball for " + osArch);
 
@@ -2434,11 +3187,11 @@ main.registerCommand({
       files.pathJoin(tmpdir, '.meteor'),
       { platform: targetPlatform });
 
-    main.captureAndExit(
+    await main.captureAndExit(
       "=> Errors downloading packages for " + osArch + ":",
-      function () {
-        tmpTropo.downloadPackagesMissingFromMap(packageMap, {
-          serverArchitectures: [osArch]
+      async function () {
+        await tmpTropo.downloadPackagesMissingFromMap(packageMap, {
+          serverArchitectures: [osArch],
         });
       }
     );
@@ -2456,26 +3209,26 @@ main.registerCommand({
     var toolIsopackPath =
           tmpTropo.packagePath(toolPackage, toolVersion);
     var toolIsopack = new isopack.Isopack;
-    toolIsopack.initFromPath(toolPackage, toolIsopackPath);
+    await toolIsopack.initFromPath(toolPackage, toolIsopackPath);
     var toolRecord = _.findWhere(toolIsopack.toolsOnDisk, {arch: osArch});
     if (!toolRecord) {
       throw Error("missing tool for " + osArch);
     }
 
-    tmpTropo.linkToLatestMeteor(files.pathJoin(
+    await tmpTropo.linkToLatestMeteor(files.pathJoin(
         tmpTropo.packagePath(toolPackage, toolVersion, true),
         toolRecord.path,
         'meteor'));
 
     if (options.unpacked) {
-      files.cp_r(tmpTropo.root, outputDirectory);
+      await files.cp_r(tmpTropo.root, outputDirectory);
     } else {
-      files.createTarball(
+      await files.createTarball(
         tmpTropo.root,
         files.pathJoin(outputDirectory,
           'meteor-bootstrap-' + osArch + '.tar.gz'));
     }
-  });
+  }
 
   return 0;
 });
@@ -2487,7 +3240,7 @@ main.registerCommand({
   maxArgs: 1,
   hidden: true,
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
-}, function (options) {
+}, async function (options) {
   var bannersFile = options.args[0];
   try {
     var bannersData = files.readFile(bannersFile, 'utf8');
@@ -2506,14 +3259,14 @@ main.registerCommand({
   }
 
   try {
-    var conn = packageClient.loggedInPackagesConnection();
+    var conn = await packageClient.loggedInPackagesConnection();
   } catch (err) {
     packageClient.handlePackageServerConnectionError(err);
     return 1;
   }
 
   try {
-    packageClient.callPackageServer(
+    await packageClient.callPackageServer(
       conn, 'setBannersOnReleases',
       bannersData.track, bannersData.banners);
   } catch (e) {
@@ -2522,7 +3275,7 @@ main.registerCommand({
   }
 
   // Refresh afterwards.
-  refreshOfficialCatalogOrDie();
+  await refreshOfficialCatalogOrDie();
   return 0;
 });
 
@@ -2534,7 +3287,7 @@ main.registerCommand({
     unrecommend: { type: Boolean, short: "u" }
   },
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
-}, function (options) {
+}, async function (options) {
 
   // We want the most recent information.
   //refreshOfficialCatalogOrDie();
@@ -2547,7 +3300,7 @@ main.registerCommand({
   }
 
   // Now let's get down to business! Fetching the thing.
-  var record = catalog.official.getReleaseTrack(name);
+  var record = await catalog.official.getReleaseTrack(name);
   if (!record) {
     Console.error();
     Console.error('There is no release track named ' + name);
@@ -2555,7 +3308,7 @@ main.registerCommand({
   }
 
   try {
-    var conn = packageClient.loggedInPackagesConnection();
+    var conn = await packageClient.loggedInPackagesConnection();
   } catch (err) {
     packageClient.handlePackageServerConnectionError(err);
     return 1;
@@ -2564,13 +3317,13 @@ main.registerCommand({
   try {
     if (options.unrecommend) {
       Console.info("Unrecommending " + name + "@" + version + "...");
-      packageClient.callPackageServer(
+      await packageClient.callPackageServer(
         conn, 'unrecommendVersion', name, version);
       Console.info("Success.");
       Console.info(name + "@" + version, "is no longer a recommended release");
     } else {
       Console.info("Recommending " + options.args[0] + "...");
-      packageClient.callPackageServer(conn, 'recommendVersion', name, version);
+      await packageClient.callPackageServer(conn, 'recommendVersion', name, version);
       Console.info("Success.");
       Console.info(name + "@" + version, "is now a recommended release");
     }
@@ -2578,8 +3331,8 @@ main.registerCommand({
     packageClient.handlePackageServerConnectionError(err);
     return 1;
   }
-  conn.close();
-  refreshOfficialCatalogOrDie();
+  await conn.close();
+  await refreshOfficialCatalogOrDie();
 
   return 0;
 });
@@ -2590,7 +3343,7 @@ main.registerCommand({
   minArgs: 2,
   maxArgs: 2,
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
-}, function (options) {
+}, async function (options) {
 
   // We want the most recent information.
   //refreshOfficialCatalogOrDie();
@@ -2598,7 +3351,7 @@ main.registerCommand({
   var url = options.args[1];
 
   // Now let's get down to business! Fetching the thing.
-  var record = catalog.official.getPackage(name);
+  var record = await catalog.official.getPackage(name);
   if (!record) {
     Console.error();
     Console.error('There is no package named ' + name);
@@ -2606,7 +3359,7 @@ main.registerCommand({
   }
 
   try {
-    var conn = packageClient.loggedInPackagesConnection();
+    var conn = await packageClient.loggedInPackagesConnection();
   } catch (err) {
     packageClient.handlePackageServerConnectionError(err);
     return 1;
@@ -2615,16 +3368,16 @@ main.registerCommand({
   try {
     Console.rawInfo(
         "Changing homepage on "
-          + name + " to " + url + "...");
-      packageClient.callPackageServer(conn,
-          '_changePackageHomepage', name, url);
+          + name + " to " + url + "...\n");
+      await packageClient.callPackageServer(conn,
+        '_changePackageHomepage', name, url);
       Console.info(" done");
   } catch (err) {
     packageClient.handlePackageServerConnectionError(err);
     return 1;
   }
-  conn.close();
-  refreshOfficialCatalogOrDie();
+  await conn.close();
+  await refreshOfficialCatalogOrDie();
 
   return 0;
 });
@@ -2638,7 +3391,7 @@ main.registerCommand({
   },
   hidden: true,
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
-}, function (options) {
+}, async function (options) {
 
   // We don't care about having the most recent information, but we do want the
   // option to either unmigrate a specific version, or to unmigrate an entire
@@ -2652,11 +3405,11 @@ main.registerCommand({
     versions = [nSplit[1]];
     name = nSplit[0];
   } else {
-    versions = catalog.official.getSortedVersions(name);
+    versions = await catalog.official.getSortedVersions(name);
   }
 
   try {
-    var conn = packageClient.loggedInPackagesConnection();
+    var conn = await packageClient.loggedInPackagesConnection();
   } catch (err) {
     packageClient.handlePackageServerConnectionError(err);
     return 1;
@@ -2665,22 +3418,22 @@ main.registerCommand({
   try {
     var status = options.success ? "successfully" : "unsuccessfully";
     // XXX: This should probably use progress bars instead.
-    _.each(versions, function (version) {
+    for (const version of versions) {
       Console.rawInfo(
         "Setting " + name + "@" + version + " as " +
-         status + " migrated ... ");
-      packageClient.callPackageServer(
+         status + " migrated ...\n");
+      await packageClient.callPackageServer(
         conn,
         '_changeVersionMigrationStatus',
         name, version, !options.success);
       Console.info("done.");
-    });
+    }
   } catch (err) {
     packageClient.handlePackageServerConnectionError(err);
     return 1;
   }
   conn.close();
-  refreshOfficialCatalogOrDie();
+  await refreshOfficialCatalogOrDie();
 
   return 0;
 });

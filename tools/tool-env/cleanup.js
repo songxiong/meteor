@@ -1,35 +1,19 @@
-/// A simple interface to register functions to be called when the process
-/// exits.
+// A simple interface to register functions to be called when the process exits.
 
-var _ = require('underscore');
+const exitHandlers = [];
 
-var fiberHelpers = require('../utils/fiber-helpers.js');
+export function onExit(func) {
+  exitHandlers.push(func);
+}
 
-var cleanup = exports;
-_.extend(exports, {
-  _exitHandlers: [],
-
-  // register a function that will be called on SIGINT (e.g. Cmd-C on
-  // mac)
-  onExit: function (func) {
-    this._exitHandlers.push(func);
-  }
-});
-
-var runHandlers = function () {
-  fiberHelpers.noYieldsAllowed(function () {
-    var handlers = cleanup._exitHandlers;
-    cleanup._exitHandlers = [];
-    _.each(handlers, function (f) {
-      f();
-    });
-  });
-};
+async function runHandlers() {
+  await Promise.all(exitHandlers.splice(0).map(f => f()));
+}
 
 process.on('exit', runHandlers);
-_.each(['SIGINT', 'SIGHUP', 'SIGTERM'], function (sig) {
-  process.once(sig, function () {
-    runHandlers();
+['SIGINT', 'SIGHUP', 'SIGTERM'].forEach((sig) => {
+  process.once(sig, async () => {
+    await runHandlers();
     process.kill(process.pid, sig);
   });
 });

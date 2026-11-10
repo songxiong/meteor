@@ -1,39 +1,22 @@
-var files = require('../fs/files.js');
+import { loadIsopackage } from '../tool-env/isopackets.js';
+import { MongoExitCodes } from '../utils/mongo-exit-codes';
+var files = require('../fs/files');
 var utils = require('../utils/utils.js');
-var mongoExitCodes = require('../utils/mongo-exit-codes.js');
 var fiberHelpers = require('../utils/fiber-helpers.js');
 var runLog = require('./run-log.js');
 var child_process = require('child_process');
-
 var _ = require('underscore');
-var isopackets = require('../tool-env/isopackets.js');
 var Console = require('../console/console.js').Console;
 
-// Given a Mongo URL, open an interative Mongo shell on this terminal
+// Given a Mongo URL, open an interactive Mongo shell on this terminal
 // on that database.
-var runMongoShell = function (url) {
-  var mongoPath = files.pathJoin(files.getDevBundle(), 'mongodb', 'bin', 'mongo');
-  // XXX mongo URLs are not real URLs (notably, the comma-separation for
-  // multiple hosts). We've had a little better luck using the mongodb-uri npm
-  // package.
-  var mongoUrl = require('url').parse(url);
-  var auth = mongoUrl.auth && mongoUrl.auth.split(':');
-  var ssl = require('querystring').parse(mongoUrl.query).ssl === "true";
-
-  var args = [];
-  if (ssl) {
-    args.push('--ssl');
-  }
-  if (auth) {
-    args.push('-u', auth[0]);
-  }
-  if (auth) {
-    args.push('-p', auth[1]);
-  }
-  args.push(mongoUrl.hostname + ':' + mongoUrl.port + mongoUrl.pathname);
-
-  child_process.spawn(files.convertToOSPath(mongoPath),
-    args, { stdio: 'inherit' });
+var runMongoShell = function (url, err) {
+  // Mongo URLs are not real URLs (notably, the comma-separation for multiple
+  // hosts), so don't parse them; pass the raw URL through to mongosh.
+  const ls = child_process.spawn('mongosh', [url], {
+    stdio: 'inherit',
+  });
+  ls.on('error', err);
 };
 
 // Start mongod with a dummy replSet and wait for it to listen.
@@ -43,25 +26,38 @@ function spawnMongod(mongodPath, port, dbPath, replSetName) {
   mongodPath = files.convertToOSPath(mongodPath);
   dbPath = files.convertToOSPath(dbPath);
 
-  const args = [
+  // Because we're spawning the process with shell: true on win32, the
+  // command string and args array are effectively concatenated to
+  // a single string and passed into the shell. If any of those paths
+  // contain spaces, these will get broken up on white-spaces and treated
+  // as separate tokens. If they are quoted, they will be parsed
+  // correctly by the shell.
+  if (process.platform === 'win32') {
+    mongodPath = '"' + mongodPath + '"'
+    dbPath = '"' + dbPath + '"'
+  }
+
+  let args = [
     // nb: cli-test.sh and findMongoPids make strong assumptions about the
     // order of the arguments! Check them before changing any arguments.
-    '--bind_ip', '127.0.0.1',
-    '--port', port,
-    '--dbpath', dbPath,
+    '--bind_ip',
+    process.env.METEOR_MONGO_BIND_IP || '127.0.0.1',
+    '--port',
+    port,
+    '--dbpath',
+    dbPath,
     // Use an 8MB oplog rather than 256MB. Uses less space on disk and
     // initializes faster. (Not recommended for production!)
-    '--oplogSize', '8',
-    '--replSet', replSetName
+    '--oplogSize',
+    '8',
+    '--replSet',
+    replSetName,
+    '--noauth'
   ];
 
   // Use mmapv1 on 32bit platforms, as our binary doesn't support WT
-  if (process.platform === "win32"
-      || (process.platform === "linux" && process.arch === "ia32")) {
+  if (process.arch === 'ia32') {
     args.push('--storageEngine', 'mmapv1', '--smallfiles');
-  } else {
-    // The WT journal seems to be at least 300MB, which is just too much
-    args.push('--nojournal');
   }
 
   return child_process.spawn(mongodPath, args, {
@@ -71,10 +67,14 @@ function spawnMongod(mongodPath, port, dbPath, replSetName) {
     // they aren't set already. If these few aren't good enough, we'll at least
     // detect the locale error and print a link to #4019 (look for
     // `detectedErrors.badLocale` below).
-    env: _.extend({
-      LANG: 'en_US.UTF-8',
-      LC_ALL: 'en_US.UTF-8'
-    }, process.env)
+    env: Object.assign(
+      {
+        LANG: 'en_US.UTF-8',
+        LC_ALL: 'en_US.UTF-8',
+      },
+      process.env
+    ),
+    ...process.platform === 'win32' && { shell: true },
   });
 }
 
@@ -87,47 +87,52 @@ var findMongoPids;
 if (process.platform === 'win32') {
   // Windows doesn't have a ps equivalent that (reliably) includes the command
   // line, so approximate using the combined output of tasklist and netstat.
-  findMongoPids = function (dbDir_unused, port) {
+  findMongoPids = async function(dbDir_unused, port) {
     var promise = fiberHelpers.makeFulfillablePromise();
 
-    child_process.exec('tasklist /fi "IMAGENAME eq mongod.exe"',
-      function (error, stdout, stderr) {
-        if (error) {
-          var additionalInfo = JSON.stringify(error);
-          if (error.code === 'ENOENT') {
-            additionalInfo = "tasklist wasn't found on your system, it usually can be found at C:\\Windows\\System32\\.";
+    child_process.exec('tasklist /fi "IMAGENAME eq mongod.exe"', function(
+      error,
+      stdout,
+      stderr
+    ) {
+      if (error) {
+        var additionalInfo = JSON.stringify(error);
+        if (error.code === 'ENOENT') {
+          additionalInfo =
+            "tasklist wasn't found on your system, it usually can be found at C:\\Windows\\System32\\.";
+        }
+        promise.reject(
+          new Error("Couldn't run tasklist.exe: " + additionalInfo)
+        );
+        return;
+      } else {
+        // Find the pids of all mongod processes
+        var mongo_pids = [];
+        stdout.split('\n').forEach(function(line) {
+          var m = line.match(/^mongod.exe\s+(\d+) /);
+          if (m) {
+            mongo_pids[m[1]] = true;
           }
-          promise.reject(
-            new Error("Couldn't run tasklist.exe: " + additionalInfo)
-          );
-          return;
-        } else {
-          // Find the pids of all mongod processes
-          var mongo_pids = [];
-          _.each(stdout.split('\n'), function (line) {
-            var m = line.match(/^mongod.exe\s+(\d+) /);
-            if (m) {
-              mongo_pids[m[1]] = true;
-            }
-          });
+        });
 
-          // Now get the corresponding port numbers
-          child_process.exec(
-            'netstat -ano',
-            {maxBuffer: 1024 * 1024 * 10},
-            function (error, stdout, stderr) {
+        // Now get the corresponding port numbers
+        child_process.exec(
+          'netstat -ano',
+          { maxBuffer: 1024 * 1024 * 10 },
+          function(error, stdout, stderr) {
             if (error) {
               promise.reject(
-                new Error("Couldn't run netstat -ano: " +
-                          JSON.stringify(error))
+                new Error("Couldn't run netstat -ano: " + JSON.stringify(error))
               );
               return;
             } else {
               var pids = [];
-              _.each(stdout.split('\n'), function (line) {
-                var m = line.match(/^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)/);
+              stdout.split('\n').forEach(function(line) {
+                var m = line.match(
+                  /^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)/
+                );
                 if (m) {
-                  var found_pid =  parseInt(m[2], 10);
+                  var found_pid = parseInt(m[2], 10);
                   var found_port = parseInt(m[1], 10);
 
                   // We can't check the path app_dir so assume it always matches
@@ -139,21 +144,23 @@ if (process.platform === 'win32') {
                     pids.push({
                       pid: found_pid,
                       port: found_port,
-                      app_dir: null});
+                      app_dir: null,
+                    });
                   }
                 }
               });
 
               promise.resolve(pids);
             }
-          });
-        }
-      });
+          }
+        );
+      }
+    });
 
-    return promise.await();
+    return await promise;
   };
 } else {
-  findMongoPids = function (dbDir, port) {
+  findMongoPids = async function(dbDir, port) {
     var promise = fiberHelpers.makeFulfillablePromise();
 
     // 'ps ax' should be standard across all MacOS and Linux.
@@ -186,55 +193,81 @@ if (process.platform === 'win32') {
         'else ps ax; fi';
     }
 
+    // If the child process output includes unicode, make sure it's
+    // handled properly.
+    const {
+      LANG = 'en_US.UTF-8',
+      LC_ALL = LANG,
+      LANGUAGE = LANG,
+      // Remainder of process.env without above properties.
+      ...env
+    } = process.env;
+
+    // Make sure all three properties are set to the same value, which
+    // defaults to "en_US.UTF-8" or whatever LANG was already set to.
+    Object.assign(env, { LANG, LC_ALL, LANGUAGE });
+
     child_process.exec(
       psScript,
-      // we don't want this to randomly fail just because you're running lots of
-      // processes. 10MB should be more than ps ax will ever spit out; the default
-      // is 200K, which at least one person hit (#2158).
-      {maxBuffer: 1024 * 1024 * 10},
-      function (error, stdout, stderr) {
+      {
+        env,
+        // we don't want this to randomly fail just because you're running
+        // lots of processes. 10MB should be more than ps ax will ever
+        // spit out; the default is 200K, which at least one person hit
+        // (#2158).
+        maxBuffer: 1024 * 1024 * 10,
+      },
+      function(error, stdout, stderr) {
         if (error) {
           promise.reject(
-            new Error("Couldn't run ps ax: " +
-                      JSON.stringify(error) + "; " +
-                      error.message)
+            new Error(
+              "Couldn't run ps ax: " +
+                JSON.stringify(error) +
+                '; ' +
+                error.message
+            )
           );
           return;
         }
 
         var ret = [];
-        _.each(stdout.split('\n'), function (line) {
+        stdout.split('\n').forEach(function(line) {
           // Matches mongos we start. Note that this matches
           // 'fake-mongod' (our mongod stub for automated tests) as well
           // as 'mongod'.
-          var m = line.match(/^\s*(\d+).+mongod .+--port (\d+) --dbpath (.+(?:\/|\\)db)/);
+          var m = line.match(
+            /^\s*(\d+).+mongod .+--port (\d+) --dbpath (.+(?:\/|\\)db)/
+          );
           if (m && m.length === 4) {
-            var foundPid =  parseInt(m[1], 10);
+            var foundPid = parseInt(m[1], 10);
             var foundPort = parseInt(m[2], 10);
             var foundPath = m[3];
 
-            if ( (! port || port === foundPort) &&
-                 (! dbDir || dbDir === foundPath)) {
+            if (
+              (!port || port === foundPort) &&
+              (!dbDir || dbDir === foundPath)
+            ) {
               ret.push({
                 pid: foundPid,
                 port: foundPort,
-                dbDir: foundPath
+                dbDir: foundPath,
               });
             }
           }
         });
 
         promise.resolve(ret);
-      });
+      }
+    );
 
-    return promise.await();
+    return await promise;
   };
 }
 
 // See if mongo is running already. Yields. Returns the port that
 // mongo is running on or null if mongo is not running.
-var findMongoPort = function (dbDir) {
-  var pids = findMongoPids(dbDir);
+var findMongoPort = async function(dbDir) {
+  var pids = await findMongoPids(dbDir);
 
   if (pids.length !== 1) {
     return null;
@@ -263,7 +296,7 @@ if (process.platform === 'win32') {
   // where we try to connect to a mongod that is not running, or a wrong
   // mongod if our current app is not running but there is a left-over file
   // lying around. This still can be better than always failing to connect.
-  findMongoPort = function (dbPath) {
+  findMongoPort = function(dbPath) {
     var mongoPort = null;
 
     var portFile = files.pathJoin(dbPath, 'METEOR-PORT');
@@ -277,70 +310,74 @@ if (process.platform === 'win32') {
     var net = require('net');
 
     return new Promise(resolve => {
-      var client = net.connect({
-        port: mongoPort
-      }, () => {
-        // The server is running.
-        client.end();
-        resolve(mongoPort);
-      });
+      var client = net.connect(
+        {
+          port: mongoPort,
+        },
+        () => {
+          // The server is running.
+          client.end();
+          resolve(mongoPort);
+        }
+      );
       client.on('error', () => resolve(null));
-    }).catch(() => null).await();
-  }
+    })
+      .catch(() => null);
+  };
 }
-
 
 // Kill any mongos running on 'port'. Yields, and returns once they
 // are all dead. Throws an exception on failure.
 //
 // This is a big hammer for dealing with still running mongos, but
 // smaller hammers have failed before and it is getting tiresome.
-var findMongoAndKillItDead = function (port, dbPath) {
-  var pids = findMongoPids(null, port);
+var findMongoAndKillItDead = async function(port, dbPath) {
+  var pids = await findMongoPids(null, port);
 
   // Go through the list serially. There really should only ever be
   // at most one but we're not taking any chances.
-  _.each(pids, function (processInfo) {
-    var pid = processInfo.pid;
+  pidsLoop:
+    for (const processInfo of pids) {
+      var pid = processInfo.pid;
 
-    // Send kill attempts and wait. First a SIGINT, then if it isn't
-    // dead within 2 sec, SIGKILL. Check every 100ms to see if it's
-    // dead.
-    for (var attempts = 1; attempts <= 40; attempts ++) {
-      var signal = 0;
-      if (attempts === 1) {
-        signal = 'SIGINT';
-      } else if (attempts === 20 || attempts === 30) {
-        signal = 'SIGKILL';
+      // Send kill attempts and wait. First a SIGINT, then if it isn't
+      // dead within 2 sec, SIGKILL. Check every 100ms to see if it's
+      // dead.
+      for (var attempts = 1; attempts <= 40; attempts++) {
+        var signal = 0;
+        if (attempts === 1) {
+          signal = 'SIGINT';
+        } else if (attempts === 20 || attempts === 30) {
+          signal = 'SIGKILL';
+        }
+
+        try {
+          process.kill(pid, signal);
+        } catch (e) {
+          // it's dead. on to the next one
+          break pidsLoop;
+        }
+
+        await utils.sleepMs(100);
       }
 
-      try {
-        process.kill(pid, signal);
-      } catch (e) {
-        // it's dead. on to the next one
-        return;
-      }
-
-      utils.sleepMs(100);
+      // give up after 4 seconds.
+      // XXX should actually catch this higher up and print a nice
+      // error. foreseeable conditions should never result in exceptions
+      // for the user.
+      throw new Error("Can't kill running mongo (pid " + pid + ').');
     }
-
-    // give up after 4 seconds.
-    // XXX should actually catch this higher up and print a nice
-    // error. foreseeable conditions should never result in exceptions
-    // for the user.
-    throw new Error("Can't kill running mongo (pid " + pid + ").");
-  });
 
   // If we had to kill mongod with SIGKILL, or on Windows where all calls to
   // `process.kill` work like SIGKILL, mongod will not have the opportunity to
   // close gracefully. Delete a lock file that may have been left over.
-  var mongodLockFile = files.pathJoin(dbPath, "mongod.lock");
+  var mongodLockFile = files.pathJoin(dbPath, 'mongod.lock');
   if (files.exists(mongodLockFile)) {
-    files.unlink(mongodLockFile)
+    files.unlink(mongodLockFile);
   }
 };
 
-var StoppedDuringLaunch = function () {};
+var StoppedDuringLaunch = function() {};
 
 // Starts a single instance of mongod, and configures it properly as a singleton
 // replica set. Yields.  Returns once the mongod is successfully listening (or
@@ -356,12 +393,16 @@ var StoppedDuringLaunch = function () {};
 // are killed (and onExit is then invoked). Also, the entirety of all three
 // databases is deleted before starting up.  This is mode intended for testing
 // mongo failover, not for normal development or production use.
-var launchMongo = function (options) {
-  var onExit = options.onExit || function () {};
+var launchMongo = async function(options) {
+  var onExit = options.onExit || function() {};
 
   var noOplog = false;
   var mongod_path = files.pathJoin(
-    files.getDevBundle(), 'mongodb', 'bin', 'mongod');
+    files.getDevBundle(),
+    'mongodb',
+    'bin',
+    'mongod'
+  );
   var replSetName = 'meteor';
 
   // Automated testing: If this is set, instead of starting mongod, we
@@ -373,10 +414,14 @@ var launchMongo = function (options) {
     }
 
     var fakeMongodCommand =
-      process.platform === "win32" ? "fake-mongod.bat" : "fake-mongod";
+      process.platform === 'win32' ? 'fake-mongod.bat' : 'fake-mongod';
     mongod_path = files.pathJoin(
-      files.getCurrentToolsDir(), 'tools',
-      'tests', 'fake-mongod', fakeMongodCommand);
+      files.getCurrentToolsDir(),
+      'tools',
+      'tests',
+      'fake-mongod',
+      fakeMongodCommand
+    );
 
     // oplog support requires sending admin commands to mongod, so
     // it'd be hard to make fake-mongod support it.
@@ -387,54 +432,53 @@ var launchMongo = function (options) {
   var stopped = false;
   var handle = {};
   var stopPromise = new Promise((resolve, reject) => {
-    handle.stop = function () {
+    handle.stop = function() {
       if (stopped) {
         return;
       }
       stopped = true;
-      _.each(subHandles, function (handle) {
-        handle.stop();
+      _.each(subHandles, function(h) {
+        h.stop();
       });
 
       if (options.onStopped) {
         options.onStopped();
       }
 
-      reject(new StoppedDuringLaunch);
+      reject(new StoppedDuringLaunch());
     };
   });
 
-  var yieldingMethod = function (object, methodName, ...args) {
-    return Promise.race([
+  var yieldingMethod = async function(object, methodName, ...args) {
+    return await Promise.race([
       stopPromise,
-      new Promise((resolve, reject) => {
-        object[methodName](...args, (err, res) => {
-          err ? reject(err) : resolve(res);
-        });
-      })
-    ]).await();
+      object[methodName](...args),
+    ]);
   };
 
-  var launchOneMongoAndWaitForReadyForInitiate = function (dbPath, port,
-                                                           portFile) {
+  var launchOneMongoAndWaitForReadyForInitiate = async function(
+    dbPath,
+    port,
+    portFile
+  ) {
     files.mkdir_p(dbPath, 0o755);
 
     var proc = null;
 
     if (options.allowKilling) {
-      findMongoAndKillItDead(port, dbPath);
+      await findMongoAndKillItDead(port, dbPath);
     }
 
     if (options.multiple) {
       // This is only for testing, so we're OK with incurring the replset
       // setup on each startup.
-      files.rm_recursive(dbPath);
+      await files.rm_recursive_deferred(dbPath);
       files.mkdir_p(dbPath, 0o755);
     } else if (portFile) {
       var portFileExists = false;
       var matchingPortFileExists = false;
       try {
-        matchingPortFileExists = +(files.readFile(portFile)) === port;
+        matchingPortFileExists = +files.readFile(portFile) === port;
         portFileExists = true;
       } catch (e) {
         if (!e || e.code !== 'ENOENT') {
@@ -465,7 +509,7 @@ var launchMongo = function (options) {
             throw e;
           }
         }
-        _.each(dbFiles, function (dbFile) {
+        _.each(dbFiles, function(dbFile) {
           if (/^local\./.test(dbFile)) {
             files.unlink(files.pathJoin(dbPath, dbFile));
           }
@@ -481,28 +525,30 @@ var launchMongo = function (options) {
     }
 
     proc = spawnMongod(mongod_path, port, dbPath, replSetName);
+    var stdout = proc.stdout;
 
     function stop() {
+      stdout.removeListener('data', stdoutOnData);
       if (proc) {
         proc.removeListener('exit', procExitHandler);
         proc.kill('SIGINT');
         proc = null;
       }
     }
-    require("../tool-env/cleanup.js").onExit(stop);
+    require('../tool-env/cleanup.js').onExit(stop);
     subHandles.push({ stop });
 
-    var procExitHandler = fiberHelpers.bindEnvironment(function (code, signal) {
+    var procExitHandler = fiberHelpers.bindEnvironment(async function(code, signal) {
       // Defang subHandle.stop().
       proc = null;
 
       // Kill any other processes too. This will also remove
       // procExitHandler from the other processes, so onExit will only be called
       // once.
-      handle.stop();
+      await handle.stop();
 
       // Invoke the outer onExit callback.
-      onExit(code, signal, stderrOutput, detectedErrors);
+      await onExit(code, signal, stderrOutput, detectedErrors);
     });
     proc.on('exit', procExitHandler);
 
@@ -511,39 +557,51 @@ var launchMongo = function (options) {
     var replSetReady = false;
 
     var maybeReadyToTalk;
-    var readyToTalkPromise = new Promise(function (resolve) {
-      maybeReadyToTalk = function () {
-        if (resolve &&
-            listening &&
-            (noOplog || replSetReadyToBeInitiated || replSetReady)) {
-          proc.stdout.removeListener('data', stdoutOnData);
+    var readyToTalkPromise = new Promise(function(resolve) {
+      maybeReadyToTalk = function() {
+        if (
+          proc &&
+          !stopped &&
+          resolve &&
+          listening &&
+          (noOplog || replSetReadyToBeInitiated || replSetReady)
+        ) {
+
+          stdout.removeListener('data', stdoutOnData);
           resolve();
           resolve = null;
         }
       };
     });
 
-    var stopOrReadyPromise = Promise.race([
-      stopPromise,
-      readyToTalkPromise,
-    ]);
+    var stopOrReadyPromise = Promise.race([stopPromise, readyToTalkPromise]);
 
     var detectedErrors = {};
-    var stdoutOnData = fiberHelpers.bindEnvironment(function (data) {
+    var stdoutOnData = fiberHelpers.bindEnvironment(function(data) {
       // note: don't use "else ifs" in this, because 'data' can have multiple
       // lines
-      if (/\[initandlisten\] Did not find local replica set configuration document at startup/.test(data) ||
-          /\[ReplicationExecutor\] Locally stored replica set configuration does not have a valid entry for the current node/.test(data)) {
+      if (
+        /replica set config in use/.test(data) ||
+        /Did not find local replica set configuration document at startup/.test(
+          data
+        ) ||
+        /\[.*\] Locally stored replica set configuration does not have a valid entry for the current node/.test(
+          data
+        )
+      ) {
         replSetReadyToBeInitiated = true;
         maybeReadyToTalk();
       }
 
-      if (/ \[initandlisten\] waiting for connections on port/.test(data)) {
+      if (
+        /Waiting for connections/.test(data) ||
+        / \[.*\] waiting for connections on port/.test(data)
+      ) {
         listening = true;
         maybeReadyToTalk();
       }
 
-      if (/ \[rsSync\] transition to primary complete/.test(data)) {
+      if (/ \[rsSync-0\] transition to primary complete/.test(data)) {
         replSetReady = true;
         maybeReadyToTalk();
       }
@@ -553,15 +611,24 @@ var launchMongo = function (options) {
       }
 
       // Running against a old mmapv1 engine, probably from pre-mongo-3.2 Meteor
-      if (/created by the 'mmapv1' storage engine, so setting the active storage engine to 'mmapv1'/.test(data)) {
+      if (
+        /created by the 'mmapv1' storage engine, so setting the active storage engine to 'mmapv1'/.test(
+          data
+        )
+      ) {
         Console.warn();
-        Console.warn('Your development database is using mmapv1, '
-          + 'the old, pre-MongoDB 3.0 database engine. '
-          + 'You should consider upgrading to Wired Tiger, the new engine. '
-          + 'The easiest way to do so in development is to run '
-          + Console.command('meteor reset') + '. '
-          + "If you'd like to migrate your database, please consult "
-          + Console.url('https://docs.mongodb.org/v3.0/release-notes/3.0-upgrade/'))
+        Console.warn(
+          'Your development database is using mmapv1, ' +
+            'the old, pre-MongoDB 3.0 database engine. ' +
+            'You should consider upgrading to Wired Tiger, the new engine. ' +
+            'The easiest way to do so in development is to run ' +
+            Console.command('meteor reset') +
+            '. ' +
+            "If you'd like to migrate your database, please consult " +
+            Console.url(
+              'https://docs.mongodb.org/v3.0/release-notes/3.0-upgrade/'
+            )
+        );
         Console.warn();
       }
 
@@ -574,26 +641,32 @@ var launchMongo = function (options) {
 
     var stderrOutput = '';
     proc.stderr.setEncoding('utf8');
-    proc.stderr.on('data', function (data) {
+    proc.stderr.on('data', function(data) {
       stderrOutput += data;
     });
 
-    stopOrReadyPromise.await();
+    await stopOrReadyPromise;
   };
 
-
-  var initiateReplSetAndWaitForReady = function () {
+  var initiateReplSetAndWaitForReady = async function () {
     try {
       // Load mongo so we'll be able to talk to it.
-      var mongoNpmModule =
-            isopackets.load('mongo')['npm-mongo'].NpmModuleMongodb;
+      const {MongoClient} = (await loadIsopackage(
+          'npm-mongo'
+      )).NpmModuleMongodb;
 
       // Connect to the intended primary and start a replset.
-      var db = new mongoNpmModule.Db(
-        'meteor',
-        new mongoNpmModule.Server('127.0.0.1', options.port, {poolSize: 1}),
-        {safe: true});
-      yieldingMethod(db, 'open');
+      const client = new MongoClient(
+          `mongodb://127.0.0.1:${options.port}`, {
+            minPoolSize: 1,
+            maxPoolSize: 1,
+            socketTimeoutMS: 60000,
+            directConnection: true
+          }
+      );
+
+      const db = client.db('meteor');
+
       if (stopped) {
         return;
       }
@@ -601,17 +674,18 @@ var launchMongo = function (options) {
       var configuration = {
         _id: replSetName,
         version: 1,
-        members: [{_id: 0, host: '127.0.0.1:' + options.port, priority: 100}]
+        protocolVersion: 1,
+        members: [{_id: 0, host: '127.0.0.1:' + options.port, priority: 100}],
       };
 
       try {
-        const config = yieldingMethod(db.admin(), "command", {
+        const config = (await yieldingMethod(db.admin(), 'command', {
           replSetGetConfig: 1,
-        }).config;
+        })).config;
 
         // If a replication set configuration already exists, it's
         // important that the new version number is greater than the old.
-        if (config && _.has(config, "version")) {
+        if (config && _.has(config, 'version')) {
           configuration.version = config.version + 1;
         }
       } catch (e) {}
@@ -621,25 +695,29 @@ var launchMongo = function (options) {
         // could in theory become primary, and one of which can never be
         // primary.
         configuration.members.push({
-          _id: 1, host: '127.0.0.1:' + (options.port + 1), priority: 5
+          _id: 1,
+          host: '127.0.0.1:' + (options.port + 1),
+          priority: 5,
         });
         configuration.members.push({
-          _id: 2, host: '127.0.0.1:' + (options.port + 2), priority: 0
+          _id: 2,
+          host: '127.0.0.1:' + (options.port + 2),
+          priority: 0,
         });
       }
 
       try {
-        yieldingMethod(db.admin(), 'command', {
+        await yieldingMethod(db.admin(), 'command', {
           replSetInitiate: configuration,
         });
       } catch (e) {
         if (e.message === 'already initialized') {
-          yieldingMethod(db.admin(), 'command', {
+          await yieldingMethod(db.admin(), 'command', {
             replSetReconfig: configuration,
             force: true,
           });
         } else {
-          throw Error("rs.initiate error: " + e.message);
+          throw Error('rs.initiate error: ' + e.message);
         }
       }
 
@@ -647,52 +725,45 @@ var launchMongo = function (options) {
         return;
       }
 
-      // XXX timeout eventually?
+      let writableTimestamp = Date.now();
+
+      // Wait until the primary is writable. If it isn't writable after one
+      // minute, throw an error and report the replica set status.
       while (!stopped) {
-        var status = yieldingMethod(
-          db.admin(), 'command', {replSetGetStatus: 1});
+        const {ismaster} = await yieldingMethod(db.admin(), 'command', {
+          isMaster: 1,
+        });
 
-        // See https://docs.mongodb.com/manual/reference/replica-states/
-        // for information on various states
+        if (ismaster) {
+          // From mongoDB 5.0, w: majority is the default write concern for most MongoDB configurations
+          // this causes writes to be acknowledged after the timeout on M1 macs
+          // We are explicitly setting it to 1 when there is only 1 node, as we do simulate replica sets with only 1 node
+          // when running locally or in test environments.
+          // ref: https://docs.mongodb.com/manual/reference/write-concern/#mongodb-writeconcern-writeconcern.-majority-
+          await yieldingMethod(db.admin(), 'command', {
+            setDefaultRWConcern: 1,
+            ...( options.multiple ? {} : {defaultWriteConcern: {w: 1}})
+          });
+          break;
+        } else if (Date.now() - writableTimestamp > 60000) {
+          const status = await yieldingMethod(db.admin(), 'command', {
+            replSetGetStatus: 1,
+          });
 
-        // Are any of the members starting up or recovering?
-        if (_.any(status.members, function (member) {
-          return member.stateStr === 'STARTUP' ||
-            member.stateStr === 'STARTUP2' ||
-            member.stateStr === 'RECOVERING';
-        })) {
-          utils.sleepMs(20);
-          continue;
+          throw new Error(
+              'Primary not writable after one minute. Last replica set status: ' +
+              JSON.stringify(status)
+          );
         }
 
-        // Is the intended primary currently a secondary? (It passes through
-        // that phase briefly.)
-        if (status.members[0].stateStr === 'SECONDARY') {
-          utils.sleepMs(20);
-          continue;
-        }
-
-        // Anything else for the intended primary is probably an error.
-        if (status.members[0].stateStr !== 'PRIMARY') {
-          throw Error("Unexpected Mongo status: " + JSON.stringify(status));
-        }
-
-        // Anything but secondary for the other members is probably an error.
-        for (var i = 1; i < status.members.length; ++i) {
-          if (status.members[i].stateStr !== 'SECONDARY') {
-            throw Error("Unexpected Mongo secondary status: " +
-                        JSON.stringify(status));
-          }
-        }
-
-        break;
+        await utils.sleepMs(50);
       }
 
-      db.close(true /* means "the app is closing the connection" */);
+      client.close(true /* means "the app is closing the connection" */);
     } catch (e) {
       // If the process has exited, we're doing another form of error
       // handling. No need to throw random low-level errors farther.
-      if (!stopped || (e instanceof StoppedDuringLaunch)) {
+      if (!stopped || e instanceof StoppedDuringLaunch) {
         throw e;
       }
     }
@@ -701,27 +772,34 @@ var launchMongo = function (options) {
   try {
     if (options.multiple) {
       var dbBasePath = files.pathJoin(options.projectLocalDir, 'dbs');
-      _.each(_.range(3), function (i) {
+      let i = 2;
+      while (i >= 0) {
         // Did we get stopped (eg, by one of the processes exiting) by now? Then
         // don't start anything new.
         if (stopped) {
           return;
         }
-        var dbPath = files.pathJoin(options.projectLocalDir, 'dbs', ''+i);
-        launchOneMongoAndWaitForReadyForInitiate(dbPath, options.port + i);
-      });
+        const newDbPath = files.pathJoin(options.projectLocalDir, 'dbs', '' + i);
+        // TODO [fibers]: it looks like we shouldn't wait for this function to finish.
+            // if all tests are passing, we're probably fine...
+        await launchOneMongoAndWaitForReadyForInitiate(newDbPath, options.port + i);
+        i--;
+      }
+
       if (!stopped) {
-        initiateReplSetAndWaitForReady();
+        await initiateReplSetAndWaitForReady();
       }
     } else {
-      var dbPath = files.pathJoin(options.projectLocalDir, 'db');
-      var portFile = !noOplog && files.pathJoin(dbPath, 'METEOR-PORT');
-      launchOneMongoAndWaitForReadyForInitiate(dbPath, options.port, portFile);
+      const newDbPath = files.pathJoin(options.projectLocalDir, 'db');
+      var portFile = !noOplog && files.pathJoin(newDbPath, 'METEOR-PORT');
+      // TODO [fibers]: it looks like we shouldn't wait for this function to finish.
+      // if all tests are passing, we're probably fine...
+      await launchOneMongoAndWaitForReadyForInitiate(newDbPath, options.port, portFile);
       if (!stopped && !noOplog) {
-        initiateReplSetAndWaitForReady();
+        await initiateReplSetAndWaitForReady();
         if (!stopped) {
           // Write down that we configured the database properly.
-          files.writeFile(portFile, options.port);
+          files.writeFile(portFile, '' + options.port);
         }
       }
     }
@@ -743,7 +821,7 @@ var launchMongo = function (options) {
 // logged, and onFailure is called.
 //
 // options: projectLocalDir, port, onFailure, multiple
-var MongoRunner = function (options) {
+var MongoRunner = function(options) {
   var self = this;
   self.projectLocalDir = options.projectLocalDir;
   self.port = options.port;
@@ -763,21 +841,21 @@ var MongoRunner = function (options) {
 
 var MRp = MongoRunner.prototype;
 
-_.extend(MRp, {
+Object.assign(MRp, {
   // Blocks (yields) until the server has started for the first time and
   // is accepting connections. (It might subsequently die and be
   // restarted; we won't tell you about that.)
   //
   // If the server fails to start for the first time (after a few
   // restarts), we'll print a message and give up.
-  start: function () {
+  start: async function() {
     var self = this;
 
     if (self.handle) {
-      throw new Error("already running?");
+      throw new Error('already running?');
     }
 
-    self._startOrRestart();
+    await self._startOrRestart();
 
     // Did we properly start up? Great!
     if (self.handle) {
@@ -790,10 +868,10 @@ _.extend(MRp, {
     }
 
     // Otherwise, wait for a successful _startOrRestart, or a failure.
-    if (! self.resolveStartupPromise) {
-      new Promise(function (resolve) {
+    if (!self.resolveStartupPromise) {
+      await new Promise(function(resolve) {
         self.resolveStartupPromise = resolve;
-      }).await();
+      });
     }
   },
 
@@ -808,22 +886,21 @@ _.extend(MRp, {
   //
   // In case (a), self.handle will be the handle returned from launchMongo; in
   // case (b) self.handle will be null.
-  _startOrRestart: function () {
+  _startOrRestart: async function() {
     var self = this;
 
     if (self.handle) {
-      throw new Error("already running?");
+      throw new Error('already running?');
     }
 
     var allowKilling = self.multiple || self.firstStart;
     self.firstStart = false;
-    if (! allowKilling) {
+    if (!allowKilling) {
       // If we're not going to try to kill an existing mongod first, then we
       // shouldn't annoy the user by telling it that we couldn't start up.
       self.suppressExitMessage = true;
     }
-
-    self.handle = launchMongo({
+    self.handle = await launchMongo({
       projectLocalDir: self.projectLocalDir,
       port: self.port,
       multiple: self.multiple,
@@ -842,7 +919,7 @@ _.extend(MRp, {
     }
   },
 
-  _exited: function (code, signal, stderr, detectedErrors) {
+  _exited: async function(code, signal, stderr, detectedErrors) {
     var self = this;
 
     self.handle = null;
@@ -858,12 +935,17 @@ _.extend(MRp, {
     // wrong. If we didn't try to kill Mongo, we'll do that on the next
     // restart. Not killing it on the first try is important for speed,
     // since findMongoAndKillItDead is a very slow operation.
-    if (! self.suppressExitMessage) {
+    if (!self.suppressExitMessage) {
       // Print the last 20 lines of stderr.
       runLog.log(
-        stderr.split('\n').slice(-20).join('\n') +
-          "Unexpected mongo exit code " + code +
-          (self.multiple ? "." : ". Restarting."));
+        stderr
+          .split('\n')
+          .slice(-20)
+          .join('\n') +
+          'Unexpected mongo exit code ' +
+          code +
+          (self.multiple ? '.' : '. Restarting.')
+      );
     }
 
     // If we're in multiple mode, we never try to restart. That's to keep the
@@ -877,54 +959,77 @@ _.extend(MRp, {
     // when 5 seconds goes without a restart. (Note that by using a
     // timer instead of looking at the current date, we avoid getting
     // confused by time changes.)
-    self.errorCount ++;
+    self.errorCount++;
     if (self.errorTimer) {
       clearTimeout(self.errorTimer);
     }
-    self.errorTimer = setTimeout(function () {
+    self.errorTimer = setTimeout(function() {
       self.errorTimer = null;
       self.errorCount = 0;
     }, 5000);
 
     if (self.errorCount < 3) {
       // Wait a second, then restart.
-      self.restartTimer = setTimeout(fiberHelpers.bindEnvironment(function () {
-        self.restartTimer = null;
-        self._startOrRestart();
-      }), 1000);
+      self.restartTimer = setTimeout(
+        fiberHelpers.bindEnvironment(async function() {
+          self.restartTimer = null;
+          await self._startOrRestart();
+        }),
+        1000
+      );
       return;
     }
 
     // Too many restarts, too quicky. It's dead. Print friendly
     // diagnostics and give up.
-    var explanation = mongoExitCodes.Codes[code];
+    var explanation = MongoExitCodes[code];
     var message = "Can't start Mongo server.";
 
-    if (explanation && explanation.symbol === 'EXIT_UNCAUGHT' &&
-        detectedErrors.freeSpace) {
-      message += "\n\n" +
-        "Looks like you are out of free disk space under .meteor/local.";
+    if (
+      explanation &&
+      explanation.symbol === 'EXIT_UNCAUGHT' &&
+      detectedErrors.freeSpace
+    ) {
+      message +=
+        '\n\n' +
+        'Looks like you are out of free disk space under .meteor/local.';
     } else if (explanation) {
-      message += "\n" + explanation.longText;
+      message += '\n' + explanation.longText;
+    } else if (process.platform === 'win32') {
+      message +=
+        '\n\n' +
+        'Check how to troubleshoot here ' +
+        'https://v2-docs.meteor.com/windows.html#cant-start-mongo-server';
     }
 
-    if (explanation === mongoExitCodes.EXIT_NET_ERROR) {
-      message += "\n\n" +
-"Check for other processes listening on port " + self.port + "\n" +
-"or other Meteor instances running in the same project.";
+    if (explanation && explanation.symbol === 'EXIT_NET_ERROR') {
+      message +=
+        '\n\n' +
+        'Check for other processes listening on port ' +
+        self.port +
+        '\n' +
+        'or other Meteor instances running in the same project.';
     }
 
-    if (! explanation && /GLIBC/i.test(stderr)) {
-      message += "\n\n" +
-"Looks like you are trying to run Meteor on an old Linux distribution.\n" +
-"Meteor on Linux requires glibc version 2.9 or above. Try upgrading your\n" +
-"distribution to the latest version.";
+    if (!explanation && /GLIBC/i.test(stderr)) {
+      message +=
+        '\n\n' +
+        'Looks like you are trying to run Meteor on an old Linux distribution.\n' +
+        'Meteor on Linux requires glibc version 2.9 or above. Try upgrading your\n' +
+        'distribution to the latest version.';
     }
 
     if (detectedErrors.badLocale) {
-      message += "\n\n" +
-"Looks like MongoDB doesn't understand your locale settings. See\n" +
-"https://github.com/meteor/meteor/issues/4019 for more details.";
+      message +=
+        '\n\n' +
+        "Looks like MongoDB doesn't understand your locale settings. See\n" +
+        'https://github.com/meteor/meteor/issues/4019 for more details.';
+    }
+
+    if (signal === "SIGILL"){
+      message +=
+        '\n\n' +
+        "MongoDB crashed with SIGILL, you may be running a build of Meteor not compatible with your architecture. If this persists, try re-installing Meteor.";
     }
 
     runLog.log(message);
@@ -932,7 +1037,7 @@ _.extend(MRp, {
   },
 
   // Idempotent
-  stop: function () {
+  stop: function() {
     var self = this;
 
     if (self.shuttingDown) {
@@ -950,7 +1055,7 @@ _.extend(MRp, {
     }
   },
 
-  _allowStartupToReturn: function () {
+  _allowStartupToReturn: function() {
     var self = this;
     if (self.resolveStartupPromise) {
       var resolve = self.resolveStartupPromise;
@@ -959,35 +1064,34 @@ _.extend(MRp, {
     }
   },
 
-  _fail: function () {
+  _fail: async function() {
     var self = this;
     self.stop();
-    self.onFailure && self.onFailure();
+    self.onFailure && await self.onFailure();
     self._allowStartupToReturn();
   },
 
-  _mongoHosts: function () {
+  _mongoHosts: function() {
     var self = this;
     var ports = [self.port];
     if (self.multiple) {
       ports.push(self.port + 1, self.port + 2);
     }
-    return _.map(ports, function (port) {
-      return "127.0.0.1:" + port;
-    }).join(",");
+    return _.map(ports, function(port) {
+      return '127.0.0.1:' + port;
+    }).join(',');
   },
 
-  mongoUrl: function () {
+  mongoUrl: function() {
     var self = this;
-    return "mongodb://" + self._mongoHosts() + "/meteor";
+    return 'mongodb://' + self._mongoHosts() + '/meteor';
   },
 
-  oplogUrl: function () {
+  oplogUrl: function() {
     var self = this;
-    return "mongodb://" + self._mongoHosts() + "/local";
-  }
+    return 'mongodb://' + self._mongoHosts() + '/local';
+  },
 });
-
 
 exports.runMongoShell = runMongoShell;
 exports.findMongoPort = findMongoPort;

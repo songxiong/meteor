@@ -1,26 +1,20 @@
 Package.describe({
   summary: "An implementation of a diff algorithm on arrays and objects.",
-  version: '1.0.7-rc.0',
-  documentation: null
+  version: "1.2.1",
+  documentation: null,
 });
 
 Package.onUse(function (api) {
-  api.export('DiffSequence');
-  api.use(['underscore', 'ejson']);
-  api.addFiles([
-    'diff.js'
-  ]);
+  api.use("ecmascript");
+  api.use("ejson");
+  api.mainModule("diff.js");
+  api.export("DiffSequence");
+  api.types("diff-sequence.d.ts");
 });
 
 Package.onTest(function (api) {
-  api.use([
-    'tinytest',
-    'underscore',
-    'ejson'
-  ]);
+  api.use(["tinytest", "ejson", "id-map"]);
 
-  api.use('diff-sequence');
-  api.addFiles([
-    'tests.js'
-  ]);
+  api.use("diff-sequence");
+  api.addFiles(["tests.js"]);
 });

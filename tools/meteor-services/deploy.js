@@ -4,19 +4,39 @@
 // prompt for password
 // send RPC with or without password as required
 
-var files = require('../fs/files.js');
-var httpHelpers = require('../utils/http-helpers.js');
-var buildmessage = require('../utils/buildmessage.js');
-var config = require('./config.js');
-var auth = require('./auth.js');
-var _ = require('underscore');
-var stats = require('./stats.js');
-var Console = require('../console/console.js').Console;
+import {
+  pathJoin,
+  createTarGzStream,
+  getSettings,
+  mkdtemp,
+  changeTempDirStatus,
+  exists,
+  findGitCommitHash,
+} from '../fs/files';
+import { request } from '../utils/http-helpers.js';
+import buildmessage from '../utils/buildmessage.js';
+import {
+  pollForRegistrationCompletion,
+  doInteractivePasswordLogin,
+  loggedInUsername,
+  isLoggedIn,
+} from './auth.js';
+import { recordPackages } from './stats.js';
+import { Console } from '../console/console.js';
+import { Profile } from '../tool-env/profile';
+
+function sleepForMilliseconds(millisecondsToWait) {
+  return new Promise(function(resolve) {
+    let time = setTimeout(() => resolve(null), millisecondsToWait)
+  });
+}
+
+const hasOwn = Object.prototype.hasOwnProperty;
 
 const CAPABILITIES = ['showDeployMessages', 'canTransferAuthorization'];
 
-// Make a synchronous RPC to the "classic" MDG deploy API. The deploy
-// API has the following contract:
+// Make a synchronous RPC to the "classic" Meteor Software deploy API. The
+// deploy API has the following contract:
 //
 // - Parameters are always sent in the query string.
 // - A tarball can be sent in the body (when deploying an app).
@@ -27,13 +47,17 @@ const CAPABILITIES = ['showDeployMessages', 'canTransferAuthorization'];
 //   provide a human-readable error message in the body.
 // - URLs are of the form "/[operation]/[site]".
 // - Body encodings are always utf8.
-// - Meteor Accounts auth is possible using first-party MDG cookies
+// - Meteor Accounts auth is possible using first-party Meteor Software cookies
 //   (rather than OAuth).
 //
 // Options include:
 // - method: GET, POST, or DELETE. default GET
-// - operation: "info", "logs", "mongo", "deploy", "authorized-apps"
-// - site: site name
+// - operation: "info", "logs", "mongo", "deploy", "authorized-apps",
+//   "version-status"
+// - site: site name. Pass this even if the site isn't part of the URL
+//   so that Galaxy discovery works properly
+// - operand: the part of the URL after the operation. If not set,
+//   defaults to site
 // - expectPayload: an array of key names. if present, then we expect
 //   the server to return JSON content on success and to return an
 //   object with all of these key names.
@@ -58,27 +82,50 @@ const CAPABILITIES = ['showDeployMessages', 'canTransferAuthorization'];
 //   derived from either a transport-level exception, the response
 //   body, or a generic 'try again later' message, as appropriate
 
-var deployRpc = function (options) {
-  var genericError = "Server error (please try again later)";
-
-  options = _.clone(options);
-  options.headers = _.clone(options.headers || {});
+async function deployRpc(options) {
+  options = Object.assign({}, options);
+  options.headers = Object.assign({}, options.headers || {});
   if (options.headers.cookie) {
     throw new Error("sorry, can't combine cookie headers yet");
   }
-  options.qs = _.extend({}, options.qs, {capabilities: CAPABILITIES});
+  options.qs = Object.assign(
+    {},
+    options.qs,
+    { capabilities: CAPABILITIES.slice() },
+    options.deployWithTokenProps || {}
+  );
+  // If we are waiting for deploy, we let Galaxy know so it can
+  // use that information to send us the right deploy message response.
+  if (options.waitForDeploy) {
+    options.qs.capabilities.push('willPollVersionStatus');
+  }
 
-  const deployURLBase = getDeployURL(options.site).await();
+  let deployURLBase;
+  try {
+    deployURLBase = await getDeployURL(options.site);
+  } catch (e) {
+    return {
+      statusCode: null,
+      errorMessage: e.message
+    };
+  }
 
   if (options.printDeployURL) {
     Console.info("Talking to Galaxy servers at " + deployURLBase);
   }
 
+  let operand = '';
+  if (options.operand) {
+    operand = `/${options.operand}`;
+  } else if (options.site) {
+    operand = `/${options.site}`;
+  }
+
   // XXX: Reintroduce progress for upload
   try {
-    var result = httpHelpers.request(_.extend(options, {
+    var result = await request(Object.assign(options, {
       url: deployURLBase + '/' + options.operation +
-        (options.site ? ('/' + options.site) : ''),
+        operand,
       method: options.method || 'GET',
       bodyStream: options.bodyStream,
       useAuthHeader: true,
@@ -96,7 +143,12 @@ var deployRpc = function (options) {
   var ret = { statusCode: response.statusCode };
 
   if (response.statusCode !== 200) {
-    ret.errorMessage = body.length > 0 ? body : genericError;
+    if (body.length > 0) {
+      ret.errorMessage = body;
+    } else {
+      ret.errorMessage = "Server error " + response.statusCode +
+        " (please try again later)";
+    }
     return ret;
   }
 
@@ -105,25 +157,28 @@ var deployRpc = function (options) {
     try {
       ret.payload = JSON.parse(body);
     } catch (e) {
-      ret.errorMessage = genericError;
+      ret.errorMessage =
+        "Server error (please try again later)\n"
+        + "Invalid JSON: " + body;
       return ret;
     }
   } else if (contentType === "text/plain; charset=utf-8") {
     ret.message = body;
   }
 
-  var hasAllExpectedKeys = _.all(_.map(
-    options.expectPayload || [], function (key) {
-      return ret.payload && _.has(ret.payload, key);
-    }));
+  const hasAllExpectedKeys =
+    (options.expectPayload || [])
+      .map(key => ret.payload && hasOwn.call(ret.payload, key))
+      .every(x => x);
 
-  if ((options.expectPayload && ! _.has(ret, 'payload')) ||
-      (options.expectMessage && ! _.has(ret, 'message')) ||
+  if ((options.expectPayload && ! hasOwn.call(ret, 'payload')) ||
+      (options.expectMessage && ! hasOwn.call(ret, 'message')) ||
       ! hasAllExpectedKeys) {
     delete ret.payload;
     delete ret.message;
 
-    ret.errorMessage = genericError;
+    ret.errorMessage = "Server error (please try again later)\n" +
+      "Response missing expected keys.";
   }
 
   return ret;
@@ -146,25 +201,35 @@ var deployRpc = function (options) {
 //   accounts server but our authentication actually fails, then prompt
 //   the user to log in with a username and password and then resend the
 //   RPC.
-var authedRpc = function (options) {
-  var rpcOptions = _.clone(options);
+async function authedRpc(options) {
+  var rpcOptions = Object.assign({}, options);
   var preflight = rpcOptions.preflight;
   delete rpcOptions.preflight;
 
   // Fetch auth info
-  var infoResult = deployRpc({
+  var infoResult = await deployRpc({
     operation: 'info',
     site: rpcOptions.site,
     expectPayload: [],
     qs: options.qs,
-    printDeployURL: options.printDeployURL
+    printDeployURL: options.printDeployURL,
+    waitForDeploy: options.waitForDeploy,
   });
   delete rpcOptions.printDeployURL;
 
   if (infoResult.statusCode === 401 && rpcOptions.promptIfAuthFails) {
+    Console.error("Authentication failed or login token expired.");
+
+    if (!Console.isInteractive()) {
+      return {
+        statusCode: 401,
+        errorMessage: "login failed."
+      };
+    }
+
     // Our authentication didn't validate, so prompt the user to log in
     // again, and resend the RPC if the login succeeds.
-    var username = Console.readLine({
+    var username = await Console.readLine({
       prompt: "Username: ",
       stream: process.stderr
     });
@@ -172,8 +237,8 @@ var authedRpc = function (options) {
       username: username,
       suppressErrorMessage: true
     };
-    if (auth.doInteractivePasswordLogin(loginOptions)) {
-      return authedRpc(options);
+    if (await doInteractivePasswordLogin(loginOptions)) {
+      return await authedRpc(options);
     } else {
       return {
         statusCode: 403,
@@ -184,7 +249,7 @@ var authedRpc = function (options) {
 
   if (infoResult.statusCode === 404) {
     // Doesn't exist, therefore not protected.
-    return preflight ? { } : deployRpc(rpcOptions);
+    return preflight ? { } : await deployRpc(rpcOptions);
   }
 
   if (infoResult.errorMessage) {
@@ -192,45 +257,15 @@ var authedRpc = function (options) {
   }
   var info = infoResult.payload;
 
-  if (! _.has(info, 'protection')) {
+  if (! hasOwn.call(info, 'protection')) {
     // Not protected.
     //
     // XXX should prompt the user to claim the app (only if deploying?)
-    return preflight ? { } : deployRpc(rpcOptions);
-  }
-
-  if (info.protection === "password") {
-    if (preflight) {
-      return { protection: info.protection };
-    }
-    // Password protected. Read a password, hash it, and include the
-    // hashed password as a query parameter when doing the RPC.
-    var password;
-    password = Console.readLine({
-      echo: false,
-      prompt: "Password: ",
-      stream: process.stderr
-    });
-
-    // Hash the password so we never send plaintext over the
-    // wire. Doesn't actually make us more secure, but it means we
-    // won't leak a user's password, which they might use on other
-    // sites too.
-    var crypto = require('crypto');
-    var hash = crypto.createHash('sha1');
-    hash.update('S3krit Salt!');
-    hash.update(password);
-    password = hash.digest('hex');
-
-    rpcOptions = _.clone(rpcOptions);
-    rpcOptions.qs = _.clone(rpcOptions.qs || {});
-    rpcOptions.qs.password = password;
-
-    return deployRpc(rpcOptions);
+    return preflight ? { } : await deployRpc(rpcOptions);
   }
 
   if (info.protection === "account") {
-    if (! _.has(info, 'authorized')) {
+    if (! hasOwn.call(info, 'authorized')) {
       // Absence of this implies that we are not an authorized user on
       // this app
       if (preflight) {
@@ -238,7 +273,7 @@ var authedRpc = function (options) {
       } else {
         return {
           statusCode: null,
-          errorMessage: auth.isLoggedIn() ?
+          errorMessage: isLoggedIn() ?
             // XXX better error message (probably need to break out of
             // the 'errorMessage printed with brief prefix' pattern)
             "Not an authorized user on this site" :
@@ -254,7 +289,7 @@ var authedRpc = function (options) {
         authorized: info.authorized
       };
     } else {
-      return deployRpc(rpcOptions);
+      return await deployRpc(rpcOptions);
     }
   }
 
@@ -264,26 +299,11 @@ var authedRpc = function (options) {
   };
 };
 
-// When the user is trying to do something with a legacy
-// password-protected app, instruct them to claim it with 'meteor
-// claim'.
-var printLegacyPasswordMessage = function (site) {
-  Console.error(
-    "\nThis site was deployed with an old version of Meteor that used " +
-    "site passwords instead of user accounts. Now we have a much better " +
-    "system, Meteor developer accounts.");
-  Console.error();
-  Console.error("If this is your site, please claim it into your account with");
-  Console.error(
-    Console.command("meteor claim " + site),
-    Console.options({ indent: 2 }));
-};
-
 // When the user is trying to do something with an app that they are not
 // authorized for, instruct them to get added via 'meteor authorized
 // --add' or switch accounts.
-var printUnauthorizedMessage = function () {
-  var username = auth.loggedInUsername();
+function printUnauthorizedMessage() {
+  var username = loggedInUsername();
   Console.error("Sorry, that site belongs to a different user.");
   if (username) {
     Console.error("You are currently logged in as " + username + ".");
@@ -300,7 +320,7 @@ var printUnauthorizedMessage = function () {
 // syntactically good, canonicalize it (this essentially means
 // stripping 'http://' or a trailing '/' if present) and return it. If
 // not, print an error message to stderr and return null.
-var canonicalizeSite = function (site) {
+function canonicalizeSite(site) {
   // There are actually two different bugs here. One is that the meteor deploy
   // server does not support apps whose total site length is greater than 63
   // (because of how it generates Mongo database names); that can be fixed on
@@ -321,16 +341,19 @@ var canonicalizeSite = function (site) {
     url = 'http://' + url;
   }
 
-  var parsed = require('url').parse(url);
+  let parsed = null;
+  try {
+    parsed = new URL(url);
+  } catch (e) {}
 
-  if (! parsed.hostname) {
+  if (! parsed || ! parsed.hostname) {
     Console.info(
       "Please specify a domain to connect to, such as www.example.com or " +
       "http://www.example.com/");
     return false;
   }
 
-  if (parsed.pathname != '/' || parsed.hash || parsed.query) {
+  if (parsed.pathname !== '/' || parsed.hash || parsed.search) {
     Console.info(
       "Sorry, Meteor does not yet support specific path URLs, such as " +
       Console.url("http://www.example.com/blog") + " .  Please specify the root of a domain.");
@@ -339,6 +362,114 @@ var canonicalizeSite = function (site) {
 
   return parsed.hostname;
 };
+
+// Executes the poll to check for deployment success and outputs proper messages
+// to user about the status of their app during the polling process
+async function pollForDeploymentSuccess(versionId, deployPollTimeout, result, site, deployWithTokenProps) {
+  // Create a default polling configuration for polling for deploy / build
+  // In the future, we may change this to be user-configurable or smart
+  // The user can only currently configure the polling timeout via a flag
+  const pollingState = new PollingState(deployPollTimeout);
+  await sleepForMilliseconds(pollingState.initialWaitTimeMs);
+  const deploymentPollResult = await pollForDeploy(pollingState, versionId, site, deployWithTokenProps);
+  if (deploymentPollResult && deploymentPollResult.isActive) {
+    return 0;
+  }
+  return 1;
+}
+
+// Creates a polling configuration with defaults if fields left unset
+// Right now we only use the default unless timeout is specified
+// We envision potentially creating this configuration object in a programmatic
+// way or via user-specification in the future.
+// Default initialWaitTime is 10 seconds – this is the time to wait before checking at all
+// Default pollInterval is 700 milliseconds – this is the wait interval between polls
+// Default timeout is 15 minutes
+// `start` tracks the time when we started polling
+// `currentMessage` tracks what the current status message is for this version
+class PollingState {
+  constructor(timeoutMs,
+    initialWaitTimeMs,
+    pollIntervalMs,
+    maxErrors) {
+      const FIFTEEN_MINUTES_MS = 15*60*1000;
+      const MAX_ERRORS = 5;
+      this.initialWaitTimeMs = initialWaitTimeMs || 10*1000;
+      this.pollIntervalMs = pollIntervalMs || 700;
+      this.deadline = timeoutMs ? new Date(new Date().getTime() + timeoutMs) :
+        new Date(new Date().getTime() + FIFTEEN_MINUTES_MS);
+      this.start = new Date();
+      this.currentMessage = '';
+      this.errors = 0;
+      this.maxErrors = maxErrors || MAX_ERRORS;
+  }
+}
+
+// Poll the "version-status" endpoint for the build and deploy status
+// of a specified version ID with a polling configuration.
+// This will only end successfully when the polling endpoint reports that
+// the version deployment is finished. The version-status endpoints will report
+// messages pertaining to the status of the version, which will then be reported
+// directly to the user. When the poll is complete, it will return an object
+// with information about the final state of the version and the app.
+async function pollForDeploy(pollingState, versionId, site, deployWithTokenProps) {
+  const {
+    deadline,
+    pollIntervalMs,
+    currentMessage,
+  } = pollingState;
+
+  // Do a call to the version-status endpoint for the specified versionId
+  const versionStatusResult = await deployRpc({
+    method: 'GET',
+    operation: 'version-status',
+    site,
+    operand: versionId,
+    expectPayload: ['message', 'finishStatus'],
+    printDeployURL: false,
+    deployWithTokenProps
+  });
+
+  // Check the details of the Version Status response and compare message to last call
+  if (versionStatusResult &&
+    versionStatusResult.payload &&
+    versionStatusResult.payload.message) {
+      const message = versionStatusResult.payload.message;
+      if (currentMessage !== message) {
+        Console.info(message);
+        pollingState.currentMessage = message;
+      }
+  } else {
+    // If we did not get a valid Version Status response, just fail silently and
+    // keep polling as per usual – this may have just been a whiff from Galaxy.
+    // We do the retry here because we might hit an error if we try to parse the
+    // result of the version-status call below.
+    pollingState.errors++;
+    const errorMessage = versionStatusResult.errorMessage || 'Unexpected error from Galaxy';
+    if (pollingState.errors >= pollingState.maxErrors) {
+      Console.error(`Error checking deploy status; giving up: ${errorMessage}`);
+      return 1;
+    } else if (new Date() < deadline) {
+      Console.warn(`Error checking deploy status; will retry: ${errorMessage}`);
+      await sleepForMilliseconds(pollIntervalMs);
+      return await pollForDeploy(pollingState, versionId, site, deployWithTokenProps);
+    }
+  }
+
+  const finishStatus = versionStatusResult.payload.finishStatus;
+  // Poll again if version isn't finished and we haven't exceeded the timeout
+  if(new Date() < deadline && !finishStatus.isFinished) {
+    // Wait for a set interval and then poll again
+    await sleepForMilliseconds(pollIntervalMs);
+    return await pollForDeploy(pollingState, versionId, site, deployWithTokenProps);
+  } else if (!finishStatus.isFinished) {
+    Console.info(`Polling timed out. To check the status of your app, visit
+    ${versionStatusResult.payload.galaxyUrl}. To wait longer, pass a timeout
+    in milliseconds to the '--deploy-polling-timeout' option of 'meteor deploy'.`);
+  }
+  return finishStatus;
+}
+
 
 // Run the bundler and deploy the result. Print progress
 // messages. Return a command exit code.
@@ -353,83 +484,148 @@ var canonicalizeSite = function (site) {
 //   stats server.
 // - buildOptions: the 'buildOptions' argument to the bundler
 // - rawOptions: any unknown options that were passed to the command line tool
-var bundleAndDeploy = function (options) {
+// - waitForDeploy: whether to poll Galaxy after upload for deploy status
+// - isCacheBuildEnabled: Reuses the build already created if the git commit
+//   hash is the same
+// - deployPollingTimeoutMs: user overridden timeout for polling Galaxy
+//   for deploy status
+export async function bundleAndDeploy(options) {
   if (options.recordPackageUsage === undefined) {
     options.recordPackageUsage = true;
   }
 
-  var site = canonicalizeSite(options.site);
-  if (! site) {
-    return 1;
+  // we don't need site for build-only
+  let site = null;
+  let preflightPassword = null;
+
+  if (options.isBuildOnly) {
+    Console.info('Skipping pre authentication as the option --build-only was provided.');
+  } else {
+    site = options.site && canonicalizeSite(options.site)
+    if (! site) {
+      Console.error("Error deploying application: site is required.");
+      Console.error("Your deploy command should be like: meteor deploy <site>");
+      Console.error(
+        "For more help, see " + Console.command("'meteor deploy --help'") + ".");
+      return 1;
+    }
+
+    // We should give a username/password prompt if the user was logged in
+    // but the credentials are expired, unless the user is logged in but
+    // doesn't have a username (in which case they should hit the email
+    // prompt -- a user without a username shouldn't be given a username
+    // prompt). There's an edge case where things happen in the following
+    // order: user creates account, user sets username, credential expires
+    // or is revoked, user comes back to deploy again. In that case,
+    // they'll get an email prompt instead of a username prompt because
+    // the command-line tool didn't have time to learn about their
+    // username before the credential was expired.
+    await pollForRegistrationCompletion({
+      noLogout: true
+    });
+    const promptIfAuthFails = (loggedInUsername() !== null);
+
+    // Check auth up front, rather than after the (potentially lengthy)
+    // bundling process.
+    const preflight = await authedRpc({
+      site: site,
+      preflight: true,
+      promptIfAuthFails: promptIfAuthFails,
+      qs: Object.assign(
+        {},
+        options.rawOptions,
+        {
+          deployToken: options.deployToken,
+          owner: options.owner,
+        }
+      ),
+      printDeployURL: true
+    });
+
+    if (preflight.errorMessage) {
+      Console.error("Error deploying application: " + preflight.errorMessage);
+      return 1;
+    }
+
+    if (preflight.protection === "account" &&
+      !preflight.authorized) {
+      printUnauthorizedMessage();
+      return 1;
+    }
+
+    preflightPassword = preflight.preflightPassword;
   }
 
-  // We should give a username/password prompt if the user was logged in
-  // but the credentials are expired, unless the user is logged in but
-  // doesn't have a username (in which case they should hit the email
-  // prompt -- a user without a username shouldn't be given a username
-  // prompt). There's an edge case where things happen in the following
-  // order: user creates account, user sets username, credential expires
-  // or is revoked, user comes back to deploy again. In that case,
-  // they'll get an email prompt instead of a username prompt because
-  // the command-line tool didn't have time to learn about their
-  // username before the credential was expired.
-  auth.pollForRegistrationCompletion({
-    noLogout: true
-  });
-  var promptIfAuthFails = (auth.loggedInUsername() !== null);
+  const projectDir = options.projectContext.getProjectLocalDirectory('');
+  const gitCommitHash = process.env.METEOR_GIT_COMMIT_HASH || await findGitCommitHash(projectDir);
 
-  // Check auth up front, rather than after the (potentially lengthy)
-  // bundling process.
-  var preflight = authedRpc({
-    site: site,
-    preflight: true,
-    promptIfAuthFails: promptIfAuthFails,
-    qs: options.rawOptions,
-    printDeployURL: true
-  });
-
-  if (preflight.errorMessage) {
-    Console.error("Error deploying application: " + preflight.errorMessage);
-    return 1;
+  const buildCache = options.projectContext.getBuildCache();
+  let isCacheBuildValid = options.isCacheBuildEnabled;
+  if (options.isCacheBuildEnabled) {
+    if (!buildCache ||
+      !exists(buildCache.buildDir) ||
+      !exists(buildCache.bundlePath) ||
+      !buildCache.gitCommitHash ||
+      !gitCommitHash ||
+      buildCache.gitCommitHash !== gitCommitHash) {
+      Console.warn(`We don't have a valid build cache so a new build will be performed.`);
+      isCacheBuildValid = false;
+    }
   }
 
-  if (preflight.protection === "password") {
-    printLegacyPasswordMessage(site);
-    Console.error("If it's not your site, please try a different name!");
-    return 1;
+  function getBuildDirAndBundlePath() {
+    if (isCacheBuildValid) {
+      return buildCache;
+    }
 
-  } else if (preflight.protection === "account" &&
-             ! preflight.authorized) {
-    printUnauthorizedMessage();
-    return 1;
+    const buildDir = mkdtemp('build_tar');
+    if (options.isCacheBuildEnabled) {
+      changeTempDirStatus(buildDir, false);
+      Console.info(`The --cache-build was used so the build folder (${buildDir}) will not be deleted on exit...`);
+    }
+    const bundlePath = pathJoin(buildDir, 'bundle');
+    return { buildDir, bundlePath };
   }
 
-  var buildDir = files.mkdtemp('build_tar');
-  var bundlePath = files.pathJoin(buildDir, 'bundle');
+  const {buildDir, bundlePath} = getBuildDirAndBundlePath();
 
-  Console.info('Deploying your app...');
+  if (options.isCacheBuildEnabled) {
+    Console.info('Saving build in cache (--cache-build)...');
+    await options.projectContext.saveBuildCache({
+      buildDir,
+      bundlePath,
+      gitCommitHash
+    });
+  }
+
+  Console.info('Preparing to build your app...');
 
   var settings = null;
-  var messages = buildmessage.capture({
+  var messages = await buildmessage.capture({
     title: "preparing to deploy",
     rootPath: process.cwd()
-  }, function () {
+  }, async function () {
     if (options.settingsFile) {
-      settings = files.getSettings(options.settingsFile);
+      settings = getSettings(options.settingsFile);
     }
   });
 
   if (! messages.hasMessages()) {
-    var bundler = require('../isobuild/bundler.js');
 
-    var bundleResult = bundler.bundle({
-      projectContext: options.projectContext,
-      outputPath: bundlePath,
-      buildOptions: options.buildOptions,
-    });
+    if(isCacheBuildValid) {
+      Console.info('Skipping build (--cache-build)...');
+    } else {
+      const bundler = require('../isobuild/bundler.js');
 
-    if (bundleResult.errors) {
-      messages = bundleResult.errors;
+      const bundleResult = await bundler.bundle({
+        projectContext: options.projectContext,
+        outputPath: bundlePath,
+        buildOptions: options.buildOptions,
+      });
+
+      if (bundleResult.errors) {
+        messages = bundleResult.errors;
+      }
     }
   }
 
@@ -440,69 +636,89 @@ var bundleAndDeploy = function (options) {
   }
 
   if (options.recordPackageUsage) {
-    stats.recordPackages({
+    await recordPackages({
       what: "sdk.deploy",
       projectContext: options.projectContext,
       site: site
     });
   }
 
-  var result = buildmessage.enterJob({ title: "uploading" }, function () {
-    return authedRpc({
+  if (options.isBuildOnly) {
+    Console.info(
+      '\nYour build is ready. As you used the option --build-only the process finished after the build.'
+    );
+    return 0;
+  }
+
+  const deployWithTokenProps = {
+    deployToken: options.deployToken,
+    owner: options.owner
+  };
+
+  Console.info('Preparing to upload your app...');
+  const result = await buildmessage.enterJob({
+    title: "uploading"
+  }, Profile("upload bundle", async function () {
+    return await authedRpc({
       method: 'POST',
       operation: 'deploy',
       site: site,
-      qs: _.extend({}, options.rawOptions, settings !== null ? {settings: settings} : {}),
-      bodyStream: files.createTarGzStream(files.pathJoin(buildDir, 'bundle')),
+      qs: Object.assign(
+        {},
+        options.rawOptions,
+        settings !== null ? {settings: settings} : {},
+        {
+          free: options.free,
+          plan: options.plan,
+          containerSize: options.containerSize,
+          mongo: options.mongo,
+          ...deployWithTokenProps,
+        },
+      ),
+      bodyStream: createTarGzStream(pathJoin(buildDir, 'bundle')),
       expectPayload: ['url'],
-      preflightPassword: preflight.preflightPassword,
+      preflightPassword,
       // Disable the HTTP timeout for this POST request.
       timeout: null,
+      waitForDeploy: options.waitForDeploy,
     });
-  });
+  }));
 
   if (result.errorMessage) {
     Console.error("\nError deploying application: " + result.errorMessage);
     return 1;
   }
 
+  // This will allow Galaxy to report messages to users ad-hoc
+  // Also if we are using the --no-wait flag, this will contain the message
+  // that Galaxy used to send after upload success.
   if (result.payload.message) {
     Console.info(result.payload.message);
-  } else {
-    var deployedAt = require('url').parse(result.payload.url);
-    var hostname = deployedAt.hostname;
-
-    Console.info('Now serving at http://' + hostname);
-
-    if (! hostname.match(/meteor\.com$/)) {
-      var dns = require('dns');
-      dns.resolve(hostname, 'CNAME', function (err, cnames) {
-        if (err || cnames[0] !== 'origin.meteor.com') {
-          dns.resolve(hostname, 'A', function (err, addresses) {
-            if (err || addresses[0] !== '107.22.210.133') {
-              Console.info('-------------');
-              Console.info(
-                "You've deployed to a custom domain.",
-                "Please be sure to CNAME your hostname",
-                "to origin.meteor.com, or set an A record to 107.22.210.133.");
-              Console.info('-------------');
-            }
-          });
-        }
-      });
-    }
   }
 
+  // After an upload succeeds, we want to poll Galaxy to see if the
+  // build / deploy succeed. We indicate that Meteor should poll for version
+  // status by including a newVersionId in the payload.
+  if (options.waitForDeploy && result.payload.newVersionId) {
+    Console.info('Waiting for deployment updates from Galaxy...');
+    return await pollForDeploymentSuccess(
+      result.payload.newVersionId,
+      options.deployPollingTimeoutMs,
+      result,
+      site,
+      deployWithTokenProps,
+    );
+  }
   return 0;
 };
 
-var deleteApp = function (site) {
+export async function deleteApp(site) {
   site = canonicalizeSite(site);
   if (! site) {
     return 1;
   }
 
-  var result = authedRpc({
+  var result = await authedRpc({
     method: 'DELETE',
     operation: 'deploy',
     site: site,
@@ -527,8 +743,8 @@ var deleteApp = function (site) {
 // messages.  Returns the result of the RPC if successful, or null
 // otherwise (including if auth failed or if the user is not authorized
 // for this site).
-var checkAuthThenSendRpc = function (site, operation, what) {
-  var preflight = authedRpc({
+async function checkAuthThenSendRpc(site, operation, what) {
+  var preflight = await authedRpc({
     operation: operation,
     site: site,
     preflight: true,
@@ -541,15 +757,12 @@ var checkAuthThenSendRpc = function (site, operation, what) {
     return null;
   }
 
-  if (preflight.protection === "password") {
-    printLegacyPasswordMessage(site);
-    return null;
-  } else if (preflight.protection === "account" &&
+  if (preflight.protection === "account" &&
              ! preflight.authorized) {
-    if (! auth.isLoggedIn()) {
+    if (! isLoggedIn()) {
       // Maybe the user is authorized for this app but not logged in
       // yet, so give them a login prompt.
-      var loginResult = auth.doUsernamePasswordLogin({ retry: true });
+      var loginResult = await doUsernamePasswordLogin({ retry: true });
       if (loginResult) {
         // Once we've logged in, retry the whole operation. We need to
         // do the preflight request again instead of immediately moving
@@ -557,7 +770,7 @@ var checkAuthThenSendRpc = function (site, operation, what) {
         // logged-in user is authorized for this app, and if they
         // aren't, then we want to print the nice unauthorized error
         // message.
-        return checkAuthThenSendRpc(site, operation, what);
+        return await checkAuthThenSendRpc(site, operation, what);
       } else {
         // Shouldn't ever get here because we set the retry flag on the
         // login, but just in case.
@@ -579,7 +792,7 @@ var checkAuthThenSendRpc = function (site, operation, what) {
 
   // User is authorized for the app; go ahead and do the actual RPC.
 
-  var result = authedRpc({
+  var result = await authedRpc({
     operation: operation,
     site: site,
     expectMessage: true,
@@ -597,14 +810,14 @@ var checkAuthThenSendRpc = function (site, operation, what) {
 // On failure, prints a message to stderr and returns null. Otherwise,
 // returns a temporary authenticated Mongo URL allowing access to this
 // site's database.
-var temporaryMongoUrl = function (site) {
+export async function temporaryMongoUrl(site) {
   site = canonicalizeSite(site);
   if (! site) {
     // canonicalizeSite printed an error
     return null;
   }
 
-  var result = checkAuthThenSendRpc(site, 'mongo', 'open a mongo connection');
+  var result = await checkAuthThenSendRpc(site, 'mongo', 'open a mongo connection');
 
   if (result !== null) {
     return result.message;
@@ -613,30 +826,13 @@ var temporaryMongoUrl = function (site) {
   }
 };
 
-var logs = function (site) {
+export async function listAuthorized(site) {
   site = canonicalizeSite(site);
   if (! site) {
     return 1;
   }
 
-  var result = checkAuthThenSendRpc(site, 'logs', 'view logs');
-
-  if (result === null) {
-    return 1;
-  } else {
-    Console.info(result.message);
-    auth.maybePrintRegistrationLink({ leadingNewline: true });
-    return 0;
-  }
-};
-
-var listAuthorized = function (site) {
-  site = canonicalizeSite(site);
-  if (! site) {
-    return 1;
-  }
-
-  var result = deployRpc({
+  var result = await deployRpc({
     operation: 'info',
     site: site,
     expectPayload: [],
@@ -648,25 +844,20 @@ var listAuthorized = function (site) {
   }
   var info = result.payload;
 
-  if (! _.has(info, 'protection')) {
+  if (! hasOwn.call(info, 'protection')) {
     Console.info("<anyone>");
     return 0;
   }
 
-  if (info.protection === "password") {
-    Console.info("<password>");
-    return 0;
-  }
-
   if (info.protection === "account") {
-    if (! _.has(info, 'authorized')) {
+    if (! hasOwn.call(info, 'authorized')) {
       Console.error("Couldn't get authorized users list: " +
                     "You are not authorized");
       return 1;
     }
 
-    Console.info((auth.loggedInUsername() || "<you>"));
-    _.each(info.authorized, function (username) {
+    Console.info((loggedInUsername() || "<you>"));
+    info.authorized.forEach(username => {
       if (username) {
         // Current username rules don't let you register anything that we might
         // want to split over multiple lines (ex: containing a space), but we
@@ -679,14 +870,14 @@ var listAuthorized = function (site) {
 };
 
 // action is "add", "transfer" or "remove"
-var changeAuthorized = function (site, action, username) {
+export async function changeAuthorized(site, action, username) {
   site = canonicalizeSite(site);
   if (! site) {
     // canonicalizeSite will have already printed an error
     return 1;
   }
 
-  var result = authedRpc({
+  var result = await authedRpc({
     method: 'POST',
     operation: 'authorized',
     site: site,
@@ -701,98 +892,16 @@ var changeAuthorized = function (site, action, username) {
   }
 
   const verbs = {
-    add: "added",
-    remove: "removed",
-    transfer: "transferred"
+    add: "added to",
+    remove: "removed from",
+    transfer: "transferred to"
   };
   Console.info(`${site}: ${verbs[action]} ${username}`);
   return 0;
 };
 
-var claim = function (site) {
-  site = canonicalizeSite(site);
-  if (! site) {
-    // canonicalizeSite will have already printed an error
-    return 1;
-  }
-
-  // Check to see if it's even a claimable site, so that we can print
-  // a more appropriate message than we'd get if we called authedRpc
-  // straight away (at a cost of an extra REST call)
-  var infoResult = deployRpc({
-    operation: 'info',
-    site: site,
-    printDeployURL: true
-  });
-  if (infoResult.statusCode === 404) {
-    Console.error(
-      "There isn't a site deployed at that address. Use " +
-      Console.command("'meteor deploy'") + " " +
-      "if you'd like to deploy your app here.");
-    return 1;
-  }
-
-  if (infoResult.payload && infoResult.payload.protection === "account") {
-    if (infoResult.payload.authorized) {
-      Console.error("That site already belongs to you.\n");
-    } else {
-      Console.error("Sorry, that site belongs to someone else.\n");
-    }
-    return 1;
-  }
-
-  if (infoResult.payload &&
-      infoResult.payload.protection === "password") {
-    Console.info(
-      "To claim this site and transfer it to your account, enter the",
-      "site password one last time.");
-    Console.info();
-  }
-
-  var result = authedRpc({
-    method: 'POST',
-    operation: 'claim',
-    site: site,
-    promptIfAuthFails: true
-  });
-
-  if (result.errorMessage) {
-    auth.pollForRegistrationCompletion();
-    if (! auth.loggedInUsername() &&
-        auth.registrationUrl()) {
-      Console.error(
-        "You need to set a password on your Meteor developer account before",
-        "you can claim sites. You can do that here in under a minute:");
-      Console.error(Console.url(auth.registrationUrl()));
-      Console.error();
-    } else {
-      Console.error("Couldn't claim site: " + result.errorMessage);
-    }
-    return 1;
-  }
-
-  Console.info(site + ": " + "successfully transferred to your account.");
-  Console.info();
-  Console.info("Show authorized users with:");
-  Console.info(
-    Console.command("meteor authorized " + site),
-    Console.options({ indent: 2 }));
-  Console.info();
-  Console.info("Add authorized users with:");
-  Console.info(
-    Console.command("meteor authorized " + site + " --add <username>"),
-    Console.options({ indent: 2 }));
-  Console.info();
-  Console.info("Remove authorized users with:");
-  Console.info(
-    Console.command("meteor authorized " + site + " --remove <username>"),
-    Console.options({ indent: 2 }));
-  Console.info();
-  return 0;
-};
-
-var listSites = function () {
-  var result = deployRpc({
+export async function listSites() {
+  var result = await deployRpc({
     method: "GET",
     operation: "authorized-apps",
     promptIfAuthFails: true,
@@ -809,10 +918,9 @@ var listSites = function () {
       ! result.payload.sites.length) {
     Console.info("You don't have any sites yet.");
   } else {
-    result.payload.sites.sort();
-    _.each(result.payload.sites, function (site) {
-      Console.info(site);
-    });
+    result.payload.sites
+      .sort()
+      .forEach(site => Console.info(site));
   }
   return 0;
 };
@@ -829,23 +937,44 @@ function addScheme(hostOrURL) {
   }
 };
 
-// Maps from "site" to Promise<deploy URL>, so we don't have to re-ping on each
-// RPC (even if the calls to getDeployURL overlap).
-const galaxyDiscoveryCache = new Map;
+// Discovery may select only Galaxy hosts: deploy RPCs carry the account token.
+const DEFAULT_DEPLOY_URL = "https://us-east-1.galaxy-deploy.meteor.com";
+const GALAXY_DEPLOY_DOMAIN = "galaxy-deploy.meteor.com";
 
-// getDeployURL returns the a Promise for the base deploy URL for the given app.
-// "app" may be falsey for certain RPCs (eg meteor list-sites).
-function getDeployURL(site) {
-  // Always trust explicitly configuration via env.
-  if (process.env.DEPLOY_HOSTNAME) {
-    return Promise.resolve(addScheme(process.env.DEPLOY_HOSTNAME));
+export function trustedGalaxyDeployURL(deployURL) {
+  if (typeof deployURL !== "string") {
+    return null;
   }
 
-  const defaultURL = "https://us-east-1.galaxy-deploy.meteor.com";
+  let parsed;
+  try {
+    parsed = new URL(deployURL);
+  } catch (e) {
+    return null;
+  }
+
+  if (parsed.protocol !== "https:" ||
+      parsed.username || parsed.password || parsed.port ||
+      ! (parsed.hostname === GALAXY_DEPLOY_DOMAIN ||
+         parsed.hostname.endsWith("." + GALAXY_DEPLOY_DOMAIN))) {
+    return null;
+  }
+
+  return parsed.origin + (parsed.pathname === "/" ? "" : parsed.pathname);
+}
+
+const galaxyDiscoveryCache = new Map;
+
+// "app" may be falsey for certain RPCs (eg meteor list-sites).
+async function getDeployURL(site) {
+  // Always trust explicitly configuration via env.
+  if (process.env.DEPLOY_HOSTNAME) {
+    return Promise.resolve(addScheme(process.env.DEPLOY_HOSTNAME.trim()));
+  }
 
   // No site? Just use the default.
   if (!site) {
-    return Promise.resolve(defaultURL);
+    return Promise.resolve(DEFAULT_DEPLOY_URL);
   }
 
   // If we have a site, we can try to do Galaxy discovery.
@@ -855,22 +984,39 @@ function getDeployURL(site) {
     return galaxyDiscoveryCache.get(site);
   }
 
-  // Otherwise, try https first, then http, then just use the default.
-  const p = discoverGalaxy(site, "https")
-          .catch(() => discoverGalaxy(site, "http"))
-          .catch(() => defaultURL);
-  galaxyDiscoveryCache.set(site, p);
-  return p;
+  // Otherwise, try https, then http, then just use the default. Galaxy only
+  // answers over http for sites without a certificate yet, such as a new
+  // app's first deploy outside us-east-1. Whoever answers discovery chooses
+  // where the account token goes, so either answer must name a Galaxy deploy
+  // server below.
+  let discoveredURL;
+  try {
+    discoveredURL = await discoverGalaxy(site, "https")
+      .catch(() => discoverGalaxy(site, "http"));
+  } catch (e) {
+    galaxyDiscoveryCache.set(site, DEFAULT_DEPLOY_URL);
+    return DEFAULT_DEPLOY_URL;
+  }
+
+  const deployURL = trustedGalaxyDeployURL(discoveredURL);
+  if (! deployURL) {
+    throw new Error(
+      "Galaxy discovery for " + site + " returned " +
+      JSON.stringify(discoveredURL) + ", which is not a Galaxy deploy " +
+      "server (https://*." + GALAXY_DEPLOY_DOMAIN + "). Refusing to send your Meteor credentials there. If " +
+      "you trust this server, set the DEPLOY_HOSTNAME environment variable " +
+      "to it.");
+  }
+
+  galaxyDiscoveryCache.set(site, deployURL);
+  return deployURL;
 }
 
-// discoverGalaxy returns the URL to use for Galaxy discovery, or an error if it
-// couldn't be fetched.
 async function discoverGalaxy(site, scheme) {
-  const discoveryURL =
-          scheme + "://" + site + "/.well-known/meteor/deploy-url";
+  const discoveryURL = scheme + "://" + site + "/.well-known/meteor/deploy-url";
   // If httpHelpers.request throws, the returned Promise will reject, which is
   // fine.
-  const { response, body } = httpHelpers.request({
+  const { response, body } = await request({
     url: discoveryURL,
     json: true,
     strictSSL: true,
@@ -888,17 +1034,8 @@ async function discoverGalaxy(site, scheme) {
     throw new Error(
       "unexpected galaxyDiscoveryVersion: " + body.galaxyDiscoveryVersion);
   }
-  if (!_.has(body, "deployURL")) {
+  if (! hasOwn.call(body, "deployURL")) {
     throw new Error("no deployURL");
   }
   return body.deployURL;
 }
-
-exports.bundleAndDeploy = bundleAndDeploy;
-exports.deleteApp = deleteApp;
-exports.temporaryMongoUrl = temporaryMongoUrl;
-exports.logs = logs;
-exports.listAuthorized = listAuthorized;
-exports.changeAuthorized = changeAuthorized;
-exports.claim = claim;
-exports.listSites = listSites;

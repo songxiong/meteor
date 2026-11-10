@@ -1,20 +1,28 @@
-Tinytest.add("ecmascript - runtime - template literals", (test) => {
-  function dump(pieces) {
-    var copy = {};
-    // Can't use _.extend({}, pieces) because es5-shim adds enumerable
-    // methods to Array.prototype, and _.extend has no own property check.
-    _.each(_.keys(pieces), key => copy[key] = pieces[key]);
-    return [copy, _.toArray(arguments).slice(1)];
-  };
+import { testExport as oyez } from './runtime-tests.js';
+
+Tinytest.add('ecmascript - runtime - template literals', test => {
+  function dump(strings, ...expressions) {
+    const copy = Object.create(null);
+    Object.assign(copy, strings);
+    copy.raw = strings.raw;
+    return [copy, expressions];
+  }
+
   const foo = 'B';
-  // uses `babelHelpers.taggedTemplateLiteralLoose`
+
   test.equal(`\u0041${foo}C`, 'ABC');
-  test.equal(dump`\u0041${foo}C`,
-             [{0:'A', 1: 'C', raw: ['\\u0041', 'C']},
-              ['B']]);
+
+  test.equal(dump`\u0041${foo}C`, [
+    {
+      0: 'A',
+      1: 'C',
+      raw: ['\\u0041', 'C'],
+    },
+    ['B'],
+  ]);
 });
 
-Tinytest.add("ecmascript - runtime - classes - basic", (test) => {
+Tinytest.add('ecmascript - runtime - classes - basic', test => {
   {
     class Foo {
       constructor(x) {
@@ -22,11 +30,12 @@ Tinytest.add("ecmascript - runtime - classes - basic", (test) => {
       }
     }
 
-    test.throws(() => {
-      Foo(); // called without `new`
-    });
+    // Babel 7 no longer forbids constructor calls in loose mode.
+    // test.throws(() => {
+    //   Foo(); // called without `new`
+    // });
 
-    test.equal((new Foo(3)).x, 3);
+    test.equal(new Foo(3).x, 3);
   }
 
   {
@@ -37,13 +46,14 @@ Tinytest.add("ecmascript - runtime - classes - basic", (test) => {
     }
     class Foo extends Bar {}
 
-    test.throws(() => {
-      Foo(); // called without `new`
-    });
+    // Babel 7 no longer forbids constructor calls in loose mode.
+    // test.throws(() => {
+    //   Foo(); // called without `new`
+    // });
 
-    test.equal((new Foo(3)).x, 3);
-    test.isTrue((new Foo(3)) instanceof Foo);
-    test.isTrue((new Foo(3)) instanceof Bar);
+    test.equal(new Foo(3).x, 3);
+    test.isTrue(new Foo(3) instanceof Foo);
+    test.isTrue(new Foo(3) instanceof Bar);
   }
 
   {
@@ -58,11 +68,11 @@ Tinytest.add("ecmascript - runtime - classes - basic", (test) => {
     }
 
     test.equal(Foo.staticMethod(), 'classy');
-    test.equal((new Foo).prototypeMethod(), 'prototypical');
+    test.equal(new Foo().prototypeMethod(), 'prototypical');
   }
 });
 
-Tinytest.add("ecmascript - runtime - classes - use before declare", (test) => {
+Tinytest.add('ecmascript - runtime - classes - use before declare', test => {
   const x = function asdf() {};
   if (typeof asdf === 'function') {
     // We seem to be in IE 8, where function names leak into the enclosing
@@ -78,9 +88,7 @@ Tinytest.add("ecmascript - runtime - classes - use before declare", (test) => {
   });
 });
 
-
-Tinytest.add("ecmascript - runtime - classes - inheritance", (test) => {
-
+Tinytest.add('ecmascript - runtime - classes - inheritance', test => {
   // uses `babelHelpers.inherits`
   {
     class Foo {
@@ -88,7 +96,7 @@ Tinytest.add("ecmascript - runtime - classes - inheritance", (test) => {
         return 1;
       }
     }
-    Foo.static2 = function () {
+    Foo.static2 = function() {
       return 2;
     };
 
@@ -118,12 +126,14 @@ Tinytest.add("ecmascript - runtime - classes - inheritance", (test) => {
   }
 });
 
-Tinytest.add("ecmascript - runtime - classes - computed props", (test) => {
+Tinytest.add('ecmascript - runtime - classes - computed props', test => {
   {
-    const frob = "inc";
+    const frob = 'inc';
 
     class Foo {
-      static [frob](n) { return n+1; }
+      static [frob](n) {
+        return n + 1;
+      }
     }
 
     test.equal(Foo.inc(3), 4);
@@ -135,28 +145,61 @@ if (Meteor.isServer) {
   // in classes on browsers that support them in the first place, and on
   // the server.  (Technically they just need a working
   // Object.defineProperty, found in IE9+ and all modern environments.)
-  Tinytest.add("ecmascript - runtime - classes - getters/setters", (test) => {
-    // uses `babelHelpers.createClass`
+  Tinytest.add('ecmascript - runtime - classes - getters/setters', test => {
     class Foo {
-      get two() { return 1+1; }
-      static get three() { return 1+1+1; }
+      get two() {
+        return 1 + 1;
+      }
+      static get three() {
+        return 1 + 1 + 1;
+      }
     }
 
-    test.equal((new Foo).two, 2);
+    test.equal(new Foo().two, 2);
     test.equal(Foo.three, 3);
   });
 }
 
-Tinytest.add("ecmascript - runtime - block scope", (test) => {
+export const testExport = 'oyez';
+
+Tinytest.add('ecmascript - runtime - classes - properties', test => {
+  class ClassWithProperties {
+    property = ['prop', 'rty'].join('e');
+    static staticProp = 1234;
+
+    check = self => {
+      test.equal(oyez, 'oyez');
+      test.isTrue(self === this);
+      test.equal(this.property, 'property');
+    };
+
+    method() {
+      test.equal(oyez, 'oyez');
+    }
+  }
+
+  test.equal(ClassWithProperties.staticProp, 1234);
+
+  const cwp = new ClassWithProperties();
+
+  cwp.check(cwp);
+
+  // Check binding of arrow function.
+  cwp.check.call(null, cwp);
+
+  cwp.method();
+});
+
+Tinytest.add('ecmascript - runtime - block scope', test => {
   {
     const buf = [];
     const thunks = [];
     function print(x) {
       buf.push(x);
-    };
+    }
     function doLater(f) {
       thunks.push(f);
-    };
+    }
 
     for (let i = 0; i < 3; i++) {
       print(i);
@@ -170,16 +213,20 @@ Tinytest.add("ecmascript - runtime - block scope", (test) => {
       });
     }
 
-    _.each(thunks, f => f());
+    thunks.forEach(f => f());
     test.equal(buf, [0, 1, 2]);
   }
 });
 
-Tinytest.add("ecmascript - runtime - classes - super", (test) => {
+Tinytest.add('ecmascript - runtime - classes - super', test => {
   {
     class Class1 {
-      foo() { return 123; }
-      static bar() { return 1; }
+      foo() {
+        return 123;
+      }
+      static bar() {
+        return 1;
+      }
     }
     class Class2 extends Class1 {}
     class Class3 extends Class2 {
@@ -188,34 +235,41 @@ Tinytest.add("ecmascript - runtime - classes - super", (test) => {
       }
     }
 
-    test.equal((new Class3).foo(), 124);
+    test.equal(new Class3().foo(), 124);
   }
 
   {
     class Foo {
-      constructor(value) { this.value = value; }
-      x() { return this.value; }
+      constructor(value) {
+        this.value = value;
+      }
+      x() {
+        return this.value;
+      }
     }
 
     class Bar extends Foo {
-      constructor() { super(123); }
-      x() { return super.x(); }
+      constructor() {
+        super(123);
+      }
+      x() {
+        return super.x();
+      }
     }
 
-    test.equal((new Bar).x(), 123);
+    test.equal(new Bar().x(), 123);
   }
 });
 
-Tinytest.add("ecmascript - runtime - object rest/spread", (test) => {
-  const middle = {b:2, c:3};
+Tinytest.add('ecmascript - runtime - object rest/spread', test => {
+  const middle = { b: 2, c: 3 };
   // uses `babelHelpers._extends`
-  const full = {a:1, ...middle, d:4};
-  test.equal(full, {a:1, b:2, c:3, d:4});
+  const full = { a: 1, ...middle, d: 4 };
+  test.equal(full, { a: 1, b: 2, c: 3, d: 4 });
 });
 
-Tinytest.add("ecmascript - runtime - spread args to new", (test) => {
-
-  const Foo = function (one, two, three) {
+Tinytest.add('ecmascript - runtime - spread args to new', test => {
+  const Foo = function(one, two, three) {
     test.isTrue(this instanceof Foo);
     test.equal(one, 1);
     test.equal(two, 2);
@@ -230,96 +284,53 @@ Tinytest.add("ecmascript - runtime - spread args to new", (test) => {
   test.isTrue(foo.created);
 });
 
-Tinytest.add("ecmascript - runtime - Map spread", (test) => {
-  const map = new Map;
+Tinytest.add('ecmascript - runtime - Map spread', test => {
+  const map = new Map();
 
   map.set(0, 1);
   map.set(1, 2);
   map.set(2, 3);
 
-  test.equal([...map], [
-    [0, 1],
-    [1, 2],
-    [2, 3]
-  ]);
+  test.equal(
+    [...map],
+    [
+      [0, 1],
+      [1, 2],
+      [2, 3],
+    ]
+  );
 });
 
-Tinytest.add("ecmascript - runtime - Set spread", (test) => {
-  const set = new Set;
+Tinytest.add('ecmascript - runtime - Set spread', test => {
+  const set = new Set();
 
-  set.add("a");
+  set.add('a');
   set.add(1);
   set.add(false);
 
-  test.equal([...set], ["a", 1, false]);
+  test.equal([...set], ['a', 1, false]);
 });
 
-Tinytest.add("ecmascript - runtime - destructuring", (test) => {
-  // uses `babelHelpers.objectWithoutProperties` and
-  // `babelHelpers.objectDestructuringEmpty`
-
-  const obj = {a:1, b:2};
-  const {a, ...rest} = obj;
+Tinytest.add('ecmascript - runtime - destructuring', test => {
+  const obj = { a: 1, b: 2 };
+  const { a, ...rest } = obj;
   test.equal(a, 1);
-  test.equal(rest, {b:2});
+  test.equal(rest, { b: 2 });
 
   const {} = {};
 
   test.throws(() => {
     const {} = null;
-  }, /Cannot destructure undefined/);
+  });
 
-  const [x, y, z] = function*() {
-    let x = 1;
+  const [x, y, z] = (function*() {
+    let n = 1;
     while (true) {
-      yield x++;
+      yield n++;
     }
-  }();
+  })();
 
   test.equal(x, 1);
   test.equal(y, 2);
   test.equal(z, 3);
-});
-
-Tinytest.addAsync("ecmascript - runtime - misc support", (test, done) => {
-  // Verify that the runtime was installed.
-  test.equal(typeof meteorBabelHelpers, "object");
-  test.equal(typeof meteorBabelHelpers.sanitizeForInObject, "function");
-
-  class Base {
-    constructor(...args) {
-      this.sum = 0;
-      args.forEach(arg => this.sum += arg);
-    }
-
-    static inherited() {
-      return "inherited";
-    }
-  }
-
-  class Derived extends Base {
-    constructor() {
-      super(1, 2, 3);
-    }
-  }
-
-  // Check that static methods are inherited.
-  test.equal(Derived.inherited(), "inherited");
-
-  const d = new Derived();
-  test.equal(d.sum, 6);
-
-  const expectedError = new Error("expected");
-
-  Promise.resolve("working").then(result => {
-    test.equal(result, "working");
-    throw expectedError;
-  }).catch(error => {
-    test.equal(error, expectedError);
-    if (Meteor.isServer) {
-      const Fiber = Npm.require("fibers");
-      // Make sure the Promise polyfill runs callbacks in a Fiber.
-      test.instanceOf(Fiber.current, Fiber);
-    }
-  }).then(done, error => test.exception(error));
 });

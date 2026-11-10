@@ -1,0 +1,40 @@
+<template name="configureLoginServiceDialogForGoogle">
+  <p>
+    First, you'll need to get a Google Client ID. Follow these steps:
+  </p>
+  <ol>
+    <li>
+      Visit <a href="https://console.cloud.google.com/" target="blank">https://console.cloud.google.com/</a>
+    </li>
+    <li>
+      Create a new project or select an existing one.
+    </li>
+    <li>
+      In the left sidebar, go to "APIs & Services" > "OAuth consent screen".
+    </li>
+    <li>
+      Configure the consent screen: select "External" user type, enter your app name, user support email, and developer contact email, then click "Save and Continue".
+    </li>
+    <li>
+      Skip the "Scopes" step (or add scopes if needed) and click "Save and Continue".
+    </li>
+    <li>
+      Add test users if needed, then click "Save and Continue".
+    </li>
+    <li>
+      In the left sidebar, go to "Credentials" and click "Create Credentials" > "OAuth client ID".
+    </li>
+    <li>
+      Select "Web application" as the application type.
+    </li>
+    <li>
+      Add your site URL to "Authorized JavaScript origins": <span class="url">{{siteUrl}}</span>
+    </li>
+    <li>
+      Add to "Authorized redirect URIs": <span class="url">{{siteUrl}}_oauth/google</span>
+    </li>
+    <li>
+      Click "Create" and note down your "Client ID" and "Client Secret" from the popup.
+    </li>
+  </ol>
+</template>

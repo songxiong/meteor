@@ -79,7 +79,7 @@ argument, it will be matched against test names:
 ```
 
 You can also run a particular file, or list all tests matching certain
-pattern, run with phantom or browserstack.
+pattern, run with puppeteer (default), phantom or browserstack.
 See more at `./meteor help self-test`.
 
 If you want to learn how to write a self-test, see the `tool-testing`
@@ -105,6 +105,34 @@ Internally, every profiled function should be wrapped into a `Profile(fn)` call.
 The entry point should be started explicitly with the `Profile.run()`
 call. Otherwise, it won't start measuring anything.
 
+### Inspector Profiling
+
+In addition to the standard profiler, you can use the more advanced inspector profiling:
+
+```bash
+# Profile a specific function (e.g. bundler.bundle)
+METEOR_INSPECT=bundler.bundle meteor run
+
+# Profile multiple functions
+METEOR_INSPECT=bundler.bundle,compiler.compile meteor build
+```
+
+Additional options:
+```bash
+# Output directory for .cpuprofile files
+METEOR_INSPECT_OUTPUT=/path/to/directory
+
+# Name to identify profile files
+METEOR_INSPECT_CONTEXT=project_xyz
+
+# Sampling interval (lower = more details, more memory)
+METEOR_INSPECT_INTERVAL=500
+```
+
+The generated `.cpuprofile` files can be opened in Chrome DevTools through the "Performance" or "Profiler" tab.
+
+For more details, see the `PERFORMANCE.md` file.
+
 ## Debugging
 
 Currently, to debug the tool with `node-inspector`, you can set the `
@@ -126,7 +154,7 @@ variable `SELF_TEST_TOOL_NODE_FLAGS` could be used the same way
 `TOOL_NODE_FLAGS` is used. If you are setting the env variable
 `SELF_TEST_TOOL_NODE_FLAGS` with `TOOL_NODE_FLAGS`, consider specifying a
 custom port, as they could collide trying to listen to the same port.
-To set a custom port, you could set the variable in the followind manner
+To set a custom port, you could set the variable in the following manner
 `SELF_TEST_TOOL_NODE_FLAGS="--debug-brk=5859"` and the debugger will
 listen to the port 5859 and not the default 5858.
 
@@ -140,8 +168,7 @@ The entry-point of the tools code is in `index.js`.
 The Meteor Tool code has two modes of running:
 
 - from local checkout for development
-- from a production release installed by running
-`curl -L https://install.meteor.com | sh` or a Windows installer.
+- from a production release installed by running `npm install -g meteor`.
 
 There are two different `meteor` / `meteor.bat` starting scripts in development
 and production. The production one is written by the packaging code.

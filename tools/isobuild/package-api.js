@@ -1,9 +1,8 @@
-var assert = require("assert");
 var _ = require("underscore");
 var buildmessage = require('../utils/buildmessage.js');
 var utils = require('../utils/utils.js');
 var compiler = require('./compiler.js');
-var archinfo = require('../utils/archinfo.js');
+var archinfo = require('../utils/archinfo');
 var catalog = require('../packaging/catalog/catalog.js');
 
 // It's important that we import these functions individually instead of
@@ -12,7 +11,7 @@ var catalog = require('../packaging/catalog/catalog.js');
 import {
   pathRelative,
   convertToPosixPath,
-} from "../fs/files.js";
+} from "../fs/files";
 
 function toArray (x) {
   if (_.isArray(x)) {
@@ -21,12 +20,18 @@ function toArray (x) {
   return x ? [x] : [];
 }
 
-function toArchArray (arch) {
-  if (! _.isArray(arch)) {
+function toArchArray(arch) {
+  if (! Array.isArray(arch)) {
     arch = arch ? [arch] : compiler.ALL_ARCHES;
   }
-  arch = _.uniq(arch);
-  arch = _.map(arch, mapWhereToArch);
+
+  const seen = Object.create(null);
+
+  arch.splice(0).forEach(where => {
+    if (seen[where]) return;
+    seen[where] = true;
+    arch.push(...archinfo.mapWhereToArches(where));
+  });
 
   // avoid using _.each so as to not add more frames to skip
   for (var i = 0; i < arch.length; ++i) {
@@ -44,27 +49,49 @@ function toArchArray (arch) {
   return arch;
 }
 
-// We currently have a 1 to 1 mapping between 'where' and 'arch'.
-// 'client' -> 'web'
-// 'server' -> 'os'
-// '*' -> '*'
-function mapWhereToArch (where) {
-  if (where === 'server') {
-    return 'os';
-  } else if (where === 'client') {
-    return 'web';
-  } else {
-    return where;
-  }
+// True for a TypeScript SOURCE path (.ts/.tsx but not .d.ts) — the marker
+// of a TypeScript-authored api.types() entry.  Mirrors
+// isTypeScriptSourceEntry in types-generator.js, which cannot be imported
+// here without giving this deliberately filesystem-free module a dependency
+// on the generator.
+function isTypeScriptSourcePath(p) {
+  return typeof p === 'string' && /\.tsx?$/.test(p) && !p.endsWith('.d.ts');
+}
+
+function isTypeScriptDeclarationPath(p) {
+  return typeof p === 'string' && p.endsWith('.d.ts');
+}
+
+function isValidTypesModuleName(name) {
+  return typeof name === 'string' &&
+    !!name.trim() &&
+    name === name.trim() &&
+    !name.includes('\\') &&
+    !/[\u0000-\u001f\u007f<>"|?*]/.test(name) &&
+    !name.split('/').some(segment =>
+      segment === '' || segment === '.' || segment === '..');
+}
+
+function normalizeTypePath(p) {
+  return convertToPosixPath(p, true).replace(/^\.\//, '');
+}
+
+function isPackageRelativeTypePath(p) {
+  return typeof p === 'string' && p.length > 0 &&
+    !p.startsWith('/') &&
+    !/^[A-Za-z]:/.test(p) &&
+    !p.split('/').some(segment =>
+      segment === '' || segment === '.' || segment === '..');
 }
 
 // Iterates over the list of target archs and calls f(arch) for all archs
 // that match an element of self.allarchs.
 function forAllMatchingArchs (archs, f) {
-  _.each(archs, function (arch) {
-    _.each(compiler.ALL_ARCHES, function (matchArch) {
+  compiler.ALL_ARCHES.forEach(matchArch => {
+    archs.some(arch => {
       if (archinfo.matches(matchArch, arch)) {
         f(matchArch);
+        return true;
       }
     });
   });
@@ -74,47 +101,54 @@ function forAllMatchingArchs (archs, f) {
  * @name  PackageAPI
  * @class PackageAPI
  * @instanceName api
+ * @showInstanceName true
  * @global
  * @summary Type of the API object passed into the `Package.onUse` function.
  */
-export function PackageAPI(options) {
-  var self = this;
-  assert.ok(self instanceof PackageAPI);
+export class PackageAPI {
+  constructor(options) {
+    options = options || {};
 
-  options = options || {};
+    this.buildingIsopackets = !!options.buildingIsopackets;
+    this.buildingSelfTestCatalog = !!options.buildingSelfTestCatalog;
 
-  self.buildingIsopackets = !!options.buildingIsopackets;
+    // source files used.
+    // It's a multi-level map structured as:
+    //   arch -> sources|assets -> relPath -> {relPath, fileOptions}
+    this.files = {};
 
-  // source files used.
-  // It's a multi-level map structured as:
-  //   arch -> sources|assets -> relPath -> {relPath, fileOptions}
-  self.files = {};
+    // symbols exported
+    this.exports = {};
 
-  // symbols exported
-  self.exports = {};
+    // packages used and implied (keys are 'package', 'unordered', and
+    // 'weak').  an "implied" package is a package that will be used by a unibuild
+    // which uses us.
+    this.uses = {};
+    this.implies = {};
 
-  // packages used and implied (keys are 'package', 'unordered', and
-  // 'weak').  an "implied" package is a package that will be used by a unibuild
-  // which uses us.
-  self.uses = {};
-  self.implies = {};
+    _.each(compiler.ALL_ARCHES, arch => {
+      this.files[arch] = {
+        assets: [],
+        sources: [],
+        main: null,
+      };
 
-  _.each(compiler.ALL_ARCHES, function (arch) {
-    self.files[arch] = {
-      assets: [],
-      sources: [],
-      main: null,
-    };
+      this.exports[arch] = [];
+      this.uses[arch] = [];
+      this.implies[arch] = [];
+    });
 
-    self.exports[arch] = [];
-    self.uses[arch] = [];
-    self.implies[arch] = [];
-  });
+    this.releaseRecords = [];
+    this.pendingPromises = [];
+    this._typesEntry = null;
+    this._typesModules = null;
+    // Set when api.types() is called with a directory (trailing '/'):
+    // the directory path relative to the package root, without the slash
+    // (e.g. 'dist-types').  In that mode _typesEntry/_typesModules hold
+    // full package-root-relative paths inside the directory.
+    this._typesDir = null;
+  }
 
-  self.releaseRecords = [];
-}
-
-_.extend(PackageAPI.prototype, {
   // Called when this package wants to make another package be
   // used. Can also take literal package objects, if you have
   // anonymous packages you want to use (eg, app packages)
@@ -126,9 +160,8 @@ _.extend(PackageAPI.prototype, {
   // options can include:
   //
   // - unordered: if true, don't require this package to load
-  //   before us -- just require it to be loaded anytime. Also
-  //   don't bring this package's imports into our
-  //   namespace. If false, override a true value specified in
+  //   before us -- just require it to be loaded anytime. If
+  //   false, override a true value specified in
   //   a previous call to use for this package name. (A
   //   limitation of the current implementation is that this
   //   flag is not tracked per-environment or per-role.)  This
@@ -183,7 +216,7 @@ _.extend(PackageAPI.prototype, {
    * are loaded before your package.) You can use this option to break
    * circular dependencies.
    */
-  use: function (names, arch, options) {
+  use(names, arch, options) {
     var self = this;
 
     // Support `api.use(package, {weak: true})` without arch.
@@ -231,7 +264,7 @@ _.extend(PackageAPI.prototype, {
         });
       });
     }
-  },
+  }
 
   // Called when this package wants packages using it to also use
   // another package.  eg, for umbrella packages which want packages
@@ -254,7 +287,7 @@ _.extend(PackageAPI.prototype, {
    * architectures by passing in an array, for example `['web.cordova',
    * 'os.linux']`.
    */
-  imply: function (names, arch) {
+  imply(names, arch) {
     var self = this;
 
     // We currently disallow build plugins in
@@ -306,7 +339,7 @@ _.extend(PackageAPI.prototype, {
         });
       });
     }
-  },
+  }
 
   // Top-level call to add a source file to a package. It will
   // be processed according to its extension (eg, *.coffee
@@ -320,8 +353,12 @@ _.extend(PackageAPI.prototype, {
    * @param {String|String[]} filenames Paths to the source files.
    * @param {String|String[]} [architecture] If you only want to use the file
    * on the server (or the client), you can pass this argument
-   * (e.g., 'server', 'client', 'web.browser', 'web.cordova') to specify
-   * what architecture the file is used with. You can specify multiple
+   * (e.g., 'server', 'legacy', 'client', 'web.browser', 'web.cordova') to specify
+   * what architecture the file is used with. You can call api.addFiles(files, "legacy")
+   * in your package.js configuration file to add extra files to the legacy bundle,
+   * or api.addFiles(files, "client") to add files to all client bundles,
+   * or api.addFiles(files, "web.browser") to add files only to the modern bundle.
+   * You can specify multiple
    * architectures by passing in an array, for example
    * `['web.cordova', 'os.linux']`. By default, the file will be loaded on both
    * server and client.
@@ -332,7 +369,7 @@ _.extend(PackageAPI.prototype, {
    * resulting file in a closure. Has the same effect as putting a file into the
    * `client/compatibility` directory in an app.
    */
-  addFiles: function (paths, arch, fileOptions) {
+  addFiles(paths, arch, fileOptions) {
     if (fileOptions && fileOptions.isAsset) {
       // XXX it would be great to print a warning here, see the issue:
       // https://github.com/meteor/meteor/issues/5495
@@ -343,15 +380,19 @@ _.extend(PackageAPI.prototype, {
     // Watch out - we rely on the levels of stack traces inside this
     // function so don't wrap it in another function without changing that logic
     this._addFiles("sources", paths, arch, fileOptions);
-  },
+  }
 
-  mainModule(path, arch) {
+  mainModule(path, arch, fileOptions = {}) {
     arch = toArchArray(arch);
+
+    const errors = [];
+
     forAllMatchingArchs(arch, a => {
       const filesForArch = this.files[a];
       const source = {
         relPath: pathRelative(".", path),
         fileOptions: {
+          ...fileOptions,
           mainModule: true
         }
       };
@@ -361,12 +402,43 @@ _.extend(PackageAPI.prototype, {
         // It's not an error to call api.mainModule multiple times, but
         // the last call takes precedence over the earlier calls.
         oldMain.fileOptions.mainModule = false;
+
+        if (! _.has(oldMain.fileOptions, "lazy")) {
+          // If the laziness of the old main module was not explicitly
+          // specified, then it would have been implicitly eager just
+          // because it was the main module. Since we are revoking its
+          // status as main module now, we should also explicitly revoke
+          // the eagerness that came with that status.
+          oldMain.fileOptions.lazy = true;
+        }
+      }
+
+      if (filesForArch.sources.some(old => source.relPath === old.relPath)) {
+        errors.push(`Duplicate api.mainModule: ${path}`);
       }
 
       filesForArch.main = source;
       filesForArch.sources.push(source);
+
+      this._forbidExportWithLazyMain(a);
     });
-  },
+
+    errors.forEach(error => {
+      buildmessage.error(error, { useMyCaller: 1 });
+    });
+  }
+
+  _forbidExportWithLazyMain(arch) {
+    const filesForArch = this.files[arch];
+    if (filesForArch.main &&
+        filesForArch.main.fileOptions.lazy &&
+        this.exports[arch].length > 0) {
+      buildmessage.error(
+        "Architecture " + JSON.stringify(arch) + " cannot both " +
+          "export symbols and have a lazy main module"
+      );
+    }
+  }
 
   /**
    * @memberOf PackageAPI
@@ -393,7 +465,265 @@ _.extend(PackageAPI.prototype, {
     // Watch out - we rely on the levels of stack traces inside this
     // function so don't wrap it in another function without changing that logic
     this._addFiles("assets", paths, arch);
-  },
+  }
+
+  /**
+   * @memberOf PackageAPI
+   * @instance
+   * @summary Declare the TypeScript type declarations for this package.
+   * @locus package.js
+   * @param {String} typesEntry Path to the main .d.ts file (relative to the
+   *   package directory), e.g. `'my-package.d.ts'` — or a directory of
+   *   declaration files, marked with a trailing slash, e.g. `'dist-types/'`
+   *   (as produced by `tsc --declaration --declarationDir dist-types`).
+   *   In directory mode every `.d.ts` (and `.d.ts.map`) file under the
+   *   directory is bundled with the package, tree structure preserved.
+   *   A `.ts`/`.tsx` entry (instead of `.d.ts`) marks the package as
+   *   TypeScript-authored: the entry must be one of the package's compiled
+   *   sources (e.g. its `api.mainModule`), local development type-checks
+   *   against the sources directly, and `meteor publish` generates real
+   *   declaration files from them with tsc right before the build.  In that
+   *   mode `options.modules` values must also be `.ts`/`.tsx` sources, and
+   *   none of the files are registered as assets (they are already source
+   *   resources).
+   * @param {Object} [options]
+   * @param {String} [options.entry] Directory mode only: the declaration
+   *   file (relative to the directory) that types
+   *   `import ... from 'meteor/pkg'`.  Defaults to the file mirroring the
+   *   package's `api.mainModule` (e.g. mainModule `server/main.ts` →
+   *   `server/main.d.ts`), or `index.d.ts` at the directory root when
+   *   there is no main module.
+   * @param {Object} [options.modules] A mapping of sub-path names to .d.ts
+   *   file paths, enabling sub-path imports such as
+   *   `import { X } from 'meteor/pkg/sub-path'`.
+   *   Example: `{ suspense: 'suspense.d.ts' }`.
+   *   In directory mode the file paths are relative to the directory.
+   */
+  types(typesEntry, options = {}) {
+    if (this._typesEntry != null || this._typesDir != null) {
+      buildmessage.error('api.types() may only be called once per package.',
+        { useMyCaller: true });
+      return;
+    }
+
+    if (typeof typesEntry !== 'string' || !typesEntry.trim()) {
+      buildmessage.error(
+        'api.types() requires a non-empty path to a .d.ts file or a ' +
+          "directory (with a trailing '/') as its first argument.",
+        { useMyCaller: true }
+      );
+      return;
+    }
+
+    const normalizedTypesEntry = convertToPosixPath(typesEntry, true);
+
+    if (options.modules !== undefined && (
+      typeof options.modules !== 'object' || options.modules === null ||
+      Array.isArray(options.modules)
+    )) {
+      buildmessage.error(
+        'api.types(): options.modules must be an object mapping sub-path names to .d.ts file paths.',
+        { useMyCaller: true }
+      );
+      return;
+    }
+
+    if (options.modules) {
+      for (const name of Object.keys(options.modules)) {
+        if (!isValidTypesModuleName(name)) {
+          buildmessage.error(
+            `api.types(): options.modules key "${name}" must be a valid ` +
+              'non-empty sub-path without empty, dot, parent, backslash, ' +
+              'control, or Windows-invalid characters.',
+            { useMyCaller: true }
+          );
+          return;
+        }
+      }
+    }
+
+    // A trailing '/' (as written by the author) selects directory mode.
+    // The decision is made from the string alone — api.* methods never
+    // touch the filesystem, and the directory may not even exist yet when
+    // package.js is evaluated (`meteor publish` generates it right before
+    // the build).
+    if (normalizedTypesEntry.endsWith('/')) {
+      const error = this._typesDirectoryMode(normalizedTypesEntry, options);
+      if (error) {
+        buildmessage.error(error, { useMyCaller: true });
+      }
+      return;
+    }
+
+    typesEntry = normalizeTypePath(normalizedTypesEntry);
+
+    if (!isPackageRelativeTypePath(typesEntry)) {
+      buildmessage.error(
+        `api.types(): types entry ("${typesEntry}") must stay inside the package.`,
+        { useMyCaller: true }
+      );
+      return;
+    }
+
+    if (options.entry !== undefined) {
+      buildmessage.error(
+        'api.types(): options.entry is only valid when the first argument ' +
+          "is a directory (marked with a trailing '/').",
+        { useMyCaller: true }
+      );
+      return;
+    }
+
+    const isSourceEntry = isTypeScriptSourcePath(typesEntry);
+    if (!isSourceEntry && !isTypeScriptDeclarationPath(typesEntry)) {
+      buildmessage.error(
+        'api.types() requires a .d.ts or .ts/.tsx file in single-file mode.',
+        { useMyCaller: true }
+      );
+      return;
+    }
+
+    let normalizedModules = null;
+    if (options.modules) {
+      normalizedModules = {};
+      for (const [name, modulePath] of Object.entries(options.modules)) {
+        if (typeof modulePath !== 'string' || !modulePath.trim()) {
+          buildmessage.error(
+            isSourceEntry
+              ? `api.types(): options.modules.${name} must be a .ts/.tsx ` +
+                  'source path when the types entry is a TypeScript source file.'
+              : `api.types(): options.modules.${name} must be a .d.ts path.`,
+            { useMyCaller: true }
+          );
+          return;
+        }
+        const normalizedModulePath = normalizeTypePath(modulePath);
+        if (!isPackageRelativeTypePath(normalizedModulePath)) {
+          buildmessage.error(
+            `api.types(): options.modules.${name} ("${modulePath}") must stay inside the package.`,
+            { useMyCaller: true }
+          );
+          return;
+        }
+        const validPath = isSourceEntry
+          ? isTypeScriptSourcePath(normalizedModulePath)
+          : isTypeScriptDeclarationPath(normalizedModulePath);
+        if (!validPath) {
+          buildmessage.error(
+            isSourceEntry
+              ? `api.types(): options.modules.${name} must be a .ts/.tsx ` +
+                  'source path when the types entry is a TypeScript source file.'
+              : `api.types(): options.modules.${name} must be a .d.ts path.`,
+            { useMyCaller: true }
+          );
+          return;
+        }
+        normalizedModules[name] = normalizedModulePath;
+      }
+    }
+
+    this._typesEntry = typesEntry;
+    this._typesModules = normalizedModules;
+
+    // A .ts/.tsx entry (not .d.ts) marks the package as TypeScript-authored:
+    // the entry is one of the package's compiled sources, and `meteor
+    // publish` generates real .d.ts declarations from it with tsc right
+    // before the build.  Nothing is registered as an asset in this mode —
+    // the entry is already a source resource of the compiled package
+    // (registering it twice would duplicate resources), and
+    // options.modules values must likewise be .ts/.tsx sources: a
+    // hand-written .d.ts mixed in here is rejected, because
+    // `tsc --emitDeclarationOnly` does not re-emit declaration inputs, so
+    // it would have no publish-time story.
+    if (isSourceEntry) {
+      return;
+    }
+
+    // Register the .d.ts files as server-only assets.  Every package is
+    // compiled for the os arch (even client-only packages), so the types
+    // generator — which reads resources straight from the isopack cache —
+    // always finds them there.  They must NOT be client assets: web-arch
+    // assets are given a public URL and served with the app bundle, and
+    // minification does not strip assets, so client .d.ts files would ship
+    // to production browsers.
+    const filesToAdd = [typesEntry];
+    if (this._typesModules) {
+      for (const modulePath of Object.values(this._typesModules)) {
+        filesToAdd.push(modulePath);
+      }
+    }
+    this._addFiles('assets', filesToAdd, ['server'], { nativeType: true });
+  }
+
+  /**
+   * Internal: the directory branch of api.types().  Stores _typesDir plus
+   * entry/modules normalized to full package-root-relative paths.  No
+   * assets are registered here — the directory contents are only known at
+   * compile time, when PackageSource.getFiles expands them (watching the
+   * directory listings so that adding/removing a .d.ts triggers a rebuild).
+   *
+   * Returns an error message string on invalid input (reported by the
+   * caller so the build error points at the api.types() call in
+   * package.js), or undefined on success.
+   */
+  _typesDirectoryMode(typesEntry, options) {
+    // Strip the trailing slash(es) and a leading './'; what remains is the
+    // directory path relative to the package root, e.g. 'dist-types'.
+    const dir = typesEntry.replace(/\/+$/, '').replace(/^\.\//, '');
+    if (!isPackageRelativeTypePath(dir)) {
+      return `api.types(): "${typesEntry}" is not a valid directory path inside the package.`;
+    }
+
+    // Convert a folder-relative path to a full package-root-relative path.
+    // Returns an { error } or { fullPath } record.
+    const resolveInDir = (label, p) => {
+      if (typeof p !== 'string' || !p.trim()) {
+        return {
+          error: `api.types(): ${label} must be a non-empty path relative to "${dir}/".`,
+        };
+      }
+      const rel = normalizeTypePath(p);
+      if (!isPackageRelativeTypePath(rel)) {
+        return {
+          error: `api.types(): ${label} ("${p}") must stay inside the "${dir}/" directory.`,
+        };
+      }
+      if (!isTypeScriptDeclarationPath(rel)) {
+        return {
+          error: `api.types(): ${label} must be a .d.ts path relative to "${dir}/".`,
+        };
+      }
+      return { fullPath: dir + '/' + rel };
+    };
+
+    let entry = null;
+    if (options.entry !== undefined) {
+      const resolved = resolveInDir('options.entry', options.entry);
+      if (resolved.error) {
+        return resolved.error;
+      }
+      entry = resolved.fullPath;
+    }
+    // Otherwise the entry stays null for now: PackageSource resolves the
+    // default (mainModule mirror, else index.d.ts) after package.js has
+    // fully run, because api.mainModule() may be called after api.types().
+
+    let modules = null;
+    if (options.modules) {
+      modules = {};
+      for (const [name, modulePath] of Object.entries(options.modules)) {
+        const resolved = resolveInDir(`options.modules.${name}`, modulePath);
+        if (resolved.error) {
+          return resolved.error;
+        }
+        modules[name] = resolved.fullPath;
+      }
+    }
+
+    this._typesDir = dir;
+    this._typesEntry = entry;
+    this._typesModules = modules;
+  }
 
   /**
    * Internal method used by addFiles and addAssets.
@@ -430,7 +760,7 @@ _.extend(PackageAPI.prototype, {
         const filesOfType = self.files[a][type];
 
         // Check if we have already added a file at this path
-        if (_.has(filesOfType, path)) {
+        if (filesOfType.some(source => source.relPath === path)) {
           // We want the singular form of the file type
           const typeName = {
             sources: 'source',
@@ -460,7 +790,7 @@ _.extend(PackageAPI.prototype, {
     for (var i = 0; i < errors.length; ++i) {
       buildmessage.error(errors[i], { useMyCaller: 1 });
     }
-  },
+  }
 
   // Use this release to resolve unclear dependencies for this package. If
   // you don't fill in dependencies for some of your implies/uses, we will
@@ -486,7 +816,7 @@ _.extend(PackageAPI.prototype, {
    * track@version. Just 'version' (e.g. `"0.9.0"`) is sufficient if using the
    * default release track `METEOR`. Can be an array of specifications.
    */
-  versionsFrom: function (releases) {
+  versionsFrom(releases) {
     var self = this;
 
     // Packages in isopackets really ought to be in the core release, by
@@ -500,6 +830,18 @@ _.extend(PackageAPI.prototype, {
       buildmessage.error(
         "packages in isopackets may not use versionsFrom");
       // recover by ignoring
+      return;
+    }
+
+    if (self.buildingSelfTestCatalog) {
+      // The self-test catalog is built from a checkout-only set of packages
+      // where the local catalog has exactly one version of each package.
+      // versionsFrom's release records would only fill in unspecified
+      // version constraints (see the !_.isEmpty(api.releaseRecords) check
+      // in package-source.js), which has no effect when there is exactly
+      // one candidate version. Skipping the lookup
+      // avoids a hard dependency on catalog.official having every Meteor
+      // release cached on disk, which is fragile in CI.
       return;
     }
 
@@ -520,16 +862,28 @@ _.extend(PackageAPI.prototype, {
                            { useMyCaller: true });
         return;
       }
-      var releaseRecord = catalog.official.getReleaseVersion(
-        relInf[0], relInf[1]);
-      if (!releaseRecord) {
-        buildmessage.error("Unknown release "+ release,
-                           { tags: { refreshCouldHelp: true } });
-      } else {
-        self.releaseRecords.push(releaseRecord);
-      }
+
+      let promise = catalog.official.getReleaseVersion(relInf[0], relInf[1])
+        .then(releaseRecord => {
+          if (!releaseRecord) {
+            buildmessage.error("Unknown release "+ release,
+                               { tags: { refreshCouldHelp: true } });
+          } else {
+            self.releaseRecords.push(releaseRecord);
+          }
+        });
+
+      this.pendingPromises.push(promise);
     }
-  },
+  }
+
+  // Internal method used by the meteor-tool
+  _waitForAsyncWork() {
+    let promises = this.pendingPromises;
+    this.pendingPromises = [];
+
+    return Promise.all(promises);
+  }
 
   // Export symbols from this package.
   //
@@ -563,7 +917,7 @@ _.extend(PackageAPI.prototype, {
    * @param {Boolean} exportOptions.testOnly If true, this symbol will only be
    * exported when running tests for this package.
    */
-  export: function (symbols, arch, options) {
+  "export"(symbols, arch, options) {
     var self = this;
 
     // Support `api.export("FooTest", {testOnly: true})` without
@@ -585,12 +939,15 @@ _.extend(PackageAPI.prototype, {
         // recover by ignoring
         return;
       }
+
       forAllMatchingArchs(arch, function (w) {
-        self.exports[w].push({name: symbol, testOnly: !!options.testOnly});
+        self.exports[w].push({
+          name: symbol,
+          testOnly: !! options.testOnly,
+        });
+
+        self._forbidExportWithLazyMain(w);
       });
     });
   }
-});
-
-// XXX COMPAT WITH 0.8.x
-PackageAPI.prototype.add_files = PackageAPI.prototype.addFiles;
+}

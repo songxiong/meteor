@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": false,
+    "noEmit": true,
+    "noUncheckedSideEffectImports": false,
+    "esModuleInterop": true,
+    "allowJs": true,
+    "resolveJsonModule": true,
+    "preserveSymlinks": true,
+    "skipLibCheck": true,
+    "paths": {
+      "/*": ["./*"],
+      "meteor/*": ["./.meteor/types/packages/*"]
+    },
+    "types": ["node", "mocha"]
+  },
+  "files": ["./.meteor/types/packages.d.ts"],
+  "include": ["**/*"],
+  "exclude": ["node_modules", ".meteor"]
+}

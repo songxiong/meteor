@@ -101,6 +101,13 @@ Tinytest.add("tracker - nested run", function (test) {
 
   expect('abcdef');
 
+  test.isTrue(a.hasDependents());
+  test.isTrue(b.hasDependents());
+  test.isTrue(c.hasDependents());
+  test.isTrue(d.hasDependents());
+  test.isTrue(e.hasDependents());
+  test.isTrue(f.hasDependents());
+
   b.changed();
   expect(''); // didn't flush yet
   Tracker.flush();
@@ -124,6 +131,14 @@ Tinytest.add("tracker - nested run", function (test) {
   // no more running!
   changeAndExpect(e, '');
   changeAndExpect(f, '');
+
+  test.isTrue(a.hasDependents());
+  test.isTrue(b.hasDependents());
+  test.isTrue(c.hasDependents());
+  test.isFalse(d.hasDependents());
+  test.isFalse(e.hasDependents());
+  test.isFalse(f.hasDependents());
+
   // rerun C
   changeAndExpect(c, 'cdef');
   changeAndExpect(e, 'ef');
@@ -132,6 +147,14 @@ Tinytest.add("tracker - nested run", function (test) {
   changeAndExpect(b, 'bcdef');
   changeAndExpect(e, 'ef');
   changeAndExpect(f, 'f');
+
+  test.isTrue(a.hasDependents());
+  test.isTrue(b.hasDependents());
+  test.isTrue(c.hasDependents());
+  test.isTrue(d.hasDependents());
+  test.isTrue(e.hasDependents());
+  test.isTrue(f.hasDependents());
+
   // kill A
   a.changed();
   changeAndExpect(f, '');
@@ -193,7 +216,7 @@ Tinytest.add("tracker - flush", function (test) {
   test.equal(buf, 'a*a*');
 
   /////
-  // Can flush a diferent run from a run;
+  // Can flush a different run from a run;
   // no current computation in afterFlush
 
   buf = "";
@@ -274,7 +297,7 @@ Tinytest.add("tracker - lifecycle", function (test) {
     test.equal(c, Tracker.currentComputation);
     test.equal(c.stopped, false);
     test.equal(c.invalidated, false);
-      test.equal(c.firstRun, firstRun);
+    test.equal(c.firstRun, firstRun);
 
     Tracker.onInvalidate(makeCb()); // 1, 6, ...
     Tracker.afterFlush(makeCb()); // 2, 7, ...
@@ -494,6 +517,165 @@ testAsyncMulti('tracker - Tracker.autorun, onError option', [function (test, exp
   d.changed();
   Tracker.flush();
 }]);
+
+Tinytest.addAsync('tracker - async function - basics', function (test, onComplete) {
+  const computation = Tracker.autorun(async function (computation) {
+    test.equal(computation.firstRun, true, 'before (firstRun)');
+    test.equal(Tracker.currentComputation, computation, 'before');
+    const x = await Promise.resolve().then(() =>
+      Tracker.withComputation(computation, () => {
+        // The `firstRun` is `false` as soon as the first `await` happens.
+        test.equal(computation.firstRun, false, 'inside (firstRun)');
+        test.equal(Tracker.currentComputation, computation, 'inside');
+        return 123;
+      })
+    );
+    test.equal(x, 123, 'await (value)');
+    test.equal(computation.firstRun, false, 'await (firstRun)');
+    Tracker.withComputation(computation, () => {
+      test.equal(Tracker.currentComputation, computation, 'await');
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    Tracker.withComputation(computation, () => {
+      test.equal(computation.firstRun, false, 'sleep (firstRun)');
+      test.equal(Tracker.currentComputation, computation, 'sleep');
+    });
+    try {
+      await Promise.reject('example');
+      test.fail();
+    } catch (error) {
+      Tracker.withComputation(computation, () => {
+        test.equal(error, 'example', 'catch (error)');
+        test.equal(computation.firstRun, false, 'catch (firstRun)');
+        test.equal(Tracker.currentComputation, computation, 'catch');
+      });
+    }
+    onComplete();
+  });
+
+  test.equal(Tracker.currentComputation, null, 'outside (computation)');
+  test.instanceOf(computation, Tracker.Computation, 'outside (result)');
+});
+
+Tinytest.addAsync('tracker - async function - interleaved', async function (test) {
+  let count = 0;
+  const limit = 100;
+  for (let index = 0; index < limit; ++index) {
+    Tracker.autorun(async function (computation) {
+      test.equal(Tracker.currentComputation, computation, `before (${index})`);
+      await new Promise(resolve => setTimeout(resolve, Math.random() * limit));
+      count++;
+      Tracker.withComputation(computation, () => {
+        test.equal(Tracker.currentComputation, computation, `after (${index})`);
+      });
+    });
+  }
+
+  test.equal(count, 0, 'before resolve');
+  await new Promise(resolve => setTimeout(resolve, limit));
+  test.equal(count, limit, 'after resolve');
+});
+
+Tinytest.addAsync('tracker - async function - parallel', async function (test) {
+  let resolvePromise;
+  const promise = new Promise(resolve => {
+    resolvePromise = resolve;
+  });
+
+  let count = 0;
+  const limit = 100;
+  const dependency = new Tracker.Dependency();
+  for (let index = 0; index < limit; ++index) {
+    Tracker.autorun(async function (computation) {
+      count++;
+      Tracker.withComputation(computation, () => {
+        dependency.depend();
+      });
+      await promise;
+      count--;
+    });
+  }
+
+  test.equal(count, limit, 'before');
+  dependency.changed();
+  await new Promise(setTimeout);
+  test.equal(count, limit * 2, 'changed');
+  resolvePromise();
+  await new Promise(setTimeout);
+  test.equal(count, 0, 'after');
+});
+
+Tinytest.addAsync('tracker - async function - stepped', async function (test) {
+  let resolvePromise;
+  const promise = new Promise(resolve => {
+    resolvePromise = resolve;
+  });
+
+  let count = 0;
+  const limit = 100;
+  for (let index = 0; index < limit; ++index) {
+    Tracker.autorun(async function (computation) {
+      test.equal(Tracker.currentComputation, computation, `before (${index})`);
+      await promise;
+      count++;
+      Tracker.withComputation(computation, () => {
+        test.equal(Tracker.currentComputation, computation, `after (${index})`);
+      });
+    });
+  }
+
+  test.equal(count, 0, 'before resolve');
+  resolvePromise();
+  await new Promise(setTimeout);
+  test.equal(count, limit, 'after resolve');
+});
+
+Tinytest.addAsync('tracker - async function - synchronize', async test => {
+  let counter = 0;
+
+  await Tracker.autorun(async () => {
+    test.equal(counter, 0);
+    counter += 1;
+    test.equal(counter, 1);
+    await new Promise(resolve => setTimeout(resolve));
+    test.equal(counter, 1);
+    counter *= 2;
+    test.equal(counter, 2);
+  });
+
+  await Tracker.autorun(async () => {
+    test.equal(counter, 2);
+    counter += 1;
+    test.equal(counter, 3);
+    await new Promise(resolve => setTimeout(resolve));
+    test.equal(counter, 3);
+    counter *= 2;
+    test.equal(counter, 6);
+  });
+})
+
+Tinytest.addAsync('tracker - async function - synchronize - firstRunPromise', async test => {
+  let counter = 0
+  await Tracker.autorun(async () => {
+    test.equal(counter, 0);
+    counter += 1;
+    test.equal(counter, 1);
+    await new Promise(resolve => setTimeout(resolve));
+    test.equal(counter, 1);
+    counter *= 2;
+    test.equal(counter, 2);
+  }).firstRunPromise;
+
+  await Tracker.autorun(async () => {
+    test.equal(counter, 2);
+    counter += 1;
+    test.equal(counter, 3);
+    await new Promise(resolve => setTimeout(resolve));
+    test.equal(counter, 3);
+    counter *= 2;
+    test.equal(counter, 6);
+  }).firstRunPromise;
+})
 
 Tinytest.add('computation - #flush', function (test) {
   var i = 0, j = 0, d = new Tracker.Dependency;

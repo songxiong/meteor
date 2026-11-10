@@ -1,111 +1,34 @@
-var assert = require('assert');
+import { getMeteorConfig } from "../tool-env/meteor-config";
+
 var compiler = require('./compiler.js');
-var archinfo = require('../utils/archinfo.js');
+var archinfo = require('../utils/archinfo');
 var _ = require('underscore');
 var linker = require('./linker.js');
 var buildmessage = require('../utils/buildmessage.js');
 import Builder from './builder.js';
 var bundler = require('./bundler.js');
-var watch = require('../fs/watch.js');
-var files = require('../fs/files.js');
-var isopackets = require('../tool-env/isopackets.js');
+var watch = require('../fs/watch');
+import * as files from '../fs/files';
+import * as fsFixPath from '../fs/fsFixPath';
+import {
+  ISOPACKETS,
+  makeIsopacketBuildContext,
+} from '../tool-env/isopackets.js';
 var colonConverter = require('../utils/colon-converter.js');
 var utils = require('../utils/utils.js');
 var buildPluginModule = require('./build-plugin.js');
 var Console = require('../console/console.js').Console;
-var Profile = require('../tool-env/profile.js').Profile;
+var Profile = require('../tool-env/profile').Profile;
+import { requestGarbageCollection } from "../utils/gc.js";
+import { Unibuild } from "./unibuild.js";
+import rspackHelpers from "../tool-env/rspack";
+import { getCurrentNodeBinDir, getDevBundle } from "../fs/files";
+import { runLogInstance } from "../runners/run-log";
 
 var rejectBadPath = function (p) {
   if (p.match(/\.\./)) {
     throw new Error("bad path: " + p);
   }
-};
-
-///////////////////////////////////////////////////////////////////////////////
-// Unibuild
-///////////////////////////////////////////////////////////////////////////////
-
-// Options:
-// - kind [required] (main/plugin/app)
-// - arch [required]
-// - uses
-// - implies
-// - watchSet
-// - nodeModulesDirectories
-// - declaredExports
-// - resources
-
-var nextBuildId = 1;
-var Unibuild = function (isopack, options) {
-  var self = this;
-  options = options || {};
-  self.pkg = isopack;
-
-  self.kind = options.kind;
-  self.arch = options.arch;
-
-  self.uses = options.uses;
-  self.implies = options.implies || [];
-
-  // This WatchSet will end up having the watch items from the
-  // SourceArch (such as package.js or .meteor/packages), plus all of
-  // the actual source files for the unibuild (including items that we
-  // looked at to find the source files, such as directories we
-  // scanned).
-  self.watchSet = options.watchSet || new watch.WatchSet();
-
-  // Each Unibuild is given a unique id when it's loaded (it is
-  // not saved to disk). This is just a convenience to make it easier
-  // to keep track of Unibuilds in a map; it's used by bundler
-  // and compiler. We put some human readable info in here too to make
-  // debugging easier.
-  self.id = self.pkg.name + "." + self.kind + "@" + self.arch + "#" +
-    (nextBuildId ++);
-
-  // 'declaredExports' are the variables which are exported from this package.
-  // A list of objects with keys 'name' (required) and 'testOnly' (boolean,
-  // defaults to false).
-  self.declaredExports = options.declaredExports;
-
-  // All of the data provided for eventual inclusion in the bundle,
-  // other than JavaScript that still needs to be fed through the
-  // final link stage. A list of objects with these keys:
-  //
-  // type: "source", "head", "body", "asset". (resources produced by
-  // legacy source handlers can also be "js" or "css".
-  //
-  // data: The contents of this resource, as a Buffer. For example,
-  // for "head", the data to insert in <head>; for "js", the
-  // JavaScript source code (which may be subject to further
-  // processing such as minification); for "asset", the contents of a
-  // static resource such as an image.
-  //
-  // servePath: The (absolute) path at which the resource would prefer
-  // to be served. Interpretation varies by type. For example, always
-  // honored for "asset", ignored for "head" and "body", sometimes
-  // honored for CSS but ignored if we are concatenating.
-  //
-  // sourceMap: Allowed only for "js". If present, a string.
-  //
-  // fileOptions: for "source", the options passed to `api.addFiles`.
-  // plugin-specific.
-  //
-  // extension: for "source", the file extension that this matched
-  // against at build time. null if matched against a specific filename.
-  self.resources = options.resources;
-
-  // Map from absolute paths of node_modules directories to
-  // NodeModulesDirectory objects.
-  self.nodeModulesDirectories = options.nodeModulesDirectories;
-
-  // Provided for backwards compatibility; please use
-  // unibuild.nodeModulesDirectories instead!
-  _.some(self.nodeModulesDirectories, (nmd, nodeModulesPath) => {
-    if (! nmd.local) {
-      self.nodeModulesPath = nodeModulesPath;
-      return true;
-    }
-  });
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -136,6 +59,24 @@ var Isopack = function () {
   self.debugOnly = false;
   self.prodOnly = false;
   self.testOnly = false;
+  self.devOnly = false;
+
+  // TypeScript type declarations entry point (set via api.types() or package-types.json).
+  self.typesEntry = null;
+
+  // Directory of TypeScript declaration files (set via the directory form
+  // of api.types()).  Null in single-file mode.  When set, typesEntry and
+  // typesModules values are full package-root-relative paths inside it.
+  self.typesDir = null;
+
+  // Optional sub-path module type declarations (set via api.types() modules option).
+  self.typesModules = null;
+
+  // The directory this isopack was loaded from (initFromPath) or saved to by
+  // the IsopackCache after a fresh build.  Null for isopacks that only exist
+  // in memory.  Used by the types generator to locate files inside the
+  // on-disk isopack, such as npm/node_modules.
+  self.isopackPath = null;
 
   // Unibuilds, an array of class Unibuild.
   self.unibuilds = [];
@@ -214,7 +155,7 @@ Isopack.knownFormats = ["unipackage-pre2", "isopack-1", "isopack-2"];
 // not semantic, and occur entirely in the isopack.json file, not in the
 // individual unibuild json files. These functions are written assuming those
 // constraints, and were not actually useful in the isopack-1/isopack-2
-// transition,where most of the changes are in the unibuild level, and there's
+// transition, where most of the changes are in the unibuild level, and there's
 // actual semantic changes involved. So they are not actually used as much as
 // they were before.
 Isopack.convertOneStepForward = function (data, fromFormat) {
@@ -246,8 +187,8 @@ Isopack.convertOneStepBackward = function (data, fromFormat) {
 };
 Isopack.convertIsopackFormat = Profile(
   "Isopack.convertIsopackFormat", function (data, fromFormat, toFormat) {
-  var fromPos = _.indexOf(Isopack.knownFormats, fromFormat);
-  var toPos = _.indexOf(Isopack.knownFormats, toFormat);
+  var fromPos = Isopack.knownFormats.indexOf(fromFormat);
+  var toPos = Isopack.knownFormats.indexOf(toFormat);
   var step = fromPos < toPos ? 1 : -1;
 
   if (fromPos === -1) {
@@ -323,7 +264,7 @@ Isopack.readMetadataFromDirectory =
   return {metadata, originalVersion};
 });
 
-_.extend(Isopack.prototype, {
+Object.assign(Isopack.prototype, {
   // Make a dummy (empty) package that contains nothing of interest.
   // XXX used?
   initEmpty: function (name) {
@@ -347,6 +288,10 @@ _.extend(Isopack.prototype, {
     self.debugOnly = options.debugOnly;
     self.prodOnly = options.prodOnly;
     self.testOnly = options.testOnly;
+    self.devOnly = options.devOnly;
+    self.typesEntry = options.typesEntry || null;
+    self.typesDir = options.typesDir || null;
+    self.typesModules = options.typesModules || null;
     self.pluginCacheDir = options.pluginCacheDir || null;
     self.isobuildFeatures = options.isobuildFeatures;
   },
@@ -398,7 +343,7 @@ _.extend(Isopack.prototype, {
     if (! anySourceFiles) {
       return null;
     }
-    return _.keys(sourceFiles);
+    return Object.keys(sourceFiles);
   }),
 
   // An sorted array of all the architectures included in this package.
@@ -416,7 +361,7 @@ _.extend(Isopack.prototype, {
         archSet[arch] = true;
       });
     });
-    var arches = _.keys(archSet).sort();
+    var arches = Object.keys(archSet).sort();
     // Ensure that our buildArchitectures string does not look like
     //    web+os+os.osx.x86_64
     // This would happen if there is an 'os' unibuild but a platform-specific
@@ -431,9 +376,32 @@ _.extend(Isopack.prototype, {
 
   // A sorted plus-separated string of all the architectures included in this
   // package.
-  buildArchitectures: function () {
-    var self = this;
-    return self.architectures().join('+');
+  buildArchitectures(simplify) {
+    const arches = this.architectures();
+
+    if (simplify) {
+      const simpler = [];
+
+      arches.forEach(arch => {
+        const parts = arch.split(".");
+        while (parts.length > 1) {
+          parts.pop();
+          if (arches.indexOf(parts.join(".")) >= 0) {
+            // If the arches array contains a strict prefix of this arch,
+            // omit this arch from the result, since it should be covered
+            // by the prefix. For example, if arches contains "web" or
+            // "web.browser" then it shouldn't need to contain
+            // "web.browser.legacy" as well.
+            return;
+          }
+        }
+        simpler.push(arch);
+      });
+
+      return simpler.join("+");
+    }
+
+    return arches.join("+");
   },
 
   // Returns true if we think that this isopack is platform specific (contains
@@ -494,7 +462,7 @@ _.extend(Isopack.prototype, {
 
   // If this package has plugins, initialize them (run the startup
   // code in them so that they register their extensions). Idempotent.
-  ensurePluginsInitialized: Profile("Isopack#ensurePluginsInitialized", function () {
+  ensurePluginsInitialized: Profile("Isopack#ensurePluginsInitialized", async function () {
     var self = this;
 
     buildmessage.assertInJob();
@@ -510,31 +478,42 @@ _.extend(Isopack.prototype, {
     self.sourceProcessors.minifier = new buildPluginModule.SourceProcessorSet(
       self.displayName(), { singlePackage: true });
 
-    _.each(self.plugins, function (pluginsByArch, name) {
+    for (const [name, pluginsByArch] of Object.entries(self.plugins)) {
       var arch = archinfo.mostSpecificMatch(
-        archinfo.host(), _.keys(pluginsByArch));
+          archinfo.host(), Object.keys(pluginsByArch));
       if (! arch) {
         buildmessage.error("package `" + name + "` is built for incompatible " +
-                           "architecture");
+            "architecture");
         // Recover by ignoring plugin
         // XXX does this recovery work?
-        return;
+        continue;
       }
 
       var plugin = pluginsByArch[arch];
-      buildmessage.enterJob({
+      await buildmessage.enterJob({
         title: "loading plugin `" + name +
-          "` from package `" + self.name + "`"
+            "` from package `" + self.name + "`"
         // don't necessarily have rootPath anymore
         // (XXX we do, if the isopack was locally built, which is
         // the important case for debugging. it'd be nice to get this
         // case right.)
-      }, function () {
+      }, async function () {
         // Make a new Plugin API object for this plugin.
-        var Plugin = self._makePluginApi();
-        plugin.load({ Plugin: Plugin, Profile: Profile });
+        const Plugin = self._makePluginApi(name);
+        const __meteor_bootstrap__ = {
+          isFibersDisabled: true,
+          // Set to null to tell Meteor.startup to call hooks immediately
+          // XXX: should we fully support startup hooks in build plugins?
+          startupHooks: null
+        };
+
+        await plugin.load({
+          Plugin,
+          Profile,
+          __meteor_bootstrap__
+        });
       });
-    });
+    }
 
     // Instantiate each of the registered batch plugins.  Note that we don't
     // do this directly in the registerCompiler (etc) call, because we want
@@ -542,16 +521,16 @@ _.extend(Isopack.prototype, {
     //   Plugin.registerCompiler({...}, function () { return new C; });
     //   var C = function () {...}
     // and so we want to wait for C to be defined.
-    _.each(self.sourceProcessors, (sourceProcessorSet) => {
-      _.each(sourceProcessorSet.allSourceProcessors, (sourceProcessor) => {
-        sourceProcessor.instantiatePlugin();
-      });
-    });
+    for (const sourceProcessorSet of Object.values(self.sourceProcessors)) {
+      for (const sourceProcessor of sourceProcessorSet.allSourceProcessors) {
+        await sourceProcessor.instantiatePlugin();
+      }
+    }
 
     self._pluginsInitialized = true;
   }),
 
-  _makePluginApi: function () {
+  _makePluginApi: function (pluginName) {
     var isopack = this;
 
     /**
@@ -560,6 +539,21 @@ _.extend(Isopack.prototype, {
      * @summary The namespace that is exposed inside build plugin files.
      */
     var Plugin = {
+      name: pluginName,
+
+      // Share the meteorConfig object as part of plugin API
+      getMeteorConfig: getMeteorConfig,
+
+      // Share functions to get the dev bundle context
+      getDevBundle,
+      getCurrentNodeBinDir,
+
+      // Share the rspackHelpers as part of plugin API
+      rspackHelpers,
+
+      // Share the runLogInstance as part of plugin API
+      runLogInstance,
+
       // 'extension' is a file extension without the separation dot
       // (eg 'js', 'coffee', 'coffee.md')
       //
@@ -720,7 +714,7 @@ _.extend(Isopack.prototype, {
        * @param {Function} factory A function that returns an instance
        * of a compiler class.
        *
-       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://github.com/meteor/meteor/wiki/Build-Plugins-API).
+       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://docs.meteor.com/api/packagejs.html#build-plugin-api).
        * @memberOf Plugin
        * @locus Build Plugin
        */
@@ -768,7 +762,7 @@ _.extend(Isopack.prototype, {
        * @param {Function} factory A function that returns an instance
        * of a linter class.
        *
-       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://github.com/meteor/meteor/wiki/Build-Plugins-API).
+       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://docs.meteor.com/api/packagejs.html#build-plugin-api).
        * @memberOf Plugin
        * @locus Build Plugin
        */
@@ -820,13 +814,13 @@ _.extend(Isopack.prototype, {
        * @param {Function} factory A function that returns an instance
        * of a minifier class.
        *
-       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://github.com/meteor/meteor/wiki/Build-Plugins-API).
+       * More detailed documentation for build plugins is available [on the GitHub Wiki](https://docs.meteor.com/api/packagejs.html#build-plugin-api).
        * @memberOf Plugin
        * @locus Build Plugin
        */
       registerMinifier: function (options, factory) {
-        var badUsedExtension = _.find(options.extensions, function (ext) {
-          return ! _.contains(['js', 'css'], ext);
+        var badUsedExtension = options.extensions.find(function (ext) {
+          return ! ['js', 'css'].includes(ext);
         });
 
         if (badUsedExtension !== undefined) {
@@ -847,7 +841,10 @@ _.extend(Isopack.prototype, {
       },
 
       nudge: function () {
-        Console.nudge(true);
+        Console.nudge();
+      },
+      yield: function () {
+        return Console.yield();
       },
 
       convertToOSPath: files.convertToOSPath,
@@ -862,7 +859,7 @@ _.extend(Isopack.prototype, {
         extname: files.pathExtname,
         sep: files.pathSep
       },
-      fs: files.fsFixPath
+      fs: fsFixPath,
     };
     return Plugin;
   },
@@ -873,7 +870,7 @@ _.extend(Isopack.prototype, {
   // - isopackBuildInfoJson: parsed isopack-buildinfo.json object,
   //   if loading from an IsopackCache.
   initFromPath: Profile(
-    "Isopack#initFromPath", function (name, dir, options) {
+    "Isopack#initFromPath", async function (name, dir, options) {
     var self = this;
     options = _.clone(options || {});
     options.firstIsopack = true;
@@ -882,10 +879,16 @@ _.extend(Isopack.prototype, {
       self.pluginCacheDir = options.pluginCacheDir;
     }
 
-    return self._loadUnibuildsFromPath(name, dir, options);
+    // Remember where this isopack lives on disk.  We deliberately record the
+    // path as given (in the tropohouse this is a symlink that is swapped when
+    // more unibuilds are merged in), so consumers always see the current
+    // contents.
+    self.isopackPath = dir;
+
+    await self._loadUnibuildsFromPath(name, dir, options);
   }),
 
-  _loadUnibuildsFromPath: function (name, dir, options) {
+  _loadUnibuildsFromPath: async function (name, dir, options) {
     var self = this;
     options = options || {};
 
@@ -895,7 +898,7 @@ _.extend(Isopack.prototype, {
     // realpath'ing dir.
     dir = files.realpath(dir);
 
-    var {metadata: mainJson} = Isopack.readMetadataFromDirectory(dir);
+    var {metadata: mainJson} = await Isopack.readMetadataFromDirectory(dir);
     if (! mainJson) {
       throw new Error("No metadata files found for isopack at: " + dir);
     }
@@ -947,11 +950,15 @@ _.extend(Isopack.prototype, {
       self.debugOnly = !!mainJson.debugOnly;
       self.prodOnly = !!mainJson.prodOnly;
       self.testOnly = !!mainJson.testOnly;
+      self.devOnly = !!mainJson.devOnly;
+      self.typesEntry = mainJson.typesEntry || null;
+      self.typesDir = mainJson.typesDir || null;
+      self.typesModules = mainJson.typesModules || null;
     }
-    _.each(mainJson.plugins, function (pluginMeta) {
+    for (const pluginMeta of mainJson.plugins) {
       rejectBadPath(pluginMeta.path);
 
-      var plugin = bundler.readJsImage(files.pathJoin(dir, pluginMeta.path));
+      var plugin = await bundler.readJsImage(files.pathJoin(dir, pluginMeta.path));
 
       if (!_.has(self.plugins, pluginMeta.name)) {
         self.plugins[pluginMeta.name] = {};
@@ -960,9 +967,9 @@ _.extend(Isopack.prototype, {
       if (!_.has(self.plugins[pluginMeta.name], plugin.arch)) {
         self.plugins[pluginMeta.name][plugin.arch] = plugin;
       }
-    });
+    }
     self.pluginsBuilt = true;
-    _.each(mainJson.builds, function (unibuildMeta) {
+    for (const unibuildMeta of mainJson.builds) {
       // aggressively sanitize path (don't let it escape to parent
       // directory)
       rejectBadPath(unibuildMeta.path);
@@ -972,145 +979,32 @@ _.extend(Isopack.prototype, {
         return unibuild.arch === unibuildMeta.arch;
       });
       if (alreadyHaveUnibuild) {
-        return;
+        continue;
       }
 
-      var unibuildJson = JSON.parse(
-        files.readFile(files.pathJoin(dir, unibuildMeta.path)));
-
-      var unibuildBasePath =
-        files.pathDirname(files.pathJoin(dir, unibuildMeta.path));
-
-      if (unibuildJson.format !== "unipackage-unibuild-pre1" &&
-          unibuildJson.format !== "isopack-2-unibuild") {
-        throw new Error("Unsupported isopack unibuild format: " +
-                        JSON.stringify(unibuildJson.format));
-      }
-
-      // Is this unibuild the legacy pre-"compiler plugin" format which contains
-      // "prelink" resources of pre-processed JS files (as well as the
-      // "packageVariables" field) instead of individual "source" resources (and
-      // a "declaredExports" field)?
-      var unibuildHasPrelink =
-            unibuildJson.format === "unipackage-unibuild-pre1";
-
-      var resources = [];
-
-      _.each(unibuildJson.resources, function (resource) {
-        rejectBadPath(resource.file);
-        var data = files.readBufferWithLengthAndOffset(
-          files.pathJoin(unibuildBasePath, resource.file),
-          resource.length, resource.offset);
-
-        if (resource.type === "prelink") {
-          if (! unibuildHasPrelink) {
-            throw Error("Unexpected prelink resource in " +
-                        unibuildJson.format + " at " + dir);
-          }
-          // We found a "prelink" resource, because we're processing a package
-          // published with an older version of Meteor which did not create
-          // isopack-2 isopacks and which always preprocessed and linked all JS
-          // files instead of leaving that until bundle time.  Let's pretend it
-          // was just a single js source file, but leave a "legacyPrelink" field
-          // on it so we can not re-link that part (and not re-analyze for
-          // assigned variables).
-          var prelinkResource = {
-            type: "source",
-            extension: "js",
-            data: data,
-            path: resource.servePath,
-            // It's a shame to have to calculate the hash here instead of having
-            // it on disk, but this only runs for legacy packages anyway.
-            hash: watch.sha1(data),
-            // Legacy prelink files definitely don't have a source processor!
-            // They were created by an Isobuild that didn't even know about
-            // source processors!
-            usesDefaultSourceProcessor: true,
-            legacyPrelink: {
-              packageVariables: unibuildJson.packageVariables || []
-            }
-          };
-          if (resource.sourceMap) {
-            rejectBadPath(resource.sourceMap);
-            prelinkResource.legacyPrelink.sourceMap = files.readFile(
-              files.pathJoin(unibuildBasePath, resource.sourceMap), 'utf8');
-          }
-          resources.push(prelinkResource);
-        } else if (resource.type === "source") {
-          resources.push({
-            type: "source",
-            extension: resource.extension,
-            usesDefaultSourceProcessor:
-              !! resource.usesDefaultSourceProcessor,
-            data: data,
-            path: resource.path,
-            hash: resource.hash,
-            fileOptions: resource.fileOptions
-          });
-        } else if (_.contains(["head", "body", "css", "js", "asset"],
-                              resource.type)) {
-          resources.push({
-            type: resource.type,
-            data: data,
-            servePath: resource.servePath || undefined,
-            path: resource.path || undefined
-          });
-        } else {
-          throw new Error("bad resource type in isopack: " +
-                          JSON.stringify(resource.type));
-        }
-      });
-
-      var declaredExports;
-      if (unibuildHasPrelink) {
-        // Legacy unibuild; it stores packageVariables and says some of them
-        // are exports.
-        declaredExports = [];
-        _.each(unibuildJson.packageVariables, function (pv) {
-          if (pv.export) {
-            declaredExports.push({
-              name: pv.name,
-              testOnly: pv.export === 'tests'
-            });
-          }
-        });
-      } else {
-        declaredExports = unibuildJson.declaredExports || [];
-      }
-
-      unibuildJson.uses && unibuildJson.uses.forEach((use) => {
-        if (!use.weak && compiler.isIsobuildFeaturePackage(use.package) &&
-            self.isobuildFeatures.indexOf(use.package) === -1) {
-          self.isobuildFeatures.push(use.package);
-        }
-      });
-
-      // Rebuild binary npm packages if unibuild arch matches host arch.
-      const rebuildBinaries = archinfo.matches(
-        archinfo.host(),
-        unibuildMeta.arch
-      );
-
-      const nodeModulesDirectories = bundler.NodeModulesDirectory
-        .readDirsFromJSON(unibuildJson.node_modules, {
-          packageName: self.name,
-          sourceRoot: unibuildBasePath,
-          rebuildBinaries,
-        });
-
-      self.unibuilds.push(new Unibuild(self, {
-        // At some point we stopped writing 'kind's to the metadata file, so
-        // default to main.
-        kind: unibuildMeta.kind || 'main',
+      const unibuild = await Unibuild.fromJSON(JSON.parse(
+          files.readFile(files.pathJoin(dir, unibuildMeta.path))
+      ), {
+        isopack: self,
+        kind: unibuildMeta.kind,
         arch: unibuildMeta.arch,
-        uses: unibuildJson.uses,
-        implies: unibuildJson.implies,
+        unibuildBasePath: files.pathDirname(
+            files.pathJoin(dir, unibuildMeta.path)),
         watchSet: unibuildWatchSets[unibuildMeta.path],
-        nodeModulesDirectories,
-        declaredExports: declaredExports,
-        resources: resources
-      }));
-    });
+      });
+
+      if (unibuild.uses) {
+        unibuild.uses.forEach(use => {
+          if (! use.weak &&
+              compiler.isIsobuildFeaturePackage(use.package) &&
+              self.isobuildFeatures.indexOf(use.package) === -1) {
+            self.isobuildFeatures.push(use.package);
+          }
+        });
+      }
+
+      self.unibuilds.push(unibuild);
+    }
 
     self.cordovaDependencies = mainJson.cordovaDependencies || null;
 
@@ -1179,7 +1073,10 @@ _.extend(Isopack.prototype, {
   //   of this flag is allow us to optimize cases that never need to write the
   //   older format, such as the per-app isopack cache.)
   // - isopackCache: isopack cache in which this isopack is registered
-  saveToPath: Profile("Isopack#saveToPath", function (outputDir, {
+  /**
+   * @return {Promise<void>}
+   */
+  saveToPath: Profile("Isopack#saveToPath", async function (outputDir, {
     includePreCompilerPluginIsopackVersions,
     includeIsopackBuildInfo,
     isopackCache = null,
@@ -1188,6 +1085,7 @@ _.extend(Isopack.prototype, {
     var outputPath = outputDir;
 
     var builder = new Builder({ outputPath: outputPath });
+    await builder.init();
     try {
       var mainJson = {
         name: self.name,
@@ -1206,6 +1104,18 @@ _.extend(Isopack.prototype, {
       }
       if (self.testOnly) {
         mainJson.testOnly = true;
+      }
+      if (self.devOnly) {
+        mainJson.devOnly = true;
+      }
+      if (self.typesEntry) {
+        mainJson.typesEntry = self.typesEntry;
+      }
+      if (self.typesDir) {
+        mainJson.typesDir = self.typesDir;
+      }
+      if (self.typesModules) {
+        mainJson.typesModules = self.typesModules;
       }
       if (! _.isEmpty(self.cordovaDependencies)) {
         mainJson.cordovaDependencies = self.cordovaDependencies;
@@ -1258,8 +1168,8 @@ _.extend(Isopack.prototype, {
       // to see if package.js exists instead of just looking for the package
       // directory.)
       // XXX Remove this once we can.
-      builder.write("package.js", {
-        data: new Buffer(
+      await builder.write("package.js", {
+        data: Buffer.from(
           ("// This file is included for compatibility with the Meteor " +
            "0.6.4 package downloader.\n"),
           "utf8")
@@ -1268,220 +1178,93 @@ _.extend(Isopack.prototype, {
       var unibuildInfos = [];
 
       // Unibuilds
-      _.each(self.unibuilds, function (unibuild) {
+      for (const unibuild of self.unibuilds) {
         // Make up a filename for this unibuild
         var baseUnibuildName = unibuild.arch;
         var unibuildDir =
-          builder.generateFilename(baseUnibuildName, { directory: true });
+            await builder.generateFilename(baseUnibuildName, { directory: true });
         var unibuildJsonFile =
-          builder.generateFilename(baseUnibuildName + ".json");
+            await builder.generateFilename(baseUnibuildName + ".json");
         mainJson.builds.push({
           kind: unibuild.kind,
           arch: unibuild.arch,
           path: unibuildJsonFile
         });
 
-        var jsResourcesForLegacyPrelink = [];
-
         // Save unibuild dependencies. Keyed by the json path rather than thinking
         // too hard about how to encode pair (name, arch).
         if (isopackBuildInfoJson) {
           isopackBuildInfoJson.unibuildDependencies[unibuildJsonFile] =
-            unibuild.watchSet.toJSON();
-        }
-
-        // Figure out where the npm dependencies go.
-        let node_modules = {};
-        _.each(unibuild.nodeModulesDirectories, nmd => {
-          const bundlePath = _.has(npmDirsToCopy, nmd.sourcePath)
-            // We already have this npm directory from another unibuild.
-            ? npmDirsToCopy[nmd.sourcePath]
-            : npmDirsToCopy[nmd.sourcePath] = builder.generateFilename(
-              nmd.getPreferredBundlePath("isopack"),
-              { directory: true }
-            );
-          node_modules[bundlePath] = nmd.toJSON();
-        });
-
-        const preferredPaths = Object.keys(node_modules);
-        if (preferredPaths.length === 1) {
-          // For backwards compatibility, if there's only one node_modules
-          // directory, store it as a single string.
-          node_modules = preferredPaths[0];
-        }
-
-        // Construct unibuild metadata
-        var unibuildJson = {
-          format: "isopack-2-unibuild",
-          declaredExports: unibuild.declaredExports,
-          uses: _.map(unibuild.uses, function (u) {
-            return {
-              'package': u.package,
-              // For cosmetic value, leave false values for these options out of
-              // the JSON file.
-              constraint: u.constraint || undefined,
-              unordered: u.unordered || undefined,
-              weak: u.weak || undefined
-            };
-          }),
-          implies: (_.isEmpty(unibuild.implies) ? undefined : unibuild.implies),
-          resources: []
-        };
-
-        if (preferredPaths.length > 0) {
-          // If there are no node_modules directories, don't confuse older
-          // versions of Meteor by storing an empty object.
-          unibuildJson.node_modules = node_modules;
+              unibuild.watchSet.toJSON();
         }
 
         const usesModules = ! isopackCache ||
-          isopackCache.uses(self, "modules", unibuild.arch);
+            isopackCache.uses(self, "modules", unibuild.arch);
 
-        // Output 'head', 'body' resources nicely
-        var concat = { head: [], body: [] };
-        var offset = { head: 0, body: 0 };
-        _.each(unibuild.resources, function (resource) {
-          if (_.contains(["head", "body"], resource.type)) {
-            if (concat[resource.type].length) {
-              concat[resource.type].push(new Buffer("\n", "utf8"));
-              offset[resource.type]++;
-            }
-            if (! (resource.data instanceof Buffer)) {
-              throw new Error("Resource data must be a Buffer");
-            }
-
-            if (! usesModules &&
-                resource.fileOptions &&
-                resource.fileOptions.lazy) {
-              // Omit lazy resources from the unibuild JSON file.
-              return;
-            }
-
-            unibuildJson.resources.push({
-              type: resource.type,
-              file: files.pathJoin(unibuildDir, resource.type),
-              length: resource.data.length,
-              offset: offset[resource.type]
-            });
-
-            concat[resource.type].push(resource.data);
-            offset[resource.type] += resource.data.length;
-          }
+        const unibuildJson = await unibuild.toJSON({
+          builder,
+          unibuildDir,
+          usesModules,
+          npmDirsToCopy,
         });
 
-        _.each(concat, function (parts, type) {
-          if (parts.length) {
-            builder.write(files.pathJoin(unibuildDir, type), {
-              data: Buffer.concat(concat[type], offset[type])
-            });
-          }
-        });
-
-        // Output other resources each to their own file
-        _.each(unibuild.resources, function (resource) {
-          if (_.contains(["head", "body"], resource.type)) {
-            // already did this one
-            return;
-          }
-
-          const generatedFilename =
-            builder.writeToGeneratedFilename(
-              files.pathJoin(unibuildDir,
-                             resource.servePath || resource.path),
-              { data: resource.data });
-
-          if (! usesModules &&
-              resource.fileOptions &&
-              resource.fileOptions.lazy) {
-            // Omit lazy resources from the unibuild JSON file, but only
-            // after they are copied into the bundle (immediately above).
-            return;
-          }
-
-          // If we're going to write a legacy prelink file later, track the
-          // original form of the resource object (with the source in a Buffer,
-          // etc) instead of the later version.  #HardcodeJs
-          if (writeLegacyBuilds &&
-              resource.type === "source" &&
-              resource.extension == "js") {
-            jsResourcesForLegacyPrelink.push({
-              data: resource.data,
-              hash: resource.hash,
-              servePath: unibuild.pkg._getServePath(resource.path),
-              bare: resource.fileOptions && resource.fileOptions.bare,
-              sourceMap: resource.sourceMap,
-              // If this file was actually read from a legacy isopack and is
-              // itself prelinked, this will be an object with some metadata
-              // about it, and we can skip re-running prelink later.
-              legacyPrelink: resource.legacyPrelink
-            });
-          }
-
-          unibuildJson.resources.push({
-            type: resource.type,
-            extension: resource.extension,
-            file: generatedFilename,
-            length: resource.data.length,
-            offset: 0,
-            usesDefaultSourceProcessor:
-              resource.usesDefaultSourceProcessor || undefined,
-            servePath: resource.servePath || undefined,
-            path: resource.path || undefined,
-            hash: resource.hash || undefined,
-            fileOptions: resource.fileOptions || undefined
-          });
-        });
+        // If we're going to write a legacy prelink file later, track the
+        // original form of the resource object (with the source in a
+        // Buffer, etc) instead of the later version.  #HardcodeJs
+        const jsResourcesForLegacyPrelink =
+            writeLegacyBuilds ? unibuild.getLegacyJsResources() : [];
 
         // Control file for unibuild
-        builder.writeJson(unibuildJsonFile, unibuildJson);
+        await builder.writeJson(unibuildJsonFile, unibuildJson);
+
         unibuildInfos.push({
-          unibuild: unibuild,
-          unibuildJson: unibuildJson,
-          jsResourcesForLegacyPrelink: jsResourcesForLegacyPrelink
+          unibuild,
+          unibuildJson,
+          jsResourcesForLegacyPrelink,
         });
-      });
+      }
 
       // If unibuilds included node_modules, copy them in.
-      _.each(npmDirsToCopy, (bundlePath, sourcePath) => {
-        builder.copyDirectory({
+      for (const [sourcePath, bundlePath] of Object.entries(npmDirsToCopy)) {
+        await builder.copyNodeModulesDirectory({
           from: sourcePath,
           to: bundlePath,
           npmDiscards: self.npmDiscards,
           symlink: false
         });
-      });
+      }
 
       // Plugins
-      _.each(self.plugins, function (pluginsByArch, name) {
-        _.each(pluginsByArch, function (plugin) {
+      for (const [name, pluginsByArch] of Object.entries(self.plugins)) {
+        for (const plugin of Object.values(pluginsByArch)) {
           // XXX the name of the plugin doesn't typically contain a colon, but
           // escape it just in case.
-          var pluginDir = builder.generateFilename(
-            'plugin.' + colonConverter.convert(name) + '.' + plugin.arch,
-            { directory: true });
-          var pluginBuild = plugin.write(builder.enter(pluginDir));
+          var pluginDir = await builder.generateFilename(
+              'plugin.' + colonConverter.convert(name) + '.' + plugin.arch,
+              { directory: true });
+          var pluginBuild = await plugin.write(await builder.enter(pluginDir));
           var pluginEntry = {
             name: name,
             arch: plugin.arch,
             path: files.pathJoin(pluginDir, pluginBuild.controlFile)
           };
           mainJson.plugins.push(pluginEntry);
-        });
-      });
+        }
+      }
 
       // Tools
       // First, are we supposed to include our own source as a tool?
       if (self.includeTool) {
-        var toolsJson = self._writeTool(builder);
+        var toolsJson = await self._writeTool(builder);
         mainJson.tools = toolsJson;
       }
       // Next, what about other tools we may be merging from other isopacks?
       // XXX check for overlap
-      _.each(self.toolsOnDisk, function (toolMeta) {
+      for (let toolMeta of self.toolsOnDisk) {
         toolMeta = _.clone(toolMeta);
         var rootDir = toolMeta.rootDir;
         delete toolMeta.rootDir;
-        builder.copyDirectory({
+        await builder.copyDirectory({
           from: files.pathJoin(rootDir, toolMeta.path),
           to: toolMeta.path,
           symlink: false
@@ -1490,20 +1273,23 @@ _.extend(Isopack.prototype, {
           mainJson.tools = [];
         }
         mainJson.tools.push(toolMeta);
-      });
+      }
 
       var mainLegacyJson = null;
       if (writeLegacyBuilds) {
         mainLegacyJson = _.clone(mainJson);
+        delete mainLegacyJson.typesEntry;
+        delete mainLegacyJson.typesDir;
+        delete mainLegacyJson.typesModules;
         mainLegacyJson.builds = [];
 
-        _.each(unibuildInfos, function (unibuildInfo) {
+        for (const unibuildInfo of unibuildInfos) {
           var unibuild = unibuildInfo.unibuild;
           var unibuildJson = unibuildInfo.unibuildJson;
           var jsResourcesForLegacyPrelink =
-                unibuildInfo.jsResourcesForLegacyPrelink;
-          var legacyFilename = builder.generateFilename(
-            unibuild.arch + '-legacy.json');
+              unibuildInfo.jsResourcesForLegacyPrelink;
+          var legacyFilename = await builder.generateFilename(
+              unibuild.arch + '-legacy.json');
           var legacyDir = unibuild.arch + '-legacy';
           mainLegacyJson.builds.push({
             kind: unibuild.kind,
@@ -1531,7 +1317,7 @@ _.extend(Isopack.prototype, {
               // already, in the format that linker.prelink understands.
             } else {
               throw Error(
-                "shouldn't write legacy builds for non-JS/CSS source "
+                  "shouldn't write legacy builds for non-JS/CSS source "
                   + JSON.stringify(resource));
             }
           });
@@ -1548,7 +1334,7 @@ _.extend(Isopack.prototype, {
             // assignment differs from that below), ah well.
             prelinkData = prelinkFile.data;
             packageVariables =
-              jsResourcesForLegacyPrelink[0].legacyPrelink.packageVariables;
+                jsResourcesForLegacyPrelink[0].legacyPrelink.packageVariables;
           } else {
             // Determine captured variables, legacy way. First, start with the
             // exports. We'll add the package variables after running prelink.
@@ -1567,24 +1353,24 @@ _.extend(Isopack.prototype, {
 
             if (jsResourcesForLegacyPrelink.length) {
               // Not originally legacy; let's run prelink to make it legacy.
-              var results = linker.prelink({
+              var results = await linker.prelink({
                 inputFiles: jsResourcesForLegacyPrelink,
                 // I was confused about this, so I am leaving a comment -- the
                 // combinedServePath is either [pkgname].js or [pluginName]:plugin.js.
                 // XXX: If we change this, we can get rid of source arch names!
                 combinedServePath: (
-                  "/packages/" + colonConverter.convert(
-                    unibuild.pkg.name +
-                      (unibuild.kind === "main" ? "" : (":" + unibuild.kind)) +
-                      ".js")),
+                    "/packages/" + colonConverter.convert(
+                        unibuild.pkg.name +
+                        (unibuild.kind === "main" ? "" : (":" + unibuild.kind)) +
+                        ".js")),
                 name: unibuild.pkg.name
               });
               if (results.files.length !== 1) {
                 throw Error("prelink should return 1 file, not " +
-                            results.files.length);
+                    results.files.length);
               }
               prelinkFile = results.files[0];
-              prelinkData = new Buffer(prelinkFile.source, 'utf8');
+              prelinkData = Buffer.from(prelinkFile.source, 'utf8');
 
               _.each(results.assignedVariables, function (name) {
                 if (_.has(packageVariableNames, name)) {
@@ -1601,9 +1387,9 @@ _.extend(Isopack.prototype, {
           if (prelinkFile && prelinkData) {
             var prelinkResource = {
               type: 'prelink',
-              file: builder.writeToGeneratedFilename(
-                files.pathJoin(legacyDir, prelinkFile.servePath),
-                { data: prelinkData }),
+              file: await builder.writeToGeneratedFilename(
+                  files.pathJoin(legacyDir, prelinkFile.servePath),
+                  { data: prelinkData }),
               length: prelinkData.length,
               offset: 0,
               servePath: prelinkFile.servePath || undefined
@@ -1616,9 +1402,9 @@ _.extend(Isopack.prototype, {
               //      so here's some exhaustive checking of things buffer
               //      _will_ accept.
               var acceptedByBuffer = _.isString(prelinkFile.sourceMap)
-                    || _.isNumber(prelinkFile.sourceMap)
-                    || _.isArray(prelinkFile.sourceMap)
-                    || (prelinkFile.sourceMap instanceof Buffer);
+                  || _.isNumber(prelinkFile.sourceMap)
+                  || _.isArray(prelinkFile.sourceMap)
+                  || (prelinkFile.sourceMap instanceof Buffer);
               if (!acceptedByBuffer) {
                 prelinkFile.sourceMap = JSON.stringify(prelinkFile.sourceMap);
               }
@@ -1628,9 +1414,9 @@ _.extend(Isopack.prototype, {
                 prelinkFile.sourceMap = JSON.stringify(prelinkFile.sourceMap);
               }
 
-              prelinkResource.sourceMap = builder.writeToGeneratedFilename(
-                files.pathJoin(legacyDir, prelinkFile.servePath + '.map'),
-                { data: new Buffer(prelinkFile.sourceMap, 'utf8') }
+              prelinkResource.sourceMap = await builder.writeToGeneratedFilename(
+                  files.pathJoin(legacyDir, prelinkFile.servePath + '.map'),
+                  { data: Buffer.from(prelinkFile.sourceMap, 'utf8') }
               );
             }
             newResources.push(prelinkResource);
@@ -1642,13 +1428,13 @@ _.extend(Isopack.prototype, {
 
           unibuildJson.resources = newResources;
           delete unibuildJson.declaredExports;
-          builder.writeJson(legacyFilename, unibuildJson);
-        });
+          await builder.writeJson(legacyFilename, unibuildJson);
+        }
 
         // old unipackage.json format/filename.  no point to save this if
         // we can't even support isopack-1.
         // XXX COMPAT WITH 0.9.3
-        builder.writeJson(
+        await builder.writeJson(
           "unipackage.json",
           Isopack.convertIsopackFormat(
             // Note that mainLegacyJson is isopack-1 (has no "source" resources)
@@ -1671,22 +1457,22 @@ _.extend(Isopack.prototype, {
       //   isopack-1: {... data ...},
       //   isopack-2: {... data ...}
       // }
-      builder.writeJson("isopack.json", isopackJson);
+      await builder.writeJson("isopack.json", isopackJson);
 
       if (isopackBuildInfoJson) {
-        builder.writeJson("isopack-buildinfo.json", isopackBuildInfoJson);
+        await builder.writeJson("isopack-buildinfo.json", isopackBuildInfoJson);
       }
-      builder.complete();
+      await builder.complete();
     } catch (e) {
-      builder.abort();
+      await builder.abort();
       throw e;
     }
   }),
 
-  _writeTool: Profile("Isopack#_writeTool", function (builder) {
+  _writeTool: Profile("Isopack#_writeTool", async function (builder) {
     var self = this;
 
-    var pathsToCopy = utils.runGitInCheckout(
+    var pathsToCopy = await utils.runGitInCheckout(
       'ls-tree',
       '-r',
       '--name-only',
@@ -1696,41 +1482,52 @@ _.extend(Isopack.prototype, {
       'tools', 'examples', 'LICENSE.txt', 'LICENSES',
       'meteor', 'meteor.bat', 'scripts/admin/launch-meteor',
       'packages/package-version-parser/package-version-parser.js',
-      'packages/meteor/flush-buffers-on-exit-in-windows.js');
+      'packages/core-runtime/package-registry.js',
+      'packages/meteor/flush-buffers-on-exit-in-windows.js',
+    );
 
-    // Trim blank line and unnecessary examples.
+    // 1. Trim blank lines and unnecessary examples.
+    // 2. Exclude `tools/e2e-tests`: These are massive internal dummy fixture apps
+    //    that serve no purpose for end-users and would otherwise bloat the published 
+    //    meteor-tool isopack download. 
+    //    Additionally, these fixtures contain complex symlinks which, on Windows checkouts 
+    //    (where core.symlinks=false), are created as plain text files. If not excluded, 
+    //    Babel attempts to transpile those text files here and throws a SyntaxError, crashing the build.
+    // NOTE: This _writeTool method is only ever executed when compiling the `meteor-tool` 
+    // package itself from a checkout, so these exclusions have zero impact on normal Meteor apps.
     pathsToCopy = _.filter(pathsToCopy.split('\n'), function (f) {
       return f && !f.match(/^examples\/other/) &&
-        !f.match(/^examples\/unfinished/);
+        !f.match(/^examples\/unfinished/) &&
+        !f.match(/^tools\/e2e-tests/);
     });
 
-    // Regexes matching paths to transpile using babel
-    var transpileRegexes = [
-      /^tools\/[^\/]+\.js$/, // General tools files
-      /^tools\/isobuild\/[^\/]+\.js$/, // Isobuild files
-      /^tools\/cli\/[^\/]+\.js$/, // CLI files
-      /^tools\/tool-env\/[^\/]+\.js$/, // Tool initiation and clean up
-      /^tools\/runners\/[^\/]+\.js$/, // Parts of tool process
-      /^tools\/packaging\/[^\/]+\.js$/,
-      /^tools\/packaging\/catalog\/[^\/]+\.js$/,
-      /^tools\/utils\/[^\/]+\.js$/,
-      /^tools\/fs\/[^\/]+\.js$/,
-      /^tools\/meteor-services\/[^\/]+\.js$/,
-      /^tools\/tool-testing\/[^\/]+\.js$/,
-      /^tools\/console\/[^\/]+\.js$/,
-      /^tools\/cordova\/[^\/]+\.js$/,
-      // We don't support running self-test from an install anymore
-    ];
+    function shouldTranspile(path) {
+      const parts = path.split("/");
+      if (parts[0] === "tools" &&
+          (path.endsWith(".js") || path.endsWith(".ts"))) {
+        if (path.endsWith(".d.ts")) {
+          // The official TypeScript compiler's transpileModule function fails
+          // for .d.ts declaration files with the cryptic error "Error: Debug
+          // Failure. Output generation failed".
+          return false;
+        }
+        if (parts[1] === "static-assets") {
+          return parts[2] === "server";
+        }
+        if (parts[1] !== "node_modules" &&
+            parts[1] !== "tests") {
+          return true;
+        }
+      }
+      return false;
+    }
 
     // Split pathsToCopy into two arrays - one of files that should be copied
     // directly, and one of files that should be transpiled with Babel
     var pathsToTranspile = [];
     var pathsToCopyStraight = [];
-    pathsToCopy.forEach((path) => {
-      var shouldTranspile =
-        _.some(transpileRegexes, (regex) => path.match(regex));
-
-      if (shouldTranspile) {
+    pathsToCopy.forEach(path => {
+      if (shouldTranspile(path)) {
         pathsToTranspile.push(path);
       } else {
         pathsToCopyStraight.push(path);
@@ -1739,52 +1536,19 @@ _.extend(Isopack.prototype, {
 
     // Set up builder to write to the correct directory
     var toolPath = 'mt-' + archinfo.host();
-    builder = builder.enter(toolPath);
+    builder = await builder.enter(toolPath);
 
-    // Transpile the files we selected
-    var babel = require("meteor-babel");
-    pathsToTranspile.forEach((path) => {
-      var fullPath = files.convertToOSPath(
-        files.pathJoin(files.getCurrentToolsDir(), path));
-
-      var inputFileContents = files.readFile(fullPath, "utf-8");
-
-      // #RemoveInProd
-      // We don't actually want to load the babel auto-transpiler when we are
-      // in a Meteor installation where everything is already transpiled for us.
-      // Therefore, strip out that line in main.js
-      if (path === "tools/tool-env/install-babel.js" ||
-          path === "tools/tool-env/source-map-retriever-stack.js") {
-        inputFileContents = inputFileContents.replace(/^.*#RemoveInProd.*$/mg, "");
-      }
-
-      var babelOptions = babel.getDefaultOptions();
-
-      _.extend(babelOptions, {
-        filename: path,
-        sourceFileName: "/" + path,
-        sourceMapTarget: path + ".map",
-        sourceMap: true
-      });
-
-      var transpiled = babel.compile(inputFileContents, babelOptions);
-
-      var sourceMapUrlComment = "//# sourceMappingURL=" + files.pathBasename(path + ".map");
-
-      builder.write(path, {
-        data: new Buffer(transpiled.code + "\n" + sourceMapUrlComment, 'utf8')
-      });
-
-      builder.write(path + ".map", {
-        data: new Buffer(JSON.stringify(transpiled.map), 'utf8')
-      });
+    const sourceRootDir = files.getCurrentToolsDir();
+    await builder.copyTranspiledModules(pathsToTranspile, {
+      sourceRootDir,
+      needToTranspile: true,
     });
 
-    var gitSha = utils.runGitInCheckout('rev-parse', 'HEAD');
+    var gitSha = await utils.runGitInCheckout('rev-parse', 'HEAD');
     builder.reserve('isopackets', {directory: true});
-    builder.write('.git_version.txt', {data: new Buffer(gitSha, 'utf8')});
+    await builder.write('.git_version.txt', {data: Buffer.from(gitSha, 'utf8')});
 
-    builder.copyDirectory({
+    await builder.copyDirectory({
       from: files.getCurrentToolsDir(),
       to: '',
       specificFiles: pathsToCopyStraight,
@@ -1795,45 +1559,50 @@ _.extend(Isopack.prototype, {
     // self-test (which isn't supported from release).
     var devBundleIgnore = _.clone(bundler.ignoreFiles);
     devBundleIgnore.push(/BrowserStackLocal/, /browserstack-webdriver/);
-    builder.copyDirectory({
+    await builder.copyDirectory({
       from: files.pathJoin(files.getDevBundle()),
       to: 'dev_bundle',
       ignore: devBundleIgnore,
       symlink: false
     });
 
+    requestGarbageCollection();
+
     // Build all of the isopackets now, so that no build step is required when
     // you're actually running meteor from a release in order to load packages.
-    var isopacketBuildContext = isopackets.makeIsopacketBuildContext();
+    var isopacketBuildContext = await makeIsopacketBuildContext();
 
-    var messages = buildmessage.capture(function () {
+    var messages = await buildmessage.capture(async function () {
       // We rebuild them in the order listed in ISOPACKETS. This is not strictly
       // necessary here, since any isopackets loaded as part of the build
       // process are going to be the current tool's isopackets, not the
       // isopackets that we're writing out.
-      _.each(isopackets.ISOPACKETS, function (packages, isopacketName) {
-        buildmessage.enterJob({
+      for (const [isopacketName, packages] of Object.entries(ISOPACKETS)) {
+        requestGarbageCollection();
+        await buildmessage.enterJob({
           title: "compiling " + isopacketName + " packages for the tool"
-        }, function () {
-          isopacketBuildContext.isopackCache.buildLocalPackages(packages);
+        }, async function () {
+          await isopacketBuildContext.isopackCache.buildLocalPackages(packages);
           if (buildmessage.jobHasMessages()) {
             return;
           }
 
-          var image = bundler.buildJsImage({
+          var image = (await bundler.buildJsImage({
             name: "isopacket-" + isopacketName,
             packageMap: isopacketBuildContext.packageMap,
             isopackCache: isopacketBuildContext.isopackCache,
             use: packages
-          }).image;
+          })).image;
           if (buildmessage.jobHasMessages()) {
             return;
           }
 
-          image.write(
-            builder.enter(files.pathJoin('isopackets', isopacketName)));
+          requestGarbageCollection();
+
+          await image.write(
+              await builder.enter(files.pathJoin('isopackets', isopacketName)));
         });
-      });
+      }
     });
     // This is a build step ... but it's one that only happens in development,
     // and similar to a isopacket load failure, it can just crash the app
@@ -1906,7 +1675,7 @@ _.extend(Isopack.prototype, {
       _.each(unibuild.uses, processUse);
       _.each(unibuild.implies, processUse);
     });
-    return _.keys(packages);
+    return Object.keys(packages);
   }),
 
   featureEnabled(featurePackageName) {

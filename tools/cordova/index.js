@@ -2,23 +2,71 @@ import _ from 'underscore';
 import assert from 'assert';
 import utils from '../utils/utils.js';
 import buildmessage from '../utils/buildmessage.js';
-
-import { oldToNew as oldToNewPluginIds, newToOld as newToOldPluginIds }
-  from 'cordova-registry-mapper';
+import {
+  pathJoin,
+  statOrNull,
+  getDevBundle,
+  rm_recursive,
+} from '../fs/files';
 
 export const CORDOVA_ARCH = "web.cordova";
 
 export const CORDOVA_PLATFORMS = ['ios', 'android'];
 
-export const CORDOVA_PLATFORM_VERSIONS = {
-  'android': '5.2.2',
-  'ios': '4.2.1'
+const CORDOVA_ANDROID_VERSION = "15.1.0";
+
+export const CORDOVA_DEV_BUNDLE_VERSIONS = {
+  'cordova-lib': '13.0.0',
+  'cordova-common': '6.0.0',
+  'cordova-create': '2.0.0',
+  'cordova-registry-mapper': '1.1.15',
+  'cordova-android': CORDOVA_ANDROID_VERSION,
 };
+
+export const CORDOVA_PLATFORM_VERSIONS = {
+  'android': CORDOVA_ANDROID_VERSION,
+  'ios': '7.1.1',
+};
+
+export const SWIFT_VERSION = 5;
 
 const PLATFORM_TO_DISPLAY_NAME_MAP = {
   'ios': 'iOS',
   'android': 'Android'
 };
+
+export function ensureDevBundleDependencies() {
+  return buildmessage.enterJob(
+    {
+      title: 'Installing Cordova in Meteor tool',
+    },
+    async () => {
+      await (require("../cli/dev-bundle-helpers.js")
+        .ensureDependencies(CORDOVA_DEV_BUNDLE_VERSIONS));
+
+      const cordovaNodeModulesDir = pathJoin(
+        getDevBundle(),
+        "lib",
+        "node_modules",
+        "cordova-lib",
+        "node_modules",
+      );
+
+      for (const pkg of [
+        // Remove these bundled packages in preference to
+        // dev_bundle/lib/node_modules/<package name>:
+        "graceful-fs",
+        pathJoin("npm", "node_modules", "graceful-fs"),
+      ]) {
+        const path = pathJoin(cordovaNodeModulesDir, pkg);
+        const stat = statOrNull(path);
+        if (stat && stat.isDirectory()) {
+          await rm_recursive(path);
+        }
+      }
+    }
+  );
+}
 
 export function displayNameForPlatform(platform) {
   return PLATFORM_TO_DISPLAY_NAME_MAP[platform] || platform;
@@ -62,6 +110,7 @@ export function pluginVersionsFromStarManifest(star) {
 }
 
 export function newPluginId(id) {
+  import { oldToNew as oldToNewPluginIds } from 'cordova-registry-mapper';
   return oldToNewPluginIds[id];
 }
 

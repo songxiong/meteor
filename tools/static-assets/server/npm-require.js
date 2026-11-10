@@ -2,7 +2,7 @@ var assert = require("assert");
 var fs = require("fs");
 var path = require("path");
 var _ = require('underscore');
-var files = require('./mini-files.js');
+var files = require('./mini-files');
 var serverJson = require("./server-json.js");
 var topLevelIdPattern = /^[^./]/;
 
@@ -145,7 +145,7 @@ function resolve(id) {
   if (res === null) {
     var idParts = id.split("/");
     var meteorAddTip = "";
-    // If it looks like `meteor/xxx`, the user may forgot to add the 
+    // If it looks like `meteor/xxx`, the user may forgot to add the
     // package before importing it.
     if (idParts.length === 2 &&
         idParts[0] === "meteor") {

@@ -1,4 +1,11 @@
 import buildmessage from '../utils/buildmessage.js';
+import {
+  optimisticReadFile,
+  optimisticHashOrNull,
+} from "../fs/optimistic";
+import {
+  convertToPosixPath
+} from '../fs/files';
 const buildPluginModule = require('./build-plugin.js');
 
 class InputFile extends buildPluginModule.InputFile {
@@ -7,6 +14,7 @@ class InputFile extends buildPluginModule.InputFile {
 
     this._source = source;
     this._arch = options.arch;
+    this._watchSet = options.watchSet;
     this._minifiedFiles = [];
   }
 
@@ -24,6 +32,9 @@ class InputFile extends buildPluginModule.InputFile {
   }
   getArch() {
     return this._arch;
+  }
+  getSourcePath() {
+    return this._source.sourcePath || null;
   }
 
   error({message, sourcePath, line, column, func}) {
@@ -60,13 +71,9 @@ export class JsFile extends InputFile {
   // - sourceMap
   // - path
   // - hash?
+  // - stats?
   addJavaScript(options) {
-    const self = this;
-    self._minifiedFiles.push({
-      data: options.data,
-      sourceMap: options.sourceMap,
-      path: options.path
-    });
+    this._minifiedFiles.push({ ...options });
   }
 }
 
@@ -75,12 +82,21 @@ export class CssFile extends InputFile {
   // - sourceMap
   // - path
   // - hash?
+  // - stats?
   addStylesheet(options) {
-    this._minifiedFiles.push({
-      data: options.data,
-      sourceMap: options.sourceMap,
-      path: options.path
-    });
+    this._minifiedFiles.push({ ...options });
+  }
+
+  readAndWatchFileWithHash(path) {
+    const filePath = convertToPosixPath(path);
+
+    const hash = optimisticHashOrNull(filePath);
+    const contents = hash !== null ? optimisticReadFile(filePath) : null;
+    this._watchSet.addFile(filePath, hash);
+
+    return {
+      hash,
+      contents
+    }
   }
 }
-

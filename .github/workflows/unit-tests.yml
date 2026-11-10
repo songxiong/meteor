@@ -1,0 +1,42 @@
+name: Unit Tests
+
+on:
+  pull_request:
+    paths:
+      - 'tools/**'
+      - 'scripts/**'
+      # testMatch also covers this package, so a PR that only touches it must
+      # still run the suite.
+      - 'npm-packages/meteor-rspack/**'
+      - 'packages/rspack/**'
+      - 'packages/tools-core/**'
+      - 'npm-packages/meteor-rspack/**'
+      - 'package.json'
+      - '.github/workflows/unit-tests.yml'
+  push:
+    branches:
+      - devel
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26.x
+
+      - name: Install unit test deps
+        run: npm run install:unit
+
+      - name: Run unit tests
+        run: npm run test:unit

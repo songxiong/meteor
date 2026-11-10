@@ -26,7 +26,7 @@ minor revisions of DDP might add extra fields without changing the DDP version;
 the client must therefore silently ignore unknown fields.  However, the client
 must not send extra fields other than those documented in the DDP protocol, in
 case these extra fields have meaning to future servers.  On the server, all
-field changes must be optional/ignorable for compatability with older clients;
+field changes must be optional/ignorable for compatibility with older clients;
 otherwise a new protocol version would be required.
 
 ## Establishing a DDP Connection:
@@ -240,7 +240,8 @@ error is an Object with the following fields:
 
  * `error`: string (previously a number. See appendix 3)
  * `reason`: optional string
- * `details`: optional string
+ * `message`: optional string
+ * `errorType`: pre-defined string with a value of `Meteor.Error`
 
 Such an Error is used to represent errors raised by the method or subscription,
 as well as an attempt to subscribe to an unknown subscription or call an unknown

@@ -1,0 +1,31 @@
+<template name="configureLoginServiceDialogForFacebook">
+  <p>
+    First, you'll need to register your app on Facebook. Follow these steps:
+  </p>
+  <ol>
+    <li>
+      Visit <a href="https://developers.facebook.com/apps" target="_blank">https://developers.facebook.com/apps</a>
+    </li>
+    <li>
+      Click "Create App" and fill out the required information.
+    </li>
+    <li>
+      In "Use cases" select "Authenticate and request data from users with Facebook Login".
+    </li>
+    <li>
+      In the app dashboard, click "Add Product" and find "Facebook Login", then click "Set Up".
+    </li>
+    <li>
+      Select "Web" as your platform.
+    </li>
+    <li>
+      In the "Facebook Login > Settings" from the left sidebar, set "Valid OAuth Redirect URIs" to <span class="url">{{siteUrl}}_oauth/facebook</span> and click "Save Changes".
+    </li>
+    <li>
+      Go to "Settings > Basic" in the left sidebar.
+    </li>
+    <li>
+      Note down your "App ID" and "App Secret" (click "Show" to reveal the App Secret). You'll need these for configuration.
+    </li>
+  </ol>
+</template>

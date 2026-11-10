@@ -1,15 +1,23 @@
 var _ = require('underscore');
 var semver = require('semver');
 var os = require('os');
-var url = require('url');
-
-var fiberHelpers = require('./fiber-helpers.js');
-var archinfo = require('./archinfo.js');
+var archinfo = require('./archinfo');
 var buildmessage = require('./buildmessage.js');
-var files = require('../fs/files.js');
+var files = require('../fs/files');
 var packageVersionParser = require('../packaging/package-version-parser.js');
 
 var utils = exports;
+
+// Cache regex patterns to avoid recompiling them on every function call.
+// This improves performance in hot paths like URL parsing.
+var REGEX_PORT_ONLY = /^[0-9]+$/;
+var REGEX_HAS_SCHEME = /^[A-Za-z][A-Za-z0-9+-\.]*\:\/\//;
+var REGEX_IPV4_ADDRESS = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
+var REGEX_VALID_EMAIL = /^[^<>()[\]\\.,;:\s@\"]+(\.[^<>()[\]\\.,;:\s@\"]+)*@([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}$/;
+var REGEX_FILE_SCHEME = /^file:\/\/.+/;
+var REGEX_URL_WITH_SHA = /^https?:\/\/.*[0-9a-f]{40}/;
+var REGEX_NPM_URL_PROTOCOL = /^(git|git\+ssh|git\+http|git\+https|https|http)?:\/\//;
+var REGEX_RELEASE_VERSION = /^(\d{1,4}(?:\.\d{1,4})*)(?:-([-A-Za-z.]{1,15})(\d{0,4}))?$/;
 
 // Parses <protocol>://<host>:<port> into an object { protocol: *, host:
 // *, port: * }. The input can also be of the form <host>:<port> or just
@@ -27,115 +35,104 @@ exports.parseUrl = function (str, defaults) {
   var defaultPort = defaults.port || undefined;
   var defaultProtocol = defaults.protocol || undefined;
 
-  if (str.match(/^[0-9]+$/)) { // just a port
+  if (REGEX_PORT_ONLY.test(str)) { // just a port
     return {
       port: str,
       hostname: defaultHostname,
-      protocol: defaultProtocol };
+      protocol: defaultProtocol
+    };
   }
 
+  // Capture any IPv6 address in brackets before new URL() normalizes it
+  // (e.g. "0000:...0001" gets compressed to "::1" by the WHATWG parser).
+  var ipv6Match = str.match(/\[([^\]]+)\]/);
+  var rawIPv6 = ipv6Match ? ipv6Match[1] : null;
+
   var hasScheme = exports.hasScheme(str);
-  if (! hasScheme) {
+  if (!hasScheme) {
     str = "http://" + str;
   }
 
-  var parsed = url.parse(str);
+  var parsed = new URL(str);
 
   // for consistency remove colon at the end of protocol
-  parsed.protocol = parsed.protocol.replace(/\:$/, '');
+  var parsedProtocol = parsed.protocol.replace(/\:$/, '');
 
-  return {
-    protocol: hasScheme ? parsed.protocol : defaultProtocol,
-    hostname: parsed.hostname || defaultHostname,
+  // WHATWG URL wraps IPv6 in brackets and normalizes the address; use the
+  // raw value extracted above to preserve the original formatting.
+  var hostname = parsed.hostname || defaultHostname;
+  if (hostname && hostname.startsWith('[') && hostname.endsWith(']')) {
+    hostname = rawIPv6 || hostname.slice(1, -1);
+  }
+
+  var ret = {
+    protocol: hasScheme ? parsedProtocol : defaultProtocol,
+    hostname: hostname,
     port: parsed.port || defaultPort
   };
+  if (parsed.pathname !== '/' && parsed.pathname) {
+    ret.pathname = parsed.pathname;
+  }
+  return ret;
 };
 
 // 'options' is an object with 'hostname', 'port', and 'protocol' keys, such as
 // the return value of parseUrl.
 exports.formatUrl = function (options) {
-  // For consistency with `Meteor.absoluteUrl`, add a trailing slash to make
-  // this a valid URL
-  if (!options.pathname)
-    options.pathname = "/";
-
-  return url.format(options);
+  let host = options.hostname || '';
+  // parseUrl returns bare IPv6 literals (e.g. "::" for "[::]"), but the WHATWG
+  // URL parser only accepts them bracketed. There is no builtin that escapes a
+  // bare IPv6 host for us: the hostname/host setters and the URL constructor all
+  // silently reject an unbracketed IPv6 address, so we bracket it by hand.
+  if (host.includes(':') && !host.startsWith('[')) {
+    host = `[${host}]`;
+  }
+  // Build straight from the parts: the URL constructor throws on an invalid or
+  // empty host, so a bad hostname surfaces as an error instead of silently
+  // producing a broken ROOT_URL.
+  const u = new URL(`${options.protocol}://${host}`);
+  if (options.port) u.port = options.port;
+  u.pathname = options.pathname || '/';
+  return u.toString();
 };
 
 exports.ipAddress = function () {
-  let defaultRoute;
-  // netroute is not available on Windows
-  if (process.platform !== "win32") {
-    const netroute = require('netroute');
-    const info = netroute.getInfo();
-    defaultRoute = _.findWhere(info.IPv4 || [], { destination: "0.0.0.0" });
-  }
-
   const interfaces = os.networkInterfaces();
 
-  if (defaultRoute) {
-    // If we know the default route, find the IPv4 address associated
-    // with that interface
-    const iface = defaultRoute["interface"];
-    const addressEntry = _.findWhere(interfaces[iface], { family: "IPv4" });
+  // If we don't know the default route, we'll lookup all non-internal
+  // IPv4 addresses and hope to find only one
+  let addressEntries = _.chain(interfaces)
+    .values()
+    .flatten()
+    .where({ family: "IPv4", internal: false })
+    .value();
 
-    if (!addressEntry) {
-      throw new Error(
-`Network interface '${iface}', which seems to be the default route,
-not found in interface list, or does not have an IPv4 address.`);
-    }
-
-    return addressEntry.address;
-  } else {
-    // If we don't know the default route, we'll lookup all non-internal
-    // IPv4 addresses and hope to find only one
-    let addressEntries = _.chain(interfaces).values().flatten().
-      where({ family: "IPv4", internal: false }).value();
-
-    if (addressEntries.length == 0) {
-      throw new Error(
-`Could not find a network interface with a non-internal IPv4 address.`);
-    } else if (addressEntries.length > 1) {
-      throw new Error(
-`Found multiple network interfaces with non-internal IPv4 addresses:
-${addressEntries.map(entry => entry.address).join(', ')}`);
-    } else {
-      return addressEntries[0].address;
-    }
+  if (!addressEntries.length) {
+    throw new Error(`Could not find a network interface with a non-internal IPv4 address.`);
   }
+
+  if (addressEntries.length > 1) {
+    throw new Error(`Found multiple network interfaces with non-internal IPv4 addresses:
+${addressEntries.map(entry => entry.address).join(', ')}`);
+  }
+
+  return addressEntries[0].address;
 };
 
 exports.hasScheme = function (str) {
-  return !! str.match(/^[A-Za-z][A-Za-z0-9+-\.]*\:\/\//);
-};
-
-
-exports.hasScheme = function (str) {
-  return !! str.match(/^[A-Za-z][A-Za-z0-9+-\.]*\:\/\//);
+  return REGEX_HAS_SCHEME.test(str);
 };
 
 exports.isIPv4Address = function (str) {
-  return str.match(/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/);
-}
+  return REGEX_IPV4_ADDRESS.test(str);
+};
 
 // XXX: Move to e.g. formatters.js?
 // Prints a package list in a nice format.
 // Input is an array of objects with keys 'name' and 'description'.
 exports.printPackageList = function (items, options) {
-  options = options || {};
-
-  var rows = _.map(items, function (item) {
-    var name = item.name;
-    var description = item.description || 'No description';
-    return [name, description];
-  });
-
-  var alphaSort = function (row) {
-    return row[0];
-  };
-  rows = _.sortBy(rows, alphaSort);
-
-  var Console = require('../console/console.js').Console;
+  const rows = _.sortBy(items.map(item => [item.name, item.description || 'No description']), row => row[0]);
+  const Console = require('../console/console.js').Console;
   return Console.printTwoColumns(rows, options);
 };
 
@@ -143,10 +140,10 @@ exports.printPackageList = function (items, options) {
 // that make sense to users (eg, the name they manually gave their
 // computer on OS X, which might contain spaces) over names that have
 // any particular technical significance (eg, might resolve in DNS).
-exports.getHost = function (...args) {
+exports.getHost = async function (...args) {
   var ret;
-  var attempt = function (...args) {
-    var output = exports.execFileSync(args[0], args.slice(1)).stdout;
+  var attempt = async function (...args) {
+    var output = await exports.execFile(args[0], args.slice(1)).stdout;
     if (output) {
       ret = output.trim();
     }
@@ -158,26 +155,26 @@ exports.getHost = function (...args) {
     //   scutil --get ComputerName
     // This can contain spaces. See
     // http://osxdaily.com/2012/10/24/set-the-hostname-computer-name-and-bonjour-name-separately-in-os-x/
-    if (! ret) {
-      attempt("scutil", "--get", "ComputerName");
+    if (!ret) {
+      await attempt("scutil", "--get", "ComputerName");
     }
   }
 
   if (archinfo.matches(archinfo.host(), 'os.osx') ||
-      archinfo.matches(archinfo.host(), 'os.linux')) {
+    archinfo.matches(archinfo.host(), 'os.linux')) {
     // On Unix-like platforms, try passing -s to hostname to strip off
     // the domain name, to reduce the extent to which the output
     // varies with DNS.
-    if (! ret) {
-      attempt("hostname", "-s");
+    if (!ret) {
+      await attempt("hostname", "-s");
     }
   }
 
   // Try "hostname" on any platform. It should work on
   // Windows. Unknown platforms that have a command called "hostname"
   // that deletes all of your files deserve what the get.
-  if (! ret) {
-    attempt("hostname");
+  if (!ret) {
+    await attempt("hostname");
   }
 
   // Otherwise, see what Node can come up with.
@@ -188,10 +185,10 @@ exports.getHost = function (...args) {
 // Meteor Accounts, mostly so that when the user is seeing a list of
 // their open sessions in their profile on the web, they have a way to
 // decide which ones they want to revoke.
-exports.getAgentInfo = function () {
+exports.getAgentInfo = async function () {
   var ret = {};
 
-  var host = utils.getHost();
+  var host = await utils.getHost();
   if (host) {
     ret.host = host;
   }
@@ -211,15 +208,23 @@ exports.sleepMs = function (ms) {
     return;
   }
 
-  new Promise(function (resolve) {
+  return new Promise(function (resolve) {
     setTimeout(resolve, ms);
-  }).await();
+  });
 };
 
 // Return a short, high entropy string without too many funny
 // characters in it.
 exports.randomToken = function () {
-  return (Math.random() * 0x100000000 + 1).toString(36);
+  return (Math.random() * 0x100000000 + 1).toString(36).replace('.', '');
+};
+
+// Like utils.randomToken, except a legal variable name, i.e. the first
+// character is guaranteed to be [a-z] and the rest [a-z0-9].
+exports.randomIdentifier = function () {
+  const firstLetter = String.fromCharCode(
+    "a".charCodeAt(0) + Math.floor(Math.random() * 26));
+  return firstLetter + Math.random().toString(36).slice(2);
 };
 
 // Returns a random non-privileged port number.
@@ -233,7 +238,7 @@ exports.parsePackageConstraint = function (constraintString, options) {
   try {
     return packageVersionParser.parsePackageConstraint(constraintString);
   } catch (e) {
-    if (! (e.versionParserError && options && options.useBuildmessage)) {
+    if (!(e.versionParserError && options && options.useBuildmessage)) {
       throw e;
     }
     buildmessage.error(e.message, { file: options.buildmessageFile });
@@ -245,7 +250,7 @@ exports.validatePackageName = function (name, options) {
   try {
     return packageVersionParser.validatePackageName(name, options);
   } catch (e) {
-    if (! (e.versionParserError && options && options.useBuildmessage)) {
+    if (!(e.versionParserError && options && options.useBuildmessage)) {
       throw e;
     }
     buildmessage.error(e.message, { file: options.buildmessageFile });
@@ -262,29 +267,29 @@ exports.validatePackageName = function (name, options) {
 exports.parsePackageAndVersion = function (packageAtVersionString, options) {
   var error = null;
   var separatorPos = Math.max(packageAtVersionString.lastIndexOf(' '),
-                              packageAtVersionString.lastIndexOf('@'));
+    packageAtVersionString.lastIndexOf('@'));
   if (separatorPos < 0) {
     error = new Error("Malformed package version: " +
-                      JSON.stringify(packageAtVersionString));
+      JSON.stringify(packageAtVersionString));
   } else {
     var packageName = packageAtVersionString.slice(0, separatorPos);
-    var version = packageAtVersionString.slice(separatorPos+1);
+    var version = packageAtVersionString.slice(separatorPos + 1);
     try {
       packageVersionParser.validatePackageName(packageName);
       // validate the version, ignoring the parsed result:
       packageVersionParser.parse(version);
     } catch (e) {
-      if (! e.versionParserError) {
+      if (!e.versionParserError) {
         throw e;
       }
       error = e;
     }
-    if (! error) {
+    if (!error) {
       return { package: packageName, version: version };
     }
   }
   // `error` holds an Error
-  if (! (options && options.useBuildmessage)) {
+  if (!(options && options.useBuildmessage)) {
     throw error;
   }
   buildmessage.error(error.message, { file: options.buildmessageFile });
@@ -340,13 +345,13 @@ exports.validatePackageNameOrExit = function (packageName, options) {
 // - IP addresses in domains (eg, foo@1.2.3.4 or the IPv6 equivalent)
 // because they're weird and we don't want them in our database.
 exports.validEmail = function (address) {
-  return /^[^<>()[\]\\.,;:\s@\"]+(\.[^<>()[\]\\.,;:\s@\"]+)*@([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}$/.test(address);
+  return REGEX_VALID_EMAIL.test(address);
 };
 
 // Like Perl's quotemeta: quotes all regexp metacharacters. See
 //   https://github.com/substack/quotemeta/blob/master/index.js
 exports.quotemeta = function (str) {
-    return String(str).replace(/(\W)/g, '\\$1');
+  return String(str).replace(/(\W)/g, '\\$1');
 };
 
 // Allow a simple way to scale up all timeouts from the command line
@@ -366,7 +371,7 @@ exports.timeoutScaleFactor = timeoutScaleFactor;
 // the prerelease for a given release will sort before it. Because $ sorts
 // before '.', this means that 1.2 will sort before 1.2.3.)
 exports.defaultOrderKeyForReleaseVersion = function (v) {
-  var m = v.match(/^(\d{1,4}(?:\.\d{1,4})*)(?:-([-A-Za-z.]{1,15})(\d{0,4}))?$/);
+  var m = v.match(REGEX_RELEASE_VERSION);
   if (!m) {
     return null;
   }
@@ -434,7 +439,7 @@ exports.isDirectory = function (dir) {
 exports.generateSubsetsOfIncreasingSize = function (total, cb) {
   // We'll throw this if cb ever returns true, which is a simple way to pop us
   // out of our recursion.
-  var Done = function () {};
+  var Done = function () { };
 
   // Generates all subsets of size subsetSize which contain the indices already
   // in chosenIndices (and no indices that are "less than" any of them).
@@ -457,7 +462,7 @@ exports.generateSubsetsOfIncreasingSize = function (total, cb) {
     // trying to produce a sorted list of indices, so if there are already
     // indices, we start with the one after the biggest one we already have.
     var firstIndexToConsider = chosenIndices.length ?
-          chosenIndices[chosenIndices.length - 1] + 1 : 0;
+      chosenIndices[chosenIndices.length - 1] + 1 : 0;
     for (var i = firstIndexToConsider; i < total.length; ++i) {
       var withThisChoice = _.clone(chosenIndices);
       withThisChoice.push(i);
@@ -477,20 +482,21 @@ exports.generateSubsetsOfIncreasingSize = function (total, cb) {
 };
 
 exports.isUrlWithFileScheme = function (x) {
-  return /^file:\/\/.+/.test(x);
+  return REGEX_FILE_SCHEME.test(x);
 };
 
 exports.isUrlWithSha = function (x) {
   // Is a URL with a fixed SHA? We use this for Cordova -- although theoretically we could use
   // a URL like isNpmUrl(), there are a variety of problems with this,
   // see https://github.com/meteor/meteor/pull/5562
-  return /^https?:\/\/.*[0-9a-f]{40}/.test(x);
-}
+  return REGEX_URL_WITH_SHA.test(x);
+};
 
 exports.isNpmUrl = function (x) {
   // These are the various protocols that NPM supports, which we use to download NPM dependencies
   // See https://docs.npmjs.com/files/package.json#git-urls-as-dependencies
-  return exports.isUrlWithSha(x) || /^(git|git\+ssh|git\+http|git\+https)?:\/\//.test(x);
+  return exports.isUrlWithSha(x) ||
+    REGEX_NPM_URL_PROTOCOL.test(x);
 };
 
 exports.isPathRelative = function (x) {
@@ -503,48 +509,78 @@ exports.isPathRelative = function (x) {
 //
 // This is talking about NPM/Cordova versions specifically, not Meteor versions.
 // It does not support the wrap number syntax.
-exports.ensureOnlyValidVersions = function (dependencies, {forCordova}) {
+exports.ensureOnlyValidVersions = function (dependencies, { forCordova }) {
   _.each(dependencies, function (version, name) {
     // We want a given version of a smart package (package.js +
     // .npm/npm-shrinkwrap.json) to pin down its dependencies precisely, so we
     // don't want anything too vague. For now, we support semvers and urls that
     // name a specific commit by SHA.
-    if (! exports.isValidVersion(version, {forCordova})) {
+    if (!exports.isValidVersion(version, { forCordova })) {
       throw new Error(
         "Must declare valid version of dependency: " + name + '@' + version);
     }
   });
 };
-exports.isValidVersion = function (version, {forCordova}) {
+exports.isValidVersion = function (version, { forCordova }) {
   return semver.valid(version) || exports.isUrlWithFileScheme(version)
-    || (forCordova ? exports.isUrlWithSha(version): exports.isNpmUrl(version));
+    || (forCordova ? exports.isUrlWithSha(version) : exports.isNpmUrl(version));
 };
-
 
 exports.execFileSync = function (file, args, opts) {
   var child_process = require('child_process');
-  var eachline = require('eachline');
 
   opts = opts || {};
-  if (! _.has(opts, 'maxBuffer')) {
+  if (!_.has(opts, 'maxBuffer')) {
+    opts.maxBuffer = 1024 * 1024 * 10;
+  }
+
+  if (!_.has(opts, 'encoding')) {
+    opts.encoding = 'utf8';
+  }
+
+  let result;
+  try {
+    result = child_process.execFileSync(file, args, opts);
+  } catch (error) {
+    return {
+      success: false,
+      stdout: error.stdout,
+      stderr: error.stderr
+    };
+  }
+
+  return {
+    stdout: result,
+    success: true,
+    stderr: ''
+  };
+}
+
+
+exports.execFile = async function (file, args, opts) {
+  var child_process = require('child_process');
+  var { eachline } = require('./eachline');
+
+  opts = opts || {};
+  if (!_.has(opts, 'maxBuffer')) {
     opts.maxBuffer = 1024 * 1024 * 10;
   }
 
   if (opts && opts.pipeOutput) {
     var p = child_process.spawn(file, args, opts);
 
-    eachline(p.stdout, fiberHelpers.bindEnvironment(function (line) {
+    eachline(p.stdout, function (line) {
       process.stdout.write(line + '\n');
-    }));
+    });
 
-    eachline(p.stderr, fiberHelpers.bindEnvironment(function (line) {
+    eachline(p.stderr, function (line) {
       process.stderr.write(line + '\n');
-    }));
+    });
 
     return {
-      success: ! new Promise(function (resolve) {
+      success: await !new Promise(function (resolve) {
         p.on('exit', resolve);
-      }).await(),
+      }),
       stdout: "",
       stderr: ""
     };
@@ -553,56 +589,68 @@ exports.execFileSync = function (file, args, opts) {
   return new Promise(function (resolve) {
     child_process.execFile(file, args, opts, function (err, stdout, stderr) {
       resolve({
-        success: ! err,
+        success: !err,
         stdout: stdout,
         stderr: stderr
       });
     });
-  }).await();
+  });
 };
 
 exports.execFileAsync = function (file, args, opts) {
   opts = opts || {};
   var child_process = require('child_process');
-  var eachline = require('eachline');
+  var { eachline } = require('./eachline');
   var p = child_process.spawn(file, args, opts);
   var mapper = opts.lineMapper || _.identity;
 
-  var logOutput = fiberHelpers.bindEnvironment(function (line) {
+  function logOutput(line) {
     if (opts.verbose) {
       line = mapper(line);
       if (line) {
         console.log(line);
       }
     }
-  });
+  }
 
   eachline(p.stdout, logOutput);
   eachline(p.stderr, logOutput);
+
+  if (!opts) {
+    return new Promise(function (resolve) {
+      child_process.execFile(file, args, opts, function (err, stdout, stderr) {
+        resolve({
+          success: !err,
+          stdout: stdout,
+          stderr: stderr
+        });
+      });
+    });
+  }
 
   return p;
 };
 
 
-exports.runGitInCheckout = function (...args) {
+exports.runGitInCheckout = async function (...args) {
   args.unshift(
     '--git-dir=' +
     files.convertToOSPath(files.pathJoin(files.getCurrentToolsDir(), '.git')));
 
-  return exports.execFileSync('git', args).stdout;
+  return (await exports.execFile('git', args)).stdout;
 };
 
 exports.Throttled = function (options) {
   var self = this;
 
-  options = _.extend({ interval: 150 }, options || {});
+  options = Object.assign({ interval: 150 }, options || {});
   self.interval = options.interval;
   var now = +(new Date);
 
   self.next = now;
 };
 
-_.extend(exports.Throttled.prototype, {
+Object.assign(exports.Throttled.prototype, {
   isAllowed: function () {
     var self = this;
     var now = +(new Date);
@@ -630,8 +678,8 @@ exports.ThrottledYield = function (options) {
   self._throttle = new exports.Throttled(options);
 };
 
-_.extend(exports.ThrottledYield.prototype, {
-  yield: function () {
+Object.assign(exports.ThrottledYield.prototype, {
+  yield: async function () {
     var self = this;
     if (self._throttle.isAllowed()) {
       // setImmediate allows signals and IO to be processed but doesn't
@@ -640,7 +688,7 @@ _.extend(exports.ThrottledYield.prototype, {
       // setTimeout 1 (which adds a minimum of 1 ms and often more in delays).
       // XXX Actually, setImmediate is so fast that we might not even need
       // to use the throttler at all?
-      new Promise(setImmediate).await();
+      await new Promise(setImmediate);
     }
   }
 });
@@ -651,7 +699,7 @@ _.extend(exports.ThrottledYield.prototype, {
 // date object and returns a long-form human-readable date (ex: December 9th,
 // 2014) or unknown for null.
 exports.longformDate = function (date) {
-  if (! date) {
+  if (!date) {
     return "Unknown";
   }
   var moment = require('moment');
@@ -673,13 +721,70 @@ exports.sha256 = function (contents) {
 };
 
 exports.sourceMapLength = function (sm) {
-  if (! sm) {
+  if (!sm) {
     return 0;
   }
   // sum the length of sources and the mappings, the size of
   // metadata is ignored, but it is not a big deal
   return sm.mappings.length
-       + (sm.sourcesContent || []).reduce((soFar, current) => {
-         return soFar + (current ? current.length : 0);
-       }, 0);
+    + (sm.sourcesContent || []).reduce((soFar, current) => {
+      return soFar + (current ? current.length : 0);
+    }, 0);
 };
+
+// Find and return the current OS architecture, in "uname -m" format.
+//
+// For Linux and macOS (Darwin) this means first getting the current
+// architecture reported by Node using "os.arch()" (e.g. ia32, x64), then
+// converting it to a "uname -m" matching architecture label (e.g. i686,
+// x86_64).
+//
+// For Windows things are handled differently. Node's "os.arch()" will return
+// "ia32" for both 32-bit and 64-bit versions of Windows (since we're using
+// a 32-bit version of Node on Windows). Instead we'll look for the presence
+// of the PROCESSOR_ARCHITEW6432 environment variable to determine if the
+// Windows architecture is 64-bit, then convert to a "uname -m" matching
+// architecture label (e.g. i386, x86_64).
+export function architecture() {
+  const supportedArchitectures = {
+    Darwin: {
+      x64: 'x86_64',
+    },
+    Linux: {
+      ia32: 'i686',
+      x64: 'x86_64',
+    },
+    Windows_NT: {
+      ia32: process.env.hasOwnProperty('PROCESSOR_ARCHITEW6432')
+        ? 'x86_64'
+        : 'i386',
+      x64: 'x86_64'
+    }
+  };
+
+  const osType = os.type();
+  const osArch = os.arch();
+
+  if (!supportedArchitectures[osType]) {
+    throw new Error(`Unsupported OS ${osType}`);
+  }
+
+  if (!supportedArchitectures[osType][osArch]) {
+    throw new Error(`Unsupported architecture ${osArch}`);
+  }
+
+  return supportedArchitectures[osType][osArch];
+};
+
+let emacsDetected;
+export function isEmacs() {
+  // Checking `process.env` is expensive, so only check once.
+  if (typeof emacsDetected === "boolean") {
+    return emacsDetected;
+  }
+
+  // Prior to v22, Emacs only set EMACS. After v27, it only sets INSIDE_EMACS.
+  emacsDetected = !!(process.env.EMACS === "t" || process.env.INSIDE_EMACS);
+  return emacsDetected;
+}
+

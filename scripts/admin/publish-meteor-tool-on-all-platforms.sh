@@ -29,7 +29,7 @@ main () {
 
   trap 'echo "${red}Login failed.${NC}"; clean_up' EXIT
 
-  echo "${green}Login with a meteor account belonging to MDG."
+  echo "${green}Login with a meteor account belonging to Meteor Software."
   echo "A session file will be generated in your checkout and it will be used to"
   echo "publish the release from the remote machines.${NC}"
 
@@ -42,7 +42,7 @@ main () {
   echo
 
   # XXX there is no os.windows.x86_64 as we don't build for it at the moment
-  PLATFORMS=( os.osx.x86_64 os.linux.x86_64 os.linux.x86_32 os.windows.x86_32 )
+  PLATFORMS=( os.osx.x86_64 os.linux.x86_64 os.linux.x86_32 os.windows.x86_32 os.linux.aarch64 )
   for PLATFORM in ${PLATFORMS[@]}; do
     COMMAND="`dirname $0`/publish-meteor-tool-on-arch.sh $GITSHA $PLATFORM $SESSION_FILE"
     echo $COMMAND

@@ -1,11 +1,14 @@
 Package.describe({
   name: "shell-server",
-  version: "0.2.1",
+  version: '0.7.2',
   summary: "Server-side component of the `meteor shell` command.",
-  documentation: "README.md"
+  documentation: "README.md",
+  devOnly: true,
 });
 
 Package.onUse(function(api) {
-  api.use("ecmascript@0.5.7", "server");
+  api.use("ecmascript", "server");
+  api.use("babel-compiler", "server");
   api.mainModule("main.js", "server");
+  api.types("shell-server.d.ts");
 });

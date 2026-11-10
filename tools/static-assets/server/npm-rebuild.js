@@ -5,6 +5,7 @@ if (process.env.METEOR_SKIP_NPM_REBUILD) {
   process.exit(0);
 }
 
+var fs = require("fs");
 var path = require("path");
 var spawn = require("child_process").spawn;
 var rebuildArgs = require("./npm-rebuild-args.js").get();
@@ -23,28 +24,33 @@ try {
 }
 
 // Make sure the npm finds this exact version of node in its $PATH.
-var PATH = path.dirname(process.execPath) + ":" + process.env.PATH;
-var env = Object.create(process.env, {
-  PATH: { value: PATH }
-});
+var binDir = path.dirname(process.execPath);
+process.env.PATH = binDir + path.delimiter + process.env.PATH;
+
+var npmCmd = "npm";
+var shell = false;
+if (process.platform === "win32") {
+  npmCmd = "npm.cmd";
+  shell = true;
+}
 
 function rebuild(i) {
   var dir = rebuilds && rebuilds[i];
 
   if (! dir) {
     // Print Node/V8/etc. versions for diagnostic purposes.
-    spawn("npm", ["version", "--json"], {
+    spawn(npmCmd, ["version", "--json"], {
       stdio: "inherit",
-      env: env
+      shell,
     });
 
     return;
   }
 
-  spawn("npm", rebuildArgs, {
+  spawn(npmCmd, rebuildArgs, {
     cwd: path.join(__dirname, dir),
     stdio: "inherit",
-    env: env
+    shell,
   }).on("exit", function (code) {
     if (code !== 0) {
       process.exit(code);

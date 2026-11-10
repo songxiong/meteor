@@ -1,6 +1,6 @@
 Package.describe({
   name: 'allow-deny',
-  version: '1.0.5',
+  version: '2.1.2',
   // Brief, one-line summary of the package.
   summary: 'Implements functionality for allow/deny and client-side db operations',
   // URL to the Git repository containing the source code for this package.
@@ -13,7 +13,6 @@ Package.describe({
 Package.onUse(function(api) {
   api.use([
     'ecmascript',
-    'underscore',
     'minimongo', // Just for LocalCollection.wrapTransform :[
     'check',
     'ejson',
@@ -22,6 +21,7 @@ Package.onUse(function(api) {
 
   api.addFiles('allow-deny.js');
   api.export('AllowDeny');
+  api.types('allow-deny.d.ts');
 });
 
 Package.onTest(function(api) {

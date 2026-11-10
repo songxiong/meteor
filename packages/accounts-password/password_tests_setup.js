@@ -1,10 +1,10 @@
-Accounts.validateNewUser(function (user) {
+Accounts.validateNewUser(user => {
   if (user.profile && user.profile.invalidAndThrowException)
     throw new Meteor.Error(403, "An exception thrown within Accounts.validateNewUser");
   return !(user.profile && user.profile.invalid);
 });
 
-Accounts.onCreateUser(function (options, user) {
+Accounts.onCreateUser((options, user) => {
   if (options.testOnCreateUserHook) {
     user.profile = user.profile || {};
     user.profile.touchedByOnCreateUser = true;
@@ -16,7 +16,7 @@ Accounts.onCreateUser(function (options, user) {
 
 
 // connection id -> action
-var invalidateLogins = {};
+const invalidateLogins = {};
 
 
 Meteor.methods({
@@ -29,8 +29,8 @@ Meteor.methods({
 });
 
 
-Accounts.validateLoginAttempt(function (attempt) {
-  var action =
+Accounts.validateLoginAttempt(attempt => {
+  const action =
     attempt &&
     attempt.connection &&
     invalidateLogins[attempt.connection.id];
@@ -42,25 +42,26 @@ Accounts.validateLoginAttempt(function (attempt) {
   else if (action === 'hide')
     throw new Meteor.Error(403, 'hide actual error');
   else
-    throw new Error('unknown action: ' + action);
+    throw new Error(`unknown action: ${action}`);
 });
 
 
 // connection id -> [{successful: boolean, attempt: object}]
-var capturedLogins = {};
+const capturedLogins = {};
+let capturedLogouts = [];
 
 Meteor.methods({
   testCaptureLogins: function () {
     capturedLogins[this.connection.id] = [];
   },
 
-  testCaptureLogouts: function() {
+  testCaptureLogouts: () => {
     capturedLogouts = [];
   },
 
   testFetchCapturedLogins: function () {
     if (capturedLogins[this.connection.id]) {
-      var logins = capturedLogins[this.connection.id];
+      const logins = capturedLogins[this.connection.id];
       delete capturedLogins[this.connection.id];
       return logins;
     }
@@ -68,41 +69,37 @@ Meteor.methods({
       return [];
   },
 
-  testFetchCapturedLogouts: function() {
-    return capturedLogouts;
-  }
+  testFetchCapturedLogouts: () => capturedLogouts,
 });
 
-Accounts.onLogin(function (attempt) {
+Accounts.onLogin(attempt => {
   if (!attempt.connection) // if login method called from the server
     return;
 
+  const attemptWithoutConnection = { ...attempt };
+  delete attemptWithoutConnection.connection;
   if (capturedLogins[attempt.connection.id])
     capturedLogins[attempt.connection.id].push({
       successful: true,
-      attempt: _.omit(attempt, 'connection')
+      attempt: attemptWithoutConnection,
     });
 });
 
-Accounts.onLoginFailure(function (attempt) {
+Accounts.onLoginFailure(attempt => {
   if (!attempt.connection) // if login method called from the server
     return;
 
+  const attemptWithoutConnection = { ...attempt };
+  delete attemptWithoutConnection.connection;
   if (capturedLogins[attempt.connection.id]) {
     capturedLogins[attempt.connection.id].push({
       successful: false,
-      attempt: _.omit(attempt, 'connection')
+      attempt: attemptWithoutConnection,
     });
   }
 });
 
-var capturedLogouts = [];
-
-Accounts.onLogout(function() {
-  capturedLogouts.push({
-    successful: true
-  });
-});
+Accounts.onLogout(() => capturedLogouts.push({ successful: true }));
 
 // Because this is global state that affects every client, we can't turn
 // it on and off during the tests. Doing so would mean two simultaneous
@@ -121,55 +118,25 @@ Accounts.config({
 });
 
 
-Meteor.methods({
-  testMeteorUser: function () { return Meteor.user(); },
-  clearUsernameAndProfile: function () {
-    if (!this.userId)
-      throw new Error("Not logged in!");
-    Meteor.users.update(this.userId,
-                        {$unset: {profile: 1, username: 1}});
-  },
+Meteor.methods(
+  {
+    testMeteorUser:
+      async () => await Meteor.userAsync(),
 
-  expireTokens: function () {
-    Accounts._expireTokens(new Date(), this.userId);
-  },
-  removeUser: function (username) {
-    Meteor.users.remove({ "username": username });
+    clearUsernameAndProfile:
+      async function () {
+        if (!this.userId) throw new Error("Not logged in!");
+        await Meteor
+          .users
+          .updateAsync(this.userId, { $unset: { profile: 1, username: 1 } });
+      },
+
+    expireTokens:
+      async function () {
+        await Accounts._expireTokens(new Date(), this.userId);
+      },
+
+    removeUser:
+      async username => await Meteor.users.removeAsync({ "username": username }),
   }
-});
-
-
-// Create a user that had previously logged in with SRP.
-
-Meteor.methods({
-  testCreateSRPUser: function () {
-    var username = Random.id();
-    Meteor.users.remove({username: username});
-    var userId = Accounts.createUser({username: username});
-    Meteor.users.update(
-      userId,
-      { '$set': { 'services.password.srp': {
-          "identity" : "iPNrshUEcpOSO5fRDu7o4RRDc9OJBCGGljYpcXCuyg9",
-          "salt" : "Dk3lFggdEtcHU3aKm6Odx7sdcaIrMskQxBbqtBtFzt6",
-          "verifier" : "2e8bce266b1357edf6952cc56d979db19f699ced97edfb2854b95972f820b0c7006c1a18e98aad40edf3fe111b87c52ef7dd06b320ce452d01376df2d560fdc4d8e74f7a97bca1f67b3cfaef34dee34dd6c76571c247d762624dc166dab5499da06bc9358528efa75bf74e2e7f5a80d09e60acf8856069ae5cfb080f2239ee76"
-      } } }
-    );
-    return username;
-  },
-
-  testSRPUpgrade: function (username) {
-    var user = Meteor.users.findOne({username: username});
-    if (user.services && user.services.password && user.services.password.srp)
-      throw new Error("srp wasn't removed");
-    if (!(user.services && user.services.password && user.services.password.bcrypt))
-      throw new Error("bcrypt wasn't added");
-  },
-
-  testNoSRPUpgrade: function (username) {
-    var user = Meteor.users.findOne({username: username});
-    if (user.services && user.services.password && user.services.password.bcrypt)
-      throw new Error("bcrypt was added");
-    if (user.services && user.services.password && ! user.services.password.srp)
-      throw new Error("srp was removed");
-  }
-});
+);

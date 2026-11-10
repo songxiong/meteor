@@ -1,3 +1,5 @@
+import isEmpty from 'lodash.isempty';
+
 var newView = function(test) {
   var results = [];
   var view = new DDPServer._SessionCollectionView('test', {
@@ -5,7 +7,7 @@ var newView = function(test) {
       results.push({fun: 'added', id: id, fields: fields});
     },
     changed: function (collection, id, changed) {
-      if (_.isEmpty(changed))
+      if (isEmpty(changed))
         return;
       results.push({fun: 'changed', id: id, changed: changed});
     },
@@ -17,8 +19,8 @@ var newView = function(test) {
     view: view,
     results: results
   };
-  _.each(["added", "changed", "removed"], function (it) {
-    v[it] = _.bind(view[it], view);
+  ["added", "changed", "removed"].forEach(function (it) {
+    v[it] = view[it].bind(view);
   });
   v.expectResult = function (result) {
     test.equal(results.shift(), result);
@@ -182,7 +184,7 @@ Tinytest.add('livedata - sessionview - change to canonical value produces no cha
   v.added("B",  "A1", {foo: "baz"});
   var canon = "bar";
   var maybeResults = v.drain();
-  if (!_.isEmpty(maybeResults)) {
+  if (!isEmpty(maybeResults)) {
     // if something happened, it was a change message to baz.
     // if nothing did, canon is still bar.
     test.length(maybeResults, 1);
@@ -390,4 +392,37 @@ Tinytest.add('livedata - sessionview - clear undefined value', function (test) {
   v.changed("A", "A1", {field: undefined});
   v.expectNoResult();
 
+});
+Tinytest.add('livedata - sessionview - prototype fields survive publication changes', function (test) {
+  const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+  const fields = value => JSON.parse('{"__proto__":' + JSON.stringify(value) + '}');
+  const expectField = (event, property, value) => {
+    test.isTrue(Boolean(event), 'publication event must be emitted');
+    if (!event) return;
+    test.isTrue(own(event[property], '__proto__'), 'field must be own data');
+    test.equal(event[property].__proto__, value);
+  };
+  const view = newView(test);
+  view.added('primary', 'record', fields({ value: 'primary' }));
+  expectField(view.drain()[0], 'fields', { value: 'primary' });
+  view.added('fallback', 'record', fields({ value: 'fallback' }));
+  view.expectNoResult();
+  const cleared = {};
+  Object.defineProperty(cleared, '__proto__', { value: undefined, enumerable: true });
+  view.changed('primary', 'record', cleared);
+  expectField(view.drain()[0], 'changed', { value: 'fallback' });
+  view.removed('fallback', 'record');
+  expectField(view.drain()[0], 'changed', undefined);
+  view.changed('primary', 'record', fields({ value: 'replacement' }));
+  expectField(view.drain()[0], 'changed', { value: 'replacement' });
+
+  const previous = newView(test);
+  previous.added('other', 'record', fields({ value: 'old' }));
+  previous.drain();
+  view.view.diff(previous.view);
+  expectField(view.drain()[0], 'changed', { value: 'replacement' });
+  const empty = newView(test);
+  view.view.diff(empty.view);
+  expectField(view.drain()[0], 'fields', { value: 'replacement' });
+  view.expectNoResult();
 });

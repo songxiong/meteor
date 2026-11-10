@@ -1,6 +1,8 @@
+import { Meteor } from 'meteor/meteor';
+
 // Listen to calls to `login` with an oauth option set. This is where
 // users actually get logged in to meteor via oauth.
-Accounts.registerLoginHandler(function (options) {
+Accounts.registerLoginHandler(async options => {
   if (!options.oauth)
     return undefined; // don't handle
 
@@ -13,7 +15,7 @@ Accounts.registerLoginHandler(function (options) {
     credentialSecret: Match.OneOf(null, String)
   });
 
-  var result = OAuth.retrieveCredential(options.oauth.credentialToken,
+  const result = await OAuth.retrieveCredential(options.oauth.credentialToken,
                                         options.oauth.credentialSecret);
 
   if (!result) {
@@ -42,16 +44,57 @@ Accounts.registerLoginHandler(function (options) {
     // to the user.
     throw result;
   else {
-    if (!_.contains(Accounts.oauth.serviceNames(), result.serviceName)) {
+    if (! Accounts.oauth.serviceNames().includes(result.serviceName)) {
       // serviceName was not found in the registered services list.
       // This could happen because the service never registered itself or
       // unregisterService was called on it.
       return { type: "oauth",
                error: new Meteor.Error(
                  Accounts.LoginCancelledError.numericError,
-                 "No registered oauth service found for: " + result.serviceName) };
+                 `No registered oauth service found for: ${result.serviceName}`) };
 
     }
     return Accounts.updateOrCreateUserFromExternalService(result.serviceName, result.serviceData, result.options);
   }
+});
+
+///
+/// OAuth Encryption Support
+///
+
+const OAuthEncryption = Package["oauth-encryption"]?.OAuthEncryption;
+
+const usingOAuthEncryption = () => {
+  return OAuthEncryption?.keyIsLoaded();
+};
+
+// Encrypt unencrypted login service secrets when oauth-encryption is
+// added.
+//
+// XXX For the oauthSecretKey to be available here at startup, the
+// developer must call Accounts.config({oauthSecretKey: ...}) at load
+// time, instead of in a Meteor.startup block, because the startup
+// block in the app code will run after this accounts-base startup
+// block.  Perhaps we need a post-startup callback?
+
+Meteor.startup(() => {
+  if (! usingOAuthEncryption()) {
+    return;
+  }
+
+  const { ServiceConfiguration } = Package['service-configuration'];
+
+  ServiceConfiguration.configurations.find({
+    $and: [{
+      secret: { $exists: true }
+    }, {
+      "secret.algorithm": { $exists: false }
+    }]
+  }).forEachAsync(async (config) => {
+    await ServiceConfiguration.configurations.updateAsync(config._id, {
+      $set: {
+        secret: OAuthEncryption.seal(config.secret)
+      }
+    });
+  });
 });

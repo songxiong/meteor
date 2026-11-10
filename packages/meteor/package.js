@@ -2,7 +2,7 @@
 
 Package.describe({
   summary: "Core Meteor environment",
-  version: '1.2.18-rc.0'
+  version: '2.3.2',
 });
 
 Package.registerBuildPlugin({
@@ -11,13 +11,12 @@ Package.registerBuildPlugin({
 });
 
 Npm.depends({
-  "meteor-deque": "2.1.0"
+  "denque": "2.1.0"
 });
 
 Package.onUse(function (api) {
-  api.use('underscore', ['client', 'server']);
-
   api.use('isobuild:compiler-plugin@1.0.0');
+  api.use('core-runtime');
 
   api.export('Meteor');
 
@@ -34,14 +33,18 @@ Package.onUse(function (api) {
   api.addFiles('setimmediate.js', ['client', 'server']);
   api.addFiles('timers.js', ['client', 'server']);
   api.addFiles('errors.js', ['client', 'server']);
-  api.addFiles('fiber_helpers.js', 'server');
+  api.addFiles('asl-helpers.js', 'server');
+  api.addFiles('asynchronous_queue.js', 'server');
+  api.addFiles('async_helpers.js', ['client', 'server']);
   api.addFiles('fiber_stubs_client.js', 'client');
+  api.addFiles('asl-helpers-client.js', 'client');
   api.addFiles('startup_client.js', ['client']);
   api.addFiles('startup_server.js', ['server']);
   api.addFiles('debug.js', ['client', 'server']);
+  api.addFiles('deprecate.js', ['client', 'server']);
   api.addFiles('string_utils.js', ['client', 'server']);
   api.addFiles('test_environment.js', ['client', 'server']);
-  
+
   // dynamic variables, bindEnvironment
   // XXX move into a separate package?
   api.addFiles('dynamics_browser.js', 'client');
@@ -52,13 +55,21 @@ Package.onUse(function (api) {
   api.addFiles('url_server.js', 'server');
   api.addFiles('url_common.js', ['client', 'server']);
 
+  api.addFiles('fetch.js', ['client', 'server']);
+
   // People expect process.exit() to not swallow console output.
   // On Windows, it sometimes does, so we fix it for all apps and packages
   api.addFiles('flush-buffers-on-exit-in-windows.js', 'server');
+
+  api.addFiles('emitter-promise.js', 'server');
+  api.export('EmitterPromise', 'server');
+
+  api.addAssets('meteor.d.ts', 'server');
+  api.types('meteor.native.d.ts');
 });
 
 Package.onTest(function (api) {
-  api.use(['underscore', 'tinytest', 'test-helpers']);
+  api.use(['tinytest', 'test-helpers']);
 
   api.addFiles('browser_environment_test.js', 'web.browser');
   api.addFiles('client_environment_test.js', 'client');
@@ -69,7 +80,6 @@ Package.onTest(function (api) {
   api.addFiles('dynamics_test.js', ['client', 'server']);
 
   api.addFiles('fiber_helpers_test.js', ['server']);
-  api.addFiles('wrapasync_test.js', ['server']);
 
   api.addFiles('url_tests.js', ['client', 'server']);
 
@@ -77,6 +87,8 @@ Package.onTest(function (api) {
 
   api.addFiles('debug_test.js', 'client');
 
-  api.addFiles('bare_test_setup.js', 'client', {bare: true});
+  api.addFiles('bare_test_setup.js', 'client', { bare: true });
   api.addFiles('bare_tests.js', 'client');
+  //api.addFiles('asl_helpers_test.js', 'server');
+  api.addFiles('emitter-promise-tests.js', 'server');
 });

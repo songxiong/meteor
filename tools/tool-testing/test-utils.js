@@ -1,138 +1,99 @@
-var isopackets = require('../tool-env/isopackets.js');
-var config = require('../meteor-services/config.js');
-var utils = require('../utils/utils.js');
-var auth = require('../meteor-services/auth.js');
-var selftest = require('./selftest.js');
-var httpHelpers = require('../utils/http-helpers.js');
-var _ = require('underscore');
+import { getAuthDDPUrl } from '../meteor-services/config.js';
+import { timeoutScaleFactor } from '../utils/utils.js';
+import { withAccountsConnection } from '../meteor-services/auth.js';
+import { fail, markStack } from './selftest.js';
+import { request } from '../utils/http-helpers.js';
+import { loadIsopackage } from '../tool-env/isopackets.js';
+import { networkInterfaces } from 'os';
 
-var randomString = function (charsCount) {
+export function randomString(charsCount) {
   var chars = 'abcdefghijklmnopqrstuvwxyz';
   var str = '';
   for (var i = 0; i < charsCount; i++) {
     str = str + chars.charAt(Math.floor(Math.random() * chars.length));
   }
   return str;
-};
+}
 
-exports.accountsCommandTimeoutSecs = 15 * utils.timeoutScaleFactor;
+export const accountsCommandTimeoutSecs = 15 * timeoutScaleFactor;
 
-exports.randomString = randomString;
-
-var randomAppName = function () {
+export function randomAppName() {
   return 'selftest-app-' + randomString(10);
-};
+}
 
-exports.randomAppName = randomAppName;
-
-exports.randomUserEmail = function () {
+export function randomUserEmail() {
   return 'selftest-user-' + randomString(15) + '@guerrillamail.com';
-};
+}
 
-exports.login = function (s, username, password) {
+export async function login(s, username, password) {
   var run = s.run('login');
   run.waitSecs(15);
-  run.matchErr('Username:');
+  await run.matchErr('Username:');
   run.write(username + '\n');
-  run.matchErr('Password:');
+  await run.matchErr('Password:');
   run.write(password + '\n');
   run.waitSecs(15);
-  run.matchErr('Logged in as ' + username + ".");
-  run.expectExit(0);
-};
+  await run.matchErr('Logged in as ' + username + ".");
+  await run.expectExit(0);
+}
 
-exports.logout = function (s) {
+export async function logout(s) {
   var run = s.run('logout');
   run.waitSecs(15);
-  run.matchErr('Logged out');
-  run.expectExit(0);
-};
+  await run.matchErr('Logged out');
+  await run.expectExit(0);
+}
 
-var registrationUrlRegexp =
-      /https:\/\/www\.meteor\.com\/setPassword\?([a-zA-Z0-9\+\/]+)/;
-exports.registrationUrlRegexp = registrationUrlRegexp;
-
-var getLoadedPackages = function () {
-  return isopackets.load('ddp');
-};
-
-var ddpConnect = function (url) {
-  var DDP = getLoadedPackages()['ddp-client'].DDP;
-  return DDP.connect(url);
-};
-
-exports.ddpConnect = ddpConnect;
-
-// Given a registration token created by doing a deferred registration
-// with `email`, makes a DDP connection to the accounts server and
-// finishes the registration process.
-exports.registerWithToken = function (token, username, password, email) {
-  // XXX It might make more sense to hard-code the DDP url to
-  // https://www.meteor.com, since that's who the sandboxes are talking
-  // to.
-  var accountsConn = ddpConnect(config.getAuthDDPUrl());
-  var registrationTokenInfo = accountsConn.call('registrationTokenInfo',
-                                                token);
-  var registrationCode = registrationTokenInfo.code;
-  accountsConn.call('register', {
-    username: username,
-    password: password,
-    emails: [email],
-    token: token,
-    code: registrationCode
-  });
-  accountsConn.close();
-};
-
-exports.randomOrgName = function () {
+export const registrationUrlRegexp =
+  /https:\/\/www\.meteor\.com\/setPassword\?([a-zA-Z0-9\+\/]+)/;
+export function randomOrgName() {
   return "selftestorg" + exports.randomString(10);
-};
+}
 
 // Logs in as the specified user and creates a randomly named
 // organization. Returns the organization name. Calls selftest.fail if
 // the organization can't be created.
-exports.createOrganization = function (username, password) {
+export function createOrganization(username, password) {
   var orgName = exports.randomOrgName();
-  auth.withAccountsConnection(function (conn) {
+  withAccountsConnection(function (conn) {
     try {
       conn.call("login", {
         meteorAccountsLoginInfo: { username: username, password: password },
         clientInfo: {}
       });
     } catch (err) {
-      selftest.fail("Failed to log in to Meteor developer accounts\n" +
+      fail("Failed to log in to Meteor developer accounts\n" +
                     "with test user: " + err);
     }
 
     try {
       conn.call("createOrganization", orgName);
     } catch (err) {
-      selftest.fail("Failed to create organization: " + err);
+      fail("Failed to create organization: " + err);
     }
   })();
 
   return orgName;
-};
+}
 
-exports.getMeteorRuntimeConfigFromHTML = function (html) {
+export function getMeteorRuntimeConfigFromHTML(html) {
   var m = html.match(/__meteor_runtime_config__ = JSON.parse\(decodeURIComponent\("([^"]+?)"\)\)/);
   if (! m) {
-    selftest.fail("Can't find __meteor_runtime_config__");
+    fail("Can't find __meteor_runtime_config__");
   }
   return JSON.parse(decodeURIComponent(m[1]));
-};
-
+}
 
 // Poll the given app looking for the correct settings. Throws an error
 // if the settings aren't found after a timeout.
-exports.checkForSettings = selftest.markStack(function (appName, settings, timeoutSecs) {
+export const checkForSettings = markStack(async function (appName, settings, timeoutSecs) {
   var timeoutDate = new Date(new Date().valueOf() + timeoutSecs * 1000);
   while (true) {
     if (new Date() >= timeoutDate) {
-      selftest.fail('Expected settings not found on app ' + appName);
+      fail('Expected settings not found on app ' + appName);
     }
 
-    var result = httpHelpers.request('http://' + appName);
+    var result = await request('http://' + appName);
 
     // XXX This is brittle; the test will break if we start formatting the
     // __meteor_runtime_config__ JS differently. Ideally we'd do something
@@ -150,3 +111,35 @@ exports.checkForSettings = selftest.markStack(function (appName, settings, timeo
     }
   }
 });
+
+export function markThrowingMethods(prototype) {
+  Object.keys(prototype).forEach(key => {
+    const value = prototype[key];
+    if (typeof value === "function") {
+      const code = Function.prototype.toString.call(value);
+      if (/\bnew TestFailure\b/.test(code)) {
+        prototype[name] = markStack(value);
+      }
+    }
+  });
+}
+
+export function getPrivateIPAddress() {
+  const nets = networkInterfaces();
+  let localIp = "";
+  Object.keys(nets).some((name)=> {
+      let ret = false;
+      for (const net of nets[name]) {
+          // Skip over non-IPv4, bridge and internal (i.e. 127.0.0.1) addresses
+          // 'IPv4' is in Node <= 17, from 18 it's a number 4 or 6
+          const familyV4Value =  typeof net.family === 'string' ? 'IPv4' : 4
+          if ((net.family === familyV4Value && !net.internal) && !name.startsWith('br')) {
+              localIp = net.address;
+              ret = true;
+              break;
+          }
+      }
+      return ret;
+  })
+  return localIp
+}

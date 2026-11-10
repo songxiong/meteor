@@ -2,12 +2,15 @@ var showRequireProfile = ('METEOR_PROFILE_REQUIRE' in process.env);
 if (showRequireProfile) {
   require('../tool-env/profile-require.js').start();
 }
+const { initMeteorConfig } = require('../tool-env/meteor-config');
+
+// Initialize meteorConfig globally
+initMeteorConfig();
 
 var assert = require("assert");
 var _ = require('underscore');
-var Fiber = require('fibers');
 var Console = require('../console/console.js').Console;
-var files = require('../fs/files.js');
+var files = require('../fs/files');
 var warehouse = require('../packaging/warehouse.js');
 var tropohouse = require('../packaging/tropohouse.js');
 var release = require('../packaging/release.js');
@@ -15,6 +18,9 @@ var projectContextModule = require('../project-context.js');
 var catalog = require('../packaging/catalog/catalog.js');
 var buildmessage = require('../utils/buildmessage.js');
 var httpHelpers = require('../utils/http-helpers.js');
+const { makeGlobalAsyncLocalStorage } = require("../utils/fiber-helpers");
+const archinfo = require('../utils/archinfo');
+import { isEmacs } from "../utils/utils.js";
 
 var main = exports;
 
@@ -36,7 +42,7 @@ Error.stackTraceLimit = Infinity;
 function Command(options) {
   assert.ok(this instanceof Command);
 
-  options = _.extend({
+  options = Object.assign({
     minArgs: 0,
     options: {},
     allowUnrecognizedOptions: false,
@@ -59,7 +65,7 @@ function Command(options) {
     }
   });
 
-  _.extend(this, options);
+  Object.assign(this, options);
 
   _.each(this.options, function (value, key) {
     if (key === "args" || key === "appDir") {
@@ -94,7 +100,17 @@ Command.prototype.evaluateOption = function (optionName, options) {
 //
 // Options that function as commands (eg, "meteor --arch") are treated
 // as subcommands of "--".
-var commands = {};
+var commands = main.commands = {};
+
+main.getTopLevelCommandNames = function () {
+  const names = [];
+  Object.entries(commands).forEach(([name, cmd]) => {
+    if (name !== "--" && cmd && !cmd.hidden) {
+      names.push(name);
+    }
+  });
+  return names;
+};
 
 // Exception to throw from a command to bail out and show command
 // usage information.
@@ -111,7 +127,7 @@ main.ExitWithCode = function ExitWithCode(code) {
   this.code = code;
 };
 
-_.extend(main.ExitWithCode.prototype, {
+Object.assign(main.ExitWithCode.prototype, {
   toString: function () {
     var self = this;
     return "ExitWithCode:" + self.code;
@@ -265,12 +281,12 @@ main.registerCommand = function (options, func) {
   target[nameParts[0]] = new Command(options);
 };
 
-main.captureAndExit = function (header, title, f) {
+main.captureAndExit = async function (header, title, f) {
   var messages;
   if (f) {
-    messages = buildmessage.capture({ title: title }, f);
+    messages = await buildmessage.capture({ title: title }, f);
   } else {
-    messages = buildmessage.capture(title);  // title is really f
+    messages = await buildmessage.capture(title);  // title is really f
   }
   if (messages.hasMessages()) {
     Console.error(header);
@@ -290,6 +306,7 @@ require('./commands-packages.js');
 require('./commands-packages-query.js');
 require('./commands-cordova.js');
 require('./commands-aliases.js');
+require('./commands-completion.js');
 
 ///////////////////////////////////////////////////////////////////////////////
 // Record all the top-level commands as JSON
@@ -419,50 +436,50 @@ var longHelp = exports.longHelp = function (commandName) {
 //   and will cause release.forced to be true).
 // - fromApp: this release was suggested because it is the app's
 //   release.  affects error messages.
-var springboard = function (rel, options) {
+var springboard = async function (rel, options) {
   options = options || {};
   if (process.env.METEOR_DEBUG_SPRINGBOARD) {
     console.log("WILL SPRINGBOARD TO", rel.getToolsPackageAtVersion());
   }
 
-  var archinfo = require('../utils/archinfo.js');
-  var isopack = require('../isobuild/isopack.js');
+  const toolsPkg = rel.getToolsPackage();
+  const toolsVersion = rel.getToolsVersion();
+  const serverArchitectures = await catalog.official.filterArchesWithBuilds(
+    toolsPkg,
+    toolsVersion,
+    archinfo.acceptableMeteorToolArches(),
+  );
 
-  var toolsPkg = rel.getToolsPackage();
-  var toolsVersion = rel.getToolsVersion();
-  var packageMapModule = require('../packaging/package-map.js');
-  var versionMap = {};
-  versionMap[toolsPkg] = toolsVersion;
-  var packageMap = new packageMapModule.PackageMap(versionMap);
+  if (serverArchitectures.length === 0) {
+    var release = await catalog.official.getDefaultReleaseVersion();
+    var releaseName = release.track + "@" + release.version;
 
-  if (process.platform === "win32") {
-    // Make sure the tool we are trying to download has been built for Windows
-    var buildsForHostArch = catalog.official.getBuildsForArches(
-      rel.getToolsPackage(), rel.getToolsVersion(), [archinfo.host()]);
+    Console.error(
+      "This project uses " + rel.getDisplayName() + ", which isn't",
+      "available on this platform. To work with this app on all supported",
+      "platforms, use", Console.command("meteor update --release " + releaseName),
+      "to pin this app to the newest compatible release."
+    );
 
-    if (! buildsForHostArch) {
-      var release = catalog.official.getDefaultReleaseVersion();
-      var releaseName = release.track + "@" + release.version;
-
-      Console.error(
-        "This project uses " + rel.getDisplayName() + ", which isn't",
-        "available on Windows. To work with this app on all supported",
-        "platforms, use", Console.command("meteor update --release " + releaseName),
-        "to pin this app to the newest Windows-compatible release.");
-
-      process.exit(1);
-    }
+    process.exit(1);
   }
 
+  const packageMapModule = require('../packaging/package-map.js');
+  const packageMap = new packageMapModule.PackageMap({
+    [toolsPkg]: toolsVersion,
+  });
+
   // XXX split better
-  Console.withProgressDisplayVisible(function () {
-    var messages = buildmessage.capture(
-      { title: "downloading the command-line tool" }, function () {
-        catalog.runAndRetryWithRefreshIfHelpful(function () {
-          tropohouse.default.downloadPackagesMissingFromMap(packageMap);
+  await Console.withProgressDisplayVisible(async function () {
+    var messages = await buildmessage.capture({
+      title: "downloading the command-line tool"
+    }, async function () {
+      await catalog.runAndRetryWithRefreshIfHelpful(async function () {
+        await tropohouse.default.downloadPackagesMissingFromMap(packageMap, {
+          serverArchitectures,
         });
-      }
-    );
+      });
+    });
 
     if (messages.hasMessages()) {
       // We have failed to download the tool that we are supposed to springboard
@@ -482,20 +499,50 @@ var springboard = function (rel, options) {
     }
   });
 
-  var packagePath = tropohouse.default.packagePath(toolsPkg, toolsVersion);
-  var toolIsopack = new isopack.Isopack;
-  toolIsopack.initFromPath(toolsPkg, packagePath);
-  var toolRecord = _.findWhere(toolIsopack.toolsOnDisk,
-                               {arch: archinfo.host()});
+  const isopack = require('../isobuild/isopack.js');
+  const packagePath = tropohouse.default.packagePath(toolsPkg, toolsVersion);
+  const toolIsopack = new isopack.Isopack;
+  await toolIsopack.initFromPath(toolsPkg, packagePath);
+
+  let toolRecord = null;
+  serverArchitectures.some(arch => {
+    return toolRecord = _.findWhere(toolIsopack.toolsOnDisk, { arch });
+  });
+
   if (!toolRecord) {
     throw Error("missing tool for " + archinfo.host() + " in " +
                 toolsPkg + "@" + toolsVersion);
   }
-  var executable = files.pathJoin(packagePath, toolRecord.path, 'meteor');
+
+  const newToolsDir = files.pathJoin(packagePath, toolRecord.path);
+  if (files.realpath(newToolsDir) ===
+      files.realpath(files.getCurrentToolsDir())) {
+    if (options.mayReturn) {
+      // Return instead of springboarding, if we are allowed to keep using
+      // the current tools without restarting the process.
+      return;
+    }
+  }
 
   // Strip off the "node" and "meteor.js" from argv and replace it with the
   // appropriate tools's meteor shell script.
-  var newArgv = process.argv.slice(2);
+  var newArgv = [];
+  const argc = process.argv.length;
+  for (var i = 2; i < argc; ++i) {
+    const arg = process.argv[i];
+    if (arg === "--unsafe-perm" ||
+        arg === "--allow-superuser") {
+      // Don't pass the --unsafe-perm or --allow-superuser flags to
+      // springboarded versions since they may not know how to use them,
+      // but set the METEOR_ALLOW_SUPERUSER environment variable in case
+      // the springboarded version needs it. See meteor/meteor#7959.
+      if (! _.has(process.env, "METEOR_ALLOW_SUPERUSER")) {
+        process.env.METEOR_ALLOW_SUPERUSER = "true";
+      }
+      continue;
+    }
+    newArgv.push(arg);
+  }
 
   if (_.has(options, 'releaseOverride')) {
     // We used to just append --release=<releaseOverride> to the arguments, and
@@ -505,14 +552,25 @@ var springboard = function (rel, options) {
     process.env['METEOR_SPRINGBOARD_RELEASE'] = options.releaseOverride;
   }
 
-  if (process.platform === 'win32') {
-    process.exit(new Promise(function (resolve) {
-      var batPath = files.convertToOSPath(executable + ".bat");
-      var child = require("child_process").spawn(batPath, newArgv, {
+  // Release our connection to the sqlite catalog database for the current
+  // process, so that the springboarded process can reestablish it.
+  await catalog.official.closePermanently();
+
+  const isWindows = process.platform === "win32";
+  const executable = files.pathJoin(
+    newToolsDir,
+    isWindows ? "meteor.bat" : "meteor",
+  );
+
+  if (isWindows) {
+    process.exit(await new Promise(function (resolve) {
+      var execPath = files.convertToOSPath(executable);
+      var child = require("child_process").spawn(execPath, newArgv, {
         env: process.env,
-        stdio: 'inherit'
+        stdio: 'inherit',
+        shell: true,
       }).on('exit', resolve);
-    }).await());
+    }));
   }
 
   // Now exec; we're not coming back.
@@ -521,12 +579,16 @@ var springboard = function (rel, options) {
 };
 
 // Springboard to a pre-0.9.0 release.
-var oldSpringboard = function (toolsVersion) {
+var oldSpringboard = async function (toolsVersion) {
   // Strip off the "node" and "meteor.js" from argv and replace it with the
   // appropriate tools's meteor shell script.
   var newArgv = process.argv.slice(2);
   var cmd =
     files.pathJoin(warehouse.getToolsDir(toolsVersion), 'bin', 'meteor');
+
+  // Release our connection to the sqlite catalog database for the current
+  // process, so that the springboarded process can reestablish it.
+  await catalog.official.closePermanently();
 
   // Now exec; we're not coming back.
   require('kexec')(cmd, newArgv);
@@ -544,13 +606,12 @@ var oldSpringboard = function (toolsVersion) {
 // finding the requested command in the commands table, and making
 // sure that you're using the version of the Meteor tools that match
 // your project.
-
-Fiber(function () {
+makeGlobalAsyncLocalStorage().run({}, async function () {
   // If running inside the Emacs shell, set stdin to be blocking,
   // reversing node's normal setting of O_NONBLOCK on the evaluation
   // of process.stdin (because Node unblocks stdio when forking). This
   // fixes execution of Mongo from within Emacs shell.
-  if (process.env.EMACS == "t") {
+  if (isEmacs()) {
     process.stdin;
     var child_process = require('child_process');
     child_process.spawn('true', [], {stdio: 'inherit'});
@@ -558,26 +619,25 @@ Fiber(function () {
 
   // Check required Node version.
   // This code is duplicated in tools/server/boot.js.
-  var MIN_NODE_VERSION = 'v0.10.41';
+  var MIN_NODE_VERSION = 'v18.16.0';
   if (require('semver').lt(process.version, MIN_NODE_VERSION)) {
     Console.error(
       'Meteor requires Node ' + MIN_NODE_VERSION + ' or later.');
     process.exit(1);
   }
 
-  // Set up git hooks, but not on Windows because they don't work there and it;s
-  // not worth setting it up at the moment
-  if (files.inCheckout() && process.platform !== "win32") {
-    var installGitHooks = require('../tool-env/install-git-hooks.js')['default'];
-    installGitHooks();
-  }
-
   // This is a bit of a hack, but: if we don't check this in the tool, then the
   // first time we do a isopack.load, it will fail due to the check in the
   // meteor package, and that'll look a lot uglier.
   if (process.env.ROOT_URL) {
-    var parsedUrl = require('url').parse(process.env.ROOT_URL);
-    if (!parsedUrl.host) {
+    let parsedUrl = null;
+    try {
+      parsedUrl = new URL(process.env.ROOT_URL);
+    } catch (e) {
+      // Not a parseable URL; handled by the check below.
+    }
+    if (!parsedUrl || !parsedUrl.host ||
+        ['http:', 'https:'].indexOf(parsedUrl.protocol) === -1) {
       Console.error('$ROOT_URL, if specified, must be an URL.');
       process.exit(1);
     }
@@ -616,7 +676,14 @@ Fiber(function () {
   // tight timetable for 1.0 and there is no advantage to doing it now
   // rather than later. #ImprovingCrossVersionOptionParsing
 
-  var isBoolean = { "--help": true, "--unsafe-perm": true };
+  const implicitValues = Object.create(null);
+
+  var isBoolean = {
+    "--help": true,
+    "--unsafe-perm": true,
+    "--allow-superuser": true,
+  };
+
   var walkCommands = function (node) {
     _.each(node, function (value, key) {
       if (value instanceof Command) {
@@ -626,6 +693,9 @@ Fiber(function () {
             names.push("-" + optionInfo.short);
           }
           _.each(names, function (name) {
+            if (_.has(optionInfo, "implicitValue")) {
+              implicitValues[name] = optionInfo.implicitValue;
+            }
             var optionIsBoolean = (optionInfo.type === Boolean);
             if (_.has(isBoolean, name)) {
               if (isBoolean[name] !== optionIsBoolean)  {
@@ -706,6 +776,8 @@ Fiber(function () {
       } else if (value !== undefined) {
         // Handle '--foo=bar' and '--foo=' (which means "set to empty string").
         rawOptions[term].push(value);
+      } else if (_.has(implicitValues, term)) {
+        rawOptions[term].push(implicitValues[term]);
       } else if (i === argv.length - 1) {
         rawOptions[term].push(null);
       } else {
@@ -768,33 +840,35 @@ Fiber(function () {
     rawArgs.push(term);
   }
 
-  // Prevent running meteor as root
-  if (process.getuid) {
-    // On UNIX platforms.
-    if (process.getuid() === 0){
-      if (_.has(rawOptions, '--unsafe-perm')) {
-        // Meteor is running as root and has the --unsafe-perm flag, just notice.
-        Console.info("");
-        Console.info("You have run Meteor as root.",
-        "Your permissions in your app directory will be incorrect if you ever attempt to perform any Meteor tasks as your non-root user.",
-        "You probably didn't want this, but you can fix it by running the following from the root of your project:");
-        Console.info("");
-        Console.info("sudo chown -Rh <username> .meteor/local");
-        Console.info("");
-        // Fix issue when running `sudo meteor --unsafe-perm`, --unsafe-perm: unknown option.
-        delete rawOptions['--unsafe-perm'];
-      }
-      else {
-        // Meteor is running as root without the --unsafe-perm flag, notice and stop.
-        Console.error("");
-        Console.error("You are attempting to run Meteor as the \"root\" user.",
-        "If you are developing, this is almost certainly *not* what you want to do and will likely result in incorrect file permissions.",
-        "However, if you are running this in a build process (CI, etc.) or you are absolutely sure you know what you are doing,",
-        "add the `--unsafe-perm` flag to this command to proceed.");
-        Console.error("");
+  if (_.has(rawOptions, "--allow-superuser") ||
+      _.has(rawOptions, "--unsafe-perm")) {
+    process.env.METEOR_ALLOW_SUPERUSER = "true";
+    delete rawOptions["--allow-superuser"];
+    delete rawOptions["--unsafe-perm"];
+  }
 
-        process.exit(1);
-      }
+  // Prevent running meteor as root on UNIX platforms.
+  if (process.getuid &&
+      process.getuid() === 0) {
+    const allowSuperuser = !! (
+      process.env.METEOR_ALLOW_SUPERUSER &&
+      JSON.parse(process.env.METEOR_ALLOW_SUPERUSER));
+
+    if (! allowSuperuser) {
+      // Meteor is running as root without METEOR_ALLOW_SUPERUSER, notice and stop.
+      Console.error("");
+      Console.error(
+        "You are attempting to run Meteor as the 'root' superuser.",
+        "If you are developing, this is almost certainly *not* what you want to do and will likely result in incorrect file permissions.",
+        "However, if you are running this command in a build process (CI, etc.), or you are absolutely sure you know what you are doing,",
+        "set the METEOR_ALLOW_SUPERUSER environment variable or pass --allow-superuser to proceed."
+      );
+
+      Console.info("");
+      Console.info(Console.command("  sudo chown -Rh <username> .meteor/local"));
+      Console.info("");
+
+      process.exit(1);
     }
   }
 
@@ -805,14 +879,17 @@ Fiber(function () {
   var appDir = files.findAppDir();
   if (appDir) {
     appDir = files.pathResolve(appDir);
+
+    // Renitialize meteorConfig globally when having appDir context
+    initMeteorConfig(appDir);
   }
 
-  require('../tool-env/isopackets.js').ensureIsopacketsLoadable();
+  await require('../tool-env/isopackets.js').ensureIsopacketsLoadable();
 
   // Initialize the server catalog. Among other things, this is where we get
   // release information (used by springboarding). We do not at this point talk
   // to the server and refresh it.
-  catalog.official.initialize({
+  await catalog.official.initialize({
     offline: !!process.env.METEOR_OFFLINE_CATALOG
   });
 
@@ -865,10 +942,12 @@ Fiber(function () {
   }
 
   var releaseName, appReleaseFile;
+
   if (appDir) {
     appReleaseFile = new projectContextModule.ReleaseFile({
       projectDir: appDir
     });
+    await appReleaseFile.init();
     // This is what happens if the file exists and is empty. This really
     // shouldn't happen unless the user did it manually.
     if (appReleaseFile.noReleaseSpecified()) {
@@ -917,15 +996,15 @@ Fiber(function () {
     } else {
       // Run outside an app dir with no --release flag. Use the latest
       // release we know about (in the default track).
-      releaseName = release.latestKnown();
+      releaseName = await release.latestKnown();
       if (!releaseName) {
         // Somehow we have a catalog that doesn't have any releases on the
         // default track. Try syncing, at least.  (This is a pretty unlikely
         // error case, since you should always start with a non-empty catalog.)
-        Console.withProgressDisplayVisible(function () {
-          catalog.refreshOrWarn();
+        await Console.withProgressDisplayVisible(async function () {
+          await catalog.refreshOrWarn();
         });
-        releaseName = release.latestKnown();
+        releaseName = await release.latestKnown();
       }
       if (!releaseName) {
         if (catalog.refreshFailed) {
@@ -962,7 +1041,7 @@ Fiber(function () {
       // mean we've downloaded the tool or any packages yet.)  release.load just
       // does a single sqlite query; it doesn't refresh the catalog.
       try {
-        rel = release.load(releaseName);
+        rel = await release.load(releaseName);
       } catch (e) {
         if (!(e instanceof release.NoSuchReleaseError)) {
           throw e;
@@ -977,20 +1056,20 @@ Fiber(function () {
         // ATTEMPT 2: legacy release, on disk. (And it's a "real" release, not a
         // "red pill" release which has the same name as a modern release!)
         if (warehouse.realReleaseExistsInWarehouse(releaseName)) {
-          var manifest = warehouse.ensureReleaseExistsAndReturnManifest(
+          var manifest = await warehouse.ensureReleaseExistsAndReturnManifest(
             releaseName);
-          oldSpringboard(manifest.tools);  // doesn't return
+          await oldSpringboard(manifest.tools);  // doesn't return
         }
 
         // ATTEMPT 3: modern release, troposphere sync needed.
-        Console.withProgressDisplayVisible(function () {
-          catalog.refreshOrWarn();
+        await Console.withProgressDisplayVisible(async function () {
+          await catalog.refreshOrWarn();
         });
 
         // Try to load the release even if the refresh failed, since it might
         // have failed on a later page than the one we needed.
         try {
-          rel = release.load(releaseName);
+          rel = await release.load(releaseName);
         } catch (e) {
           if (!(e instanceof release.NoSuchReleaseError)) {
             throw e;
@@ -1002,7 +1081,7 @@ Fiber(function () {
         // ATTEMPT 4: legacy release, loading from warehouse server.
         manifest = null;
         try {
-          manifest = warehouse.ensureReleaseExistsAndReturnManifest(
+          manifest = await warehouse.ensureReleaseExistsAndReturnManifest(
             releaseName);
         } catch (e) {
           // Note: this is WAREHOUSE's NoSuchReleaseError, not RELEASE's
@@ -1027,7 +1106,7 @@ Fiber(function () {
         }
         if (manifest) {
           // OK, it was an legacy release. We should old-springboard to it.
-          oldSpringboard(manifest.tools);  // doesn't return
+          await oldSpringboard(manifest.tools);  // doesn't return
         }
       }
     }
@@ -1047,7 +1126,7 @@ Fiber(function () {
         if (process.platform === "win32") {
           // Give a good warning if this release exists, but only in the super old
           // warehouse.
-          var result = httpHelpers.request(
+          var result = await httpHelpers.request(
             "http://warehouse.meteor.com/releases/" + releaseName + ".release.json");
           if(result.response.statusCode === 200) {
             Console.error("Meteor on Windows does not support running any releases",
@@ -1092,10 +1171,40 @@ Fiber(function () {
   // update, because the correct tools version will have been chosen
   // the first time around. It will also never happen if the current
   // release is a checkout, because that doesn't make any sense.
-  if (release.current && release.current.isProperRelease() &&
-      release.current.getToolsPackageAtVersion() !== files.getToolsVersion()) {
-    springboard(release.current, { fromApp: releaseFromApp });
-    // Does not return!
+  if (release.current &&
+      release.current.isProperRelease()) {
+    if (files.getToolsVersion() !==
+        release.current.getToolsPackageAtVersion()) {
+      await springboard(release.current, {
+        fromApp: releaseFromApp,
+        mayReturn: false,
+      });
+      // Does not return!
+    } else if (archinfo.canSwitchTo64Bit()) {
+      await springboard(release.current, {
+        fromApp: releaseFromApp,
+        // Switching to a 64-bit meteor-tool build may fail, in which case
+        // we should continue on as usual.
+        mayReturn: true,
+      });
+    }
+  }
+
+  try {
+    const { getChildProcess } =  require("./dev-bundle-bin-commands")
+
+    const child = await getChildProcess({ isFirstTry: false })
+
+    // If we spawned a process to handle a dev_bundle/bin command like
+    // `meteor npm` or `meteor node`, then don't run any other tool code.
+
+    if (child) {
+      return;
+    }
+  } catch (error) {
+    process.nextTick(function () {
+      throw error;
+    });
   }
 
   // Check for the '--help' option.
@@ -1312,9 +1421,9 @@ Fiber(function () {
   });
 
   // Check for unrecognized options.
-  if (_.keys(rawOptions).length > 0 && !command.allowUnrecognizedOptions) {
+  if (Object.keys(rawOptions).length > 0 && !command.allowUnrecognizedOptions) {
     Console.error(
-      Console.command(_.keys(rawOptions)[0]) + ": unknown option.");
+      Console.command(Object.keys(rawOptions)[0]) + ": unknown option.");
     Console.rawError(
       longHelp(commandName));
     process.exit(1);
@@ -1446,12 +1555,16 @@ Fiber(function () {
     var catalogRefreshStrategy = command.catalogRefresh;
     if (! catalog.triedToRefreshRecently &&
         catalogRefreshStrategy.beforeCommand) {
-      buildmessage.enterJob({title: 'updating package catalog'}, function () {
-        catalogRefreshStrategy.beforeCommand();
+      await buildmessage.enterJob({title: 'updating package catalog'}, async function () {
+        await catalogRefreshStrategy.beforeCommand();
       });
     }
 
-    var ret = command.func(options, {rawOptions});
+    // Set the currentCommand in the global object to spread context
+    global.currentCommand = { name: command.name, options };
+
+    var ret = await command.func(options, { rawOptions });
+
   } catch (e) {
     Console.enableProgressDisplay(false);
 
@@ -1468,22 +1581,23 @@ Fiber(function () {
       // Load the metadata for the latest release (or at least, the latest
       // release we know about locally). We should only do this if we know there
       // is some latest release on this track.
-      var latestRelease = release.load(release.latestKnown(e.track));
-      springboard(latestRelease, { releaseOverride: latestRelease.name });
+      var latestRelease = await release.load(await release.latestKnown(e.track));
+      await springboard(latestRelease, { releaseOverride: latestRelease.name });
       // (does not return)
     } else if (e instanceof main.SpringboardToSpecificRelease) {
       // Springboard to a specific release. This is only throw by
       // publish-for-arch, which is catalog.Refresh.OnceAtStart, so we ought to
       // have decent knowledge of the latest release.
-      var nextRelease = release.load(e.fullReleaseName);
-      springboard(nextRelease, { releaseOverride: e.fullReleaseName });
+      var nextRelease = await release.load(e.fullReleaseName);
+      await springboard(nextRelease, { releaseOverride: e.fullReleaseName });
       // (does not return)
     } else if (e instanceof main.WaitForExit) {
       return;
     } else if (e instanceof main.ExitWithCode) {
       process.exit(e.code);
     } else {
-      throw e;
+      console.error(e);
+      process.exit(1);
     }
   }
 
@@ -1498,4 +1612,4 @@ Fiber(function () {
     throw new Error("command returned non-number?");
   }
   process.exit(ret);
-}).run();
+});

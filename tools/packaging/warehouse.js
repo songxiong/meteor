@@ -6,7 +6,7 @@
 //
 // Because of this, we do have to be careful that the files used by this code
 // and the files used by tropohouse.js (the modern version of the warehouse)
-// don't overlap. tropohouse does not use tools or releases directorys, and
+// don't overlap. tropohouse does not use tools or releases directories, and
 // while they both have packages directories with similar structures, the
 // version names should not overlap: warehouse versions are SHAs and tropohouse
 // versions are semvers.  Additionally, while they do both use the 'meteor'
@@ -39,16 +39,17 @@
 var os = require("os");
 var _ = require("underscore");
 
-var files = require('../fs/files.js');
+var files = require('../fs/files');
 var httpHelpers = require('../utils/http-helpers.js');
 var fiberHelpers = require('../utils/fiber-helpers.js');
+var utils = require('../utils/utils.js');
 
 // Use `METEOR_WAREHOUSE_URLBASE` to override the default warehouse
-// url base. 
+// url base.
 var WAREHOUSE_URLBASE = process.env.METEOR_WAREHOUSE_URLBASE || 'https://warehouse.meteor.com';
 
 var warehouse = exports;
-_.extend(warehouse, {
+Object.assign(warehouse, {
   // An exception meaning that you asked for a release that doesn't
   // exist.
   NoSuchReleaseError: function () {
@@ -190,7 +191,7 @@ _.extend(warehouse, {
   // fetches the manifest file for the given release version. also fetches
   // all of the missing versioned packages referenced from the release manifest
   // @param releaseVersion {String} eg "0.1"
-  _populateWarehouseForRelease: function (releaseVersion, showInstalling) {
+  _populateWarehouseForRelease: async function (releaseVersion, showInstalling) {
     var releasesDir = files.pathJoin(warehouse.getWarehouseDir(), 'releases');
     files.mkdir_p(releasesDir, 0o755);
     var releaseManifestPath = files.pathJoin(releasesDir,
@@ -220,7 +221,7 @@ _.extend(warehouse, {
       }
 
       try {
-        var result = httpHelpers.request(
+        var result = await httpHelpers.request(
           WAREHOUSE_URLBASE + "/releases/" + releaseVersion + ".release.json");
       } catch (e) {
         throw new files.OfflineError(e);
@@ -251,7 +252,7 @@ _.extend(warehouse, {
       }
       if (!_.isEmpty(newPieces.packages)) {
         console.log(warehouse._packageUpdatesMessage(
-          _.keys(newPieces.packages).sort()));
+          Object.keys(newPieces.packages).sort()));
       }
       console.log();
     }
@@ -408,15 +409,6 @@ _.extend(warehouse, {
   },
 
   _platform: function () {
-    // Normalize from Node "os.arch()" to "uname -m".
-    var arch = os.arch();
-    if (arch === "ia32") {
-      arch = "i686";
-    } else if (arch === "x64") {
-      arch = "x86_64";
-    } else {
-      throw new Error("Unsupported architecture " + arch);
-    }
-    return os.type() + "_" + arch;
+    return os.type() + "_" + utils.architecture();
   }
 });

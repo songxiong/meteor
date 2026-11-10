@@ -3,30 +3,26 @@
 // the string "intercept", storing them in an array that can then
 // be retrieved using the getInterceptedEmails method
 //
-var interceptedEmails = {}; // (email address) -> (array of options)
+const interceptedEmails = {}; // (email address) -> (array of options)
 
 // add html email templates that just contain the url
 Accounts.emailTemplates.resetPassword.html =
   Accounts.emailTemplates.enrollAccount.html =
-  Accounts.emailTemplates.verifyEmail.html = function (user, url) {
-    return url;
-  };
+  Accounts.emailTemplates.verifyEmail.html = (user, url) => url;
 
 // override the from address
 Accounts.emailTemplates.resetPassword.from =
   Accounts.emailTemplates.enrollAccount.from =
-    Accounts.emailTemplates.verifyEmail.from = function (user) {
-      return 'test@meteor.com';
-    };
+    Accounts.emailTemplates.verifyEmail.from = user => 'test@meteor.com';
 
 // add a custom header to check against
 Accounts.emailTemplates.headers = {
   'My-Custom-Header' : 'Cool'
 };
 
-EmailTest.hookSend(function (options) {
-  var to = options.to;
-  if (!to || to.indexOf('intercept') === -1) {
+Email.hookSend(options => {
+  const { to } = options;
+  if (!to || !to.toUpperCase().includes('INTERCEPT')) {
     return true; // go ahead and send
   } else {
     if (!interceptedEmails[to])
@@ -37,24 +33,29 @@ EmailTest.hookSend(function (options) {
   }
 });
 
-Meteor.methods({
-  getInterceptedEmails: function (email) {
-    check(email, String);
-    return interceptedEmails[email];
-  },
+Meteor.methods(
+  {
+    getInterceptedEmails:
+      email => {
+        check(email, String);
+        return interceptedEmails[email];
+      },
 
-  addEmailForTestAndVerify: function (email) {
-    check(email, String);
-    Meteor.users.update(
-      {_id: this.userId},
-      {$push: {emails: {address: email, verified: false}}});
-    Accounts.sendVerificationEmail(this.userId, email);
-  },
+    addEmailForTestAndVerify:
+      async email => {
+        check(email, String);
+        await Meteor.users.updateAsync(
+          { _id: Accounts.userId() },
+          { $push: { emails: { address: email, verified: false } } });
+        await Accounts.sendVerificationEmail(Accounts.userId(), email);
+      },
 
-  createUserOnServer: function (email) {
-    check(email, String);
-    var userId = Accounts.createUser({email: email});
-    Accounts.sendEnrollmentEmail(userId);
-    return Meteor.users.findOne(userId);
+    createUserOnServer:
+      async email => {
+        check(email, String);
+        const userId = await Accounts.createUser({ email });
+        await Accounts.sendEnrollmentEmail(userId);
+        return Meteor.users.findOneAsync(userId);
+      }
   }
-});
+);

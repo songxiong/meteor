@@ -6,56 +6,76 @@
 
 var packageJson = {
   name: "meteor-dev-bundle-tool",
-  // Version is not important but is needed to prevent warnings.
-  version: "0.0.0",
+  private: true,
   dependencies: {
     // Explicit dependency because we are replacing it with a bundled version
     // and we want to make sure there are no dependencies on a higher version
-    npm: "3.10.8",
-    "node-gyp": "3.4.0",
-    "node-pre-gyp": "0.6.30",
-    "meteor-babel": "0.13.0",
-    "meteor-promise": "0.7.2",
-    fibers: "1.0.14",
-    promise: "7.1.1",
-    // So that Babel 6 can emit require("babel-runtime/helpers/...") calls.
-    "babel-runtime": "6.9.2",
-    // For various ES2015 polyfills, such as Map and Set.
-    "meteor-ecmascript-runtime": "0.2.9",
-    // Not yet upgrading Underscore from 1.5.2 to 1.7.0 (which should be done
-    // in the package too) because we should consider using lodash instead
-    // (and there are backwards-incompatible changes either way).
-    underscore: "1.5.2",
+    npm: "11.20.0",
+    "node-gyp": "10.2.0",
+    // Required by argon2's install script when Meteor rebuilds native
+    // dependencies in its isolated npm environment.
+    "cross-env": "10.0.0",
+    "node-gyp-build": "4.8.4",
+    "@mapbox/node-pre-gyp": "2.0.3",
+    typescript: "5.9.3",
+    "@meteorjs/babel": "7.20.2",
+    // Keep the versions of these packages consistent with the versions
+    // found in dev-bundle-server-package.js.
+    "@meteorjs/reify": "0.25.4",
+    // So that Babel can emit require("@babel/runtime/helpers/...") calls.
+    "@babel/runtime": "7.25.0",
+    // For backwards compatibility with isopackets that still depend on
+    // babel-runtime rather than @babel/runtime.
+    "babel-runtime": "7.0.0-beta.3",
+    "@types/underscore": "1.11.15",
+    underscore: "1.13.7",
     "source-map-support": "https://github.com/meteor/node-source-map-support/tarball/1912478769d76e5df4c365e147f25896aee6375e",
-    semver: "4.1.0",
-    request: "2.47.0",
+    "@types/semver": "7.5.8",
+    semver: "7.6.3",
+    request: "2.88.2",
+    uuid: "8.3.2",
+    "graceful-fs": "4.2.11",
     fstream: "https://github.com/meteor/fstream/tarball/cf4ea6c175355cec7bee38311e170d08c4078a5d",
-    tar: "2.2.1",
-    kexec: "2.0.2",
-    "source-map": "0.5.3",
-    "node-inspector": "0.12.8",
-    "v8-profiler": "5.6.5",
-    chalk: "0.5.1",
-    sqlite3: "3.1.3",
-    netroute: "1.0.2",
-    "http-proxy": "1.11.1",
-    "wordwrap": "0.0.2",
-    "moment": "2.8.4",
-    "rimraf": "2.4.3",
-    "glob": "7.0.6",
+    tar: "6.1.11",
+    'tar-fs': "2.1.1",
+    // Fork of kexec@3.0.0 with my Node.js 12 compatibility PR
+    // https://github.com/jprichardson/node-kexec/pull/37 applied.
+    // TODO: We should replace this with: https://github.com/jprichardson/node-kexec/pull/38
+    kexec: "https://github.com/meteor/node-kexec/tarball/f29f54037c7db6ad29e1781463b182e5929215a0",
+    "source-map": "0.7.4",
+    chalk: "4.1.2",
+    // TODO: maybe replace with https://www.npmjs.com/package/better-sqlite3
+    sqlite3: "5.1.7",
+    inquirer: "8.2.6",
+    // Live-search multi-select prompt used by `meteor add` interactive mode.
+    "inquirer-checkbox-plus-prompt": "1.4.2",
+    "http-proxy-3": "1.22.0",
+    "is-reachable": "3.1.0",
+    "wordwrap": "1.0.0",
+    "moment": "2.30.1",
+    "rimraf": "2.6.2",
+    "glob": "11.0.1",
+    ignore: "7.0.5",
     // XXX: When we update this, see if it fixes this Github issue:
     // https://github.com/jgm/CommonMark/issues/276 . If it does, remove the
     // workaround from the tool.
     "commonmark": "0.15.0",
-    escope: "3.2.0",
-    // 2.4.0 (more or less, the package.json change isn't committed) plus our PR
-    // https://github.com/williamwicks/node-eachline/pull/4
-    eachline: "https://github.com/meteor/node-eachline/tarball/ff89722ff94e6b6a08652bf5f44c8fffea8a21da",
-    pathwatcher: "6.7.1",
-    optimism: "0.3.3",
-    'lru-cache': '4.0.1',
-    'cordova-lib': "6.3.1",
-    longjohn: '0.2.11'
+    escope: "4.0.0",
+    split2: "3.2.2",
+    multipipe: "2.0.1",
+    pathwatcher: "8.1.2",
+    "vscode-nsfw": "2.1.8",
+    "@parcel/watcher": "2.5.6",
+    // The @wry/context package version must be compatible with the
+    // version constraint imposed by optimism/package.json.
+    optimism: "0.18.1",
+    "@wry/context": "0.7.4",
+    'lru-cache': '6.0.0',
+    "anser": "2.1.1",
+    'xmlbuilder2': '1.8.1',
+    "ws": "7.4.5",
+    "open":"8.4.2",
+    "acorn": "8.14.1",
   }
 };
 

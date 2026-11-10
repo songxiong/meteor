@@ -1,24 +1,28 @@
 Package.describe({
   summary: "Session variable",
-  version: '1.1.7-rc.0'
+  version: "1.2.4",
 });
 
 Package.onUse(function (api) {
-  api.use(['underscore', 'reactive-dict', 'ejson'], 'client');
+  api.use(["ecmascript", "reactive-dict"], "client");
 
   // Session can work with or without reload, but if reload is present
   // it should load first so we can detect it at startup and populate
   // the session.
-  api.use('reload', 'client', {weak: true});
+  api.use("reload", "client", { weak: true });
 
-  api.export('Session', 'client');
-  api.addFiles('session.js', 'client');
+  api.export("Session", "client");
+  api.mainModule("session.js", "client");
+  api.addAssets("session.d.ts", "server");
+  api.types("session.native.d.ts");
 });
 
 Package.onTest(function (api) {
-  api.use('tinytest');
-  api.use('session', 'client');
-  api.use('tracker');
-  api.use('mongo');
-  api.addFiles('session_tests.js', 'client');
+  api.use("ecmascript");
+  api.use("tinytest");
+  api.use("session", "client");
+  api.use("reactive-dict", "client");
+  api.use("tracker");
+  api.use("mongo");
+  api.addFiles("session_tests.js", "client");
 });

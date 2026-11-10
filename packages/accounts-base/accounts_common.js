@@ -1,3 +1,36 @@
+import { Meteor } from 'meteor/meteor';
+
+// config option keys
+const VALID_CONFIG_KEYS = [
+  'sendVerificationEmail',
+  'forbidClientAccountCreation',
+  'restrictCreationByEmailDomain',
+  'loginExpiration',
+  'loginExpirationInDays',
+  'oauthSecretKey',
+  'passwordResetTokenExpirationInDays',
+  'passwordResetTokenExpiration',
+  'passwordEnrollTokenExpirationInDays',
+  'passwordEnrollTokenExpiration',
+  'ambiguousErrorMessages',
+  'bcryptRounds',
+  'argon2Enabled',
+  'argon2Type',
+  'argon2TimeCost',
+  'argon2MemoryCost',
+  'argon2Parallelism',
+  'defaultFieldSelector',
+  'collection',
+  'loginTokenExpirationHours',
+  'tokenSequenceLength',
+  'clientStorage',
+  'useHttpOnlyCookies',
+  'httpOnlyCookieAllowedOrigins',
+  'httpOnlyCookieRateLimit',
+  'ddpUrl',
+  'connection',
+];
+
 /**
  * @summary Super-constructor for AccountsClient and AccountsServer.
  * @locus Anywhere
@@ -6,12 +39,26 @@
  * @param options {Object} an object with fields:
  * - connection {Object} Optional DDP connection to reuse.
  * - ddpUrl {String} Optional URL for creating a new DDP connection.
+ * - collection {String|Mongo.Collection} The name of the Mongo.Collection
+ *     or the Mongo.Collection object to hold the users.
  */
 export class AccountsCommon {
   constructor(options) {
+    // Validate config options keys
+    for (const key of Object.keys(options)) {
+      if (!VALID_CONFIG_KEYS.includes(key)) {
+        console.error(`Accounts.config: Invalid key: ${key}`);
+      }
+    }
+
     // Currently this is read directly by packages like accounts-password
     // and accounts-ui-unstyled.
-    this._options = {};
+    this._options = options || {};
+
+    // Callbacks registered by sub-packages (accounts-password, accounts-oauth,
+    // etc.) to re-run their setup (e.g. index creation) when the users
+    // collection is replaced via Accounts.config({ collection }).
+    this._usersCollectionChangeCallbacks = [];
 
     // Note that setting this.connection = null causes this.users to be a
     // LocalCollection, which is not what we want.
@@ -20,88 +67,191 @@ export class AccountsCommon {
 
     // There is an allow call in accounts_server.js that restricts writes to
     // this collection.
-    this.users = new Mongo.Collection("users", {
-      _preventAutopublish: true,
-      connection: this.connection
-    });
+    this.users = this._initializeCollection(options || {});
 
     // Callback exceptions are printed with Meteor._debug and ignored.
     this._onLoginHook = new Hook({
       bindEnvironment: false,
-      debugPrintExceptions: "onLogin callback"
+      debugPrintExceptions: 'onLogin callback',
     });
 
     this._onLoginFailureHook = new Hook({
       bindEnvironment: false,
-      debugPrintExceptions: "onLoginFailure callback"
+      debugPrintExceptions: 'onLoginFailure callback',
     });
 
     this._onLogoutHook = new Hook({
       bindEnvironment: false,
-      debugPrintExceptions: "onLogout callback"
+      debugPrintExceptions: 'onLogout callback',
     });
+
+    // Expose for testing.
+    this.DEFAULT_LOGIN_EXPIRATION_DAYS = DEFAULT_LOGIN_EXPIRATION_DAYS;
+    this.LOGIN_UNEXPIRING_TOKEN_DAYS = LOGIN_UNEXPIRING_TOKEN_DAYS;
+
+    // Thrown when the user cancels the login process (eg, closes an oauth
+    // popup, declines retina scan, etc)
+    const lceName = 'Accounts.LoginCancelledError';
+    this.LoginCancelledError = Meteor.makeErrorType(lceName, function(
+      description
+    ) {
+      this.message = description;
+    });
+    this.LoginCancelledError.prototype.name = lceName;
+
+    // This is used to transmit specific subclass errors over the wire. We
+    // should come up with a more generic way to do this (eg, with some sort of
+    // symbolic error code rather than a number).
+    this.LoginCancelledError.numericError = 0x8acdc2f;
+  }
+
+  _initializeCollection(options) {
+    if (options.collection && typeof options.collection !== 'string' && !(options.collection instanceof Mongo.Collection)) {
+      throw new Meteor.Error('Collection parameter can be only of type string or "Mongo.Collection"');
+    }
+
+    let collectionName = 'users';
+    if (typeof options.collection === 'string') {
+      collectionName = options.collection;
+    }
+
+    let collection;
+    if (options.collection instanceof Mongo.Collection) {
+      collection = options.collection;
+    } else {
+      collection = new Mongo.Collection(collectionName, {
+        _preventAutopublish: true,
+        connection: this.connection,
+      });
+    }
+
+    return collection;
   }
 
   /**
    * @summary Get the current user id, or `null` if no user is logged in. A reactive data source.
-   * @locus Anywhere but publish functions
+   * @locus Anywhere
    */
   userId() {
-    throw new Error("userId method not implemented");
+    throw new Error('userId method not implemented');
+  }
+
+  // merge the defaultFieldSelector with an existing options object
+  _addDefaultFieldSelector(options = {}) {
+    // this will be the most common case for most people, so make it quick
+    if (!this._options.defaultFieldSelector) return options;
+
+    // if no field selector then just use defaultFieldSelector
+    if (!options.fields)
+      return {
+        ...options,
+        fields: this._options.defaultFieldSelector,
+      };
+
+    // if empty field selector then the full user object is explicitly requested, so obey
+    const keys = Object.keys(options.fields);
+    if (!keys.length) return options;
+
+    // if the requested fields are +ve then ignore defaultFieldSelector
+    // assume they are all either +ve or -ve because Mongo doesn't like mixed
+    if (!!options.fields[keys[0]]) return options;
+
+    // The requested fields are -ve.
+    // If the defaultFieldSelector is +ve then use requested fields, otherwise merge them
+    const keys2 = Object.keys(this._options.defaultFieldSelector);
+    return this._options.defaultFieldSelector[keys2[0]]
+      ? options
+      : {
+          ...options,
+          fields: {
+            ...options.fields,
+            ...this._options.defaultFieldSelector,
+          },
+        };
   }
 
   /**
-   * @summary Get the current user record, or `null` if no user is logged in. A reactive data source.
-   * @locus Anywhere but publish functions
+   * @summary Get the current user record, or `null` if no user is logged in. On the client this can also be `undefined` while a user id is set but the user document is not yet in Minimongo. A reactive data source. In the server this fuction returns a promise.
+   * @locus Anywhere
+   * @param {Object} [options]
+   * @param {MongoFieldSpecifier} options.fields Dictionary of fields to return or exclude.
    */
-  user() {
-    var userId = this.userId();
-    return userId ? this.users.findOne(userId) : null;
+  user(options) {
+    if (Meteor.isServer) {
+      console.warn([
+        "`Meteor.user()` is deprecated on the server side.",
+        "    To fetch the current user record on the server,",
+        "    use `Meteor.userAsync()` instead.",
+      ].join("\n"));
+    }
+
+    const self = this;
+    const userId = self.userId();
+    const findOne = (...args) => Meteor.isClient
+      ? self.users.findOne(...args)
+      : self.users.findOneAsync(...args);
+    return userId
+      ? findOne(userId, this._addDefaultFieldSelector(options))
+      : null;
   }
 
-  // Set up config for the accounts system. Call this on both the client
-  // and the server.
-  //
-  // Note that this method gets overridden on AccountsServer.prototype, but
-  // the overriding method calls the overridden method.
-  //
-  // XXX we should add some enforcement that this is called on both the
-  // client and the server. Otherwise, a user can
-  // 'forbidClientAccountCreation' only on the client and while it looks
-  // like their app is secure, the server will still accept createUser
-  // calls. https://github.com/meteor/meteor/issues/828
-  //
-  // @param options {Object} an object with fields:
-  // - sendVerificationEmail {Boolean}
-  //     Send email address verification emails to new users created from
-  //     client signups.
-  // - forbidClientAccountCreation {Boolean}
-  //     Do not allow clients to create accounts directly.
-  // - restrictCreationByEmailDomain {Function or String}
-  //     Require created users to have an email matching the function or
-  //     having the string as domain.
-  // - loginExpirationInDays {Number}
-  //     Number of days since login until a user is logged out (login token
-  //     expires).
-  // - passwordResetTokenExpirationInDays {Number}
-  //     Number of days since password reset token creation until the
-  //     token cannt be used any longer (password reset token expires).
+  /**
+   * @summary Get the current user record, or `null` if no user is logged in. May also be `undefined` when a user id is set but the user document cannot be found yet.
+   * @locus Anywhere
+   * @param {Object} [options]
+   * @param {MongoFieldSpecifier} options.fields Dictionary of fields to return or exclude.
+   */
+  async userAsync(options) {
+    const userId = this.userId();
+    return userId
+      ? this.users.findOneAsync(userId, this._addDefaultFieldSelector(options))
+      : null;
+  }
 
   /**
-   * @summary Set global accounts options.
+   * @summary Set global accounts options. You can also set these in `Meteor.settings.packages.accounts` without the need to call this function.
    * @locus Anywhere
    * @param {Object} options
    * @param {Boolean} options.sendVerificationEmail New users with an email address will receive an address verification email.
-   * @param {Boolean} options.forbidClientAccountCreation Calls to [`createUser`](#accounts_createuser) from the client will be rejected. In addition, if you are using [accounts-ui](#accountsui), the "Create account" link will not be available.
+   * @param {Boolean} options.forbidClientAccountCreation Calls to [`createUser`](#accounts_createuser) from the client will be rejected. In addition, if you are using [accounts-ui](#accountsui), the "Create account" link will not be available. **Important**: This option must be set on both the client and server to take full effect. If only set on the server, account creation will be blocked but the UI will still show the "Create account" link.
    * @param {String | Function} options.restrictCreationByEmailDomain If set to a string, only allows new users if the domain part of their email address matches the string. If set to a function, only allows new users if the function returns true.  The function is passed the full email address of the proposed new user.  Works with password-based sign-in and external services that expose email addresses (Google, Facebook, GitHub). All existing users still can log in after enabling this option. Example: `Accounts.config({ restrictCreationByEmailDomain: 'school.edu' })`.
+   * @param {Number} options.loginExpiration The number of milliseconds from when a user logs in until their token expires and they are logged out, for a more granular control. If `loginExpirationInDays` is set, it takes precedent.
    * @param {Number} options.loginExpirationInDays The number of days from when a user logs in until their token expires and they are logged out. Defaults to 90. Set to `null` to disable login expiration.
-   * @param {String} options.oauthSecretKey When using the `oauth-encryption` package, the 16 byte key using to encrypt sensitive account credentials in the database, encoded in base64.  This option may only be specifed on the server.  See packages/oauth-encryption/README.md for details.
+   * @param {String} options.oauthSecretKey When using the `oauth-encryption` package, the 16 byte key using to encrypt sensitive account credentials in the database, encoded in base64.  This option may only be specified on the server.  See packages/oauth-encryption/README.md for details.
    * @param {Number} options.passwordResetTokenExpirationInDays The number of days from when a link to reset password is sent until token expires and user can't reset password with the link anymore. Defaults to 3.
-   * @param {Number} options.passwordEnrollTokenExpirationInDays The number of days from when a link to set inital password is sent until token expires and user can't set password with the link anymore. Defaults to 30.
+   * @param {Number} options.passwordResetTokenExpiration The number of milliseconds from when a link to reset password is sent until token expires and user can't reset password with the link anymore. If `passwordResetTokenExpirationInDays` is set, it takes precedent.
+   * @param {Number} options.passwordEnrollTokenExpirationInDays The number of days from when a link to set initial password is sent until token expires and user can't set password with the link anymore. Defaults to 30.
+   * @param {Number} options.passwordEnrollTokenExpiration The number of milliseconds from when a link to set initial password is sent until token expires and user can't set password with the link anymore. If `passwordEnrollTokenExpirationInDays` is set, it takes precedent.
+   * @param {Boolean} options.ambiguousErrorMessages Return ambiguous error messages from login failures to prevent user enumeration. Defaults to `true`.
+   * @param {Number} options.bcryptRounds Allows override of number of bcrypt rounds (aka work factor) used to store passwords. The default is 10.
+   * @param {Boolean} options.argon2Enabled Enable argon2 algorithm usage in replacement for bcrypt. The default is `false`.
+   * @param {'argon2id' | 'argon2i' | 'argon2d'} options.argon2Type Allows override of the argon2 algorithm type. The default is `argon2id`.
+   * @param {Number} options.argon2TimeCost Allows override of number of argon2 iterations (aka time cost) used to store passwords. The default is 2.
+   * @param {Number} options.argon2MemoryCost Allows override of the amount of memory (in KiB) used by the argon2 algorithm. The default is 19456 (19MB).
+   * @param {Number} options.argon2Parallelism Allows override of the number of threads used by the argon2 algorithm. The default is 1.
+   * @param {MongoFieldSpecifier} options.defaultFieldSelector To exclude by default large custom fields from `Meteor.user()` and `Meteor.findUserBy...()` functions when called without a field selector, and all `onLogin`, `onLoginFailure` and `onLogout` callbacks.  Example: `Accounts.config({ defaultFieldSelector: { myBigArray: 0 }})`. Beware when using this. If, for instance, you do not include `email` when excluding the fields, you can have problems with functions like `forgotPassword` that will break because they won't have the required data available. It's recommend that you always keep the fields `_id`, `username`, and `email`.
+   * @param {String|Mongo.Collection} options.collection A collection name or a Mongo.Collection object to hold the users. When set, `Meteor.users` is automatically updated to point to the new collection, and the default indexes (username, emails.address, login tokens, etc.) are created on it. This is useful when connecting to a remote users collection from another Meteor instance, or when storing users in a collection with a custom name. Should be set early in the startup sequence, before any clients connect or subscriptions are established, similar to other config options. Example: `Accounts.config({ collection: 'app_users' })` or `Accounts.config({ collection: new Mongo.Collection('users', { _driver: remoteDriver }) })`.
+   * @param {Number} options.loginTokenExpirationHours When using the package `accounts-2fa`, use this to set the amount of time a token sent is valid. As it's just a number, you can use, for example, 0.5 to make the token valid for just half hour. The default is 1 hour.
+   * @param {Number} options.tokenSequenceLength When using the package `accounts-2fa`, use this to the size of the token sequence generated. The default is 6.
+   * @param {'session' | 'local'} options.clientStorage By default login credentials are stored in local storage, setting this to true will switch to using session storage.
+   * @param {Boolean} options.useHttpOnlyCookies Keep the persistent copy of the resume token in an HttpOnly cookie instead of Web Storage. The client still loads it into memory to authenticate DDP. Must be enabled on the server for the `/_accounts/cookie/*` endpoints to respond, and mirrored to the client through `Meteor.settings.public.packages.accounts.useHttpOnlyCookies`.
+   * @param {String[]} options.httpOnlyCookieAllowedOrigins Additional origins (`scheme://host[:port]`) allowed to call the cookie set and clear endpoints with credentialed CORS. The origin of `ROOT_URL` and of the request `Host` are always allowed. `SameSite=Strict` and browser cookie policy still apply. Server only.
+   * @param {Object | false} options.httpOnlyCookieRateLimit Per-client-address rate limit for the cookie endpoints as `{ max, windowMs }`. Defaults to 30 requests per 10 seconds; `false` disables it. Server only.
+   * 
+   * @example
+   * // For UI-related options like forbidClientAccountCreation, call Accounts.config on both client and server
+   * // Create a shared configuration file (e.g., lib/accounts-config.js):
+   * import { Accounts } from 'meteor/accounts-base';
+   * 
+   * Accounts.config({
+   *   forbidClientAccountCreation: true,
+   *   sendVerificationEmail: true,
+   * });
+   * 
+   * // Then import this file in both client/main.js and server/main.js:
+   * // import '../lib/accounts-config.js';
    */
   config(options) {
-    var self = this;
-
     // We don't want users to accidentally only call Accounts.config on the
     // client, where some of the options will have partial effects (eg removing
     // the "create account" button from accounts-ui if forbidClientAccountCreation
@@ -112,49 +262,98 @@ export class AccountsCommon {
     } else if (!__meteor_runtime_config__.accountsConfigCalled) {
       // XXX would be nice to "crash" the client and replace the UI with an error
       // message, but there's no trivial way to do this.
-      Meteor._debug("Accounts.config was called on the client but not on the " +
-                    "server; some configuration options may not take effect.");
+      Meteor._debug(
+        'Accounts.config was called on the client but not on the ' +
+          'server; some configuration options may not take effect.'
+      );
     }
 
     // We need to validate the oauthSecretKey option at the time
     // Accounts.config is called. We also deliberately don't store the
     // oauthSecretKey in Accounts._options.
-    if (_.has(options, "oauthSecretKey")) {
-      if (Meteor.isClient)
-        throw new Error("The oauthSecretKey option may only be specified on the server");
-      if (! Package["oauth-encryption"])
-        throw new Error("The oauth-encryption package must be loaded to set oauthSecretKey");
-      Package["oauth-encryption"].OAuthEncryption.loadKey(options.oauthSecretKey);
-      options = _.omit(options, "oauthSecretKey");
+    if (Object.prototype.hasOwnProperty.call(options, 'oauthSecretKey')) {
+      if (Meteor.isClient) {
+        throw new Error(
+          'The oauthSecretKey option may only be specified on the server'
+        );
+      }
+      if (!Package['oauth-encryption']) {
+        throw new Error(
+          'The oauth-encryption package must be loaded to set oauthSecretKey'
+        );
+      }
+      Package['oauth-encryption'].OAuthEncryption.loadKey(
+        options.oauthSecretKey
+      );
+      options = { ...options };
+      delete options.oauthSecretKey;
     }
 
-    // validate option keys
-    var VALID_KEYS = ["sendVerificationEmail", "forbidClientAccountCreation", "passwordEnrollTokenExpirationInDays",
-                      "restrictCreationByEmailDomain", "loginExpirationInDays", "passwordResetTokenExpirationInDays"];
-    _.each(_.keys(options), function (key) {
-      if (!_.contains(VALID_KEYS, key)) {
-        throw new Error("Accounts.config: Invalid key: " + key);
+    // Validate config options keys
+    for (const key of Object.keys(options)) {
+      if (!VALID_CONFIG_KEYS.includes(key)) {
+        console.error(`Accounts.config: Invalid key: ${key}`);
       }
-    });
+    }
 
     // set values in Accounts._options
-    _.each(VALID_KEYS, function (key) {
+    for (const key of VALID_CONFIG_KEYS) {
       if (key in options) {
-        if (key in self._options) {
-          throw new Error("Can't set `" + key + "` more than once");
+        if (key in this._options) {
+          if (key !== 'collection' && (Meteor.isTest && key !== 'clientStorage')) {
+            throw new Meteor.Error(`Can't set \`${key}\` more than once`);
+          }
         }
-        self._options[key] = options[key];
+        this._options[key] = options[key];
       }
-    });
+    }
+
+    if (options.collection) {
+      const isNewCollection = options.collection instanceof Mongo.Collection
+        ? options.collection !== this.users
+        : options.collection !== this.users._name;
+      if (isNewCollection) {
+        this.users = this._initializeCollection(options);
+        this._onUsersCollectionChanged();
+      }
+    }
+  }
+
+  /**
+   * @summary Register a callback to be called when the users collection is
+   * replaced via `Accounts.config({ collection })`. This is used by
+   * sub-packages (accounts-password, accounts-oauth, accounts-passwordless)
+   * to recreate their indexes on the new collection.
+   * @locus Server
+   * @param {Function} callback Called with the new users collection.
+   */
+  onUsersCollectionChanged(callback) {
+    this._usersCollectionChangeCallbacks.push(callback);
+  }
+
+  // Called when this.users is replaced via config(). Override in subclasses.
+  _onUsersCollectionChanged() {
+    for (const callback of this._usersCollectionChangeCallbacks) {
+      callback(this.users);
+    }
   }
 
   /**
    * @summary Register a callback to be called after a login attempt succeeds.
    * @locus Anywhere
    * @param {Function} func The callback to be called when login is successful.
+   *                        The callback receives a single object that
+   *                        holds login details. This object contains the login
+   *                        result type (password, resume, etc.) on both the
+   *                        client and server. `onLogin` callbacks registered
+   *                        on the server also receive extra data, such
+   *                        as user details, connection information, etc.
    */
   onLogin(func) {
-    return this._onLoginHook.register(func);
+    let ret = this._onLoginHook.register(func);
+    // call the just registered callback if already logged in
+    this._startupCallback(ret.callback);
+    return ret;
   }
 
   /**
@@ -176,7 +375,7 @@ export class AccountsCommon {
   }
 
   _initConnection(options) {
-    if (! Meteor.isClient) {
+    if (!Meteor.isClient) {
       return;
     }
 
@@ -187,13 +386,14 @@ export class AccountsCommon {
     // It would be much preferable for this to be in accounts_client.js,
     // but it has to be here because it's needed to create the
     // Meteor.users collection.
-
     if (options.connection) {
       this.connection = options.connection;
     } else if (options.ddpUrl) {
       this.connection = DDP.connect(options.ddpUrl);
-    } else if (typeof __meteor_runtime_config__ !== "undefined" &&
-               __meteor_runtime_config__.ACCOUNTS_CONNECTION_URL) {
+    } else if (
+      typeof __meteor_runtime_config__ !== 'undefined' &&
+      __meteor_runtime_config__.ACCOUNTS_CONNECTION_URL
+    ) {
       // Temporary, internal hook to allow the server to point the client
       // to a different authentication server. This is for a very
       // particular use case that comes up when implementing a oauth
@@ -201,102 +401,103 @@ export class AccountsCommon {
       //
       // We will eventually provide a general way to use account-base
       // against any DDP connection, not just one special one.
-      this.connection =
-        DDP.connect(__meteor_runtime_config__.ACCOUNTS_CONNECTION_URL);
+      this.connection = DDP.connect(
+        __meteor_runtime_config__.ACCOUNTS_CONNECTION_URL
+      );
     } else {
       this.connection = Meteor.connection;
     }
   }
 
   _getTokenLifetimeMs() {
-    return (this._options.loginExpirationInDays ||
-            DEFAULT_LOGIN_EXPIRATION_DAYS) * 24 * 60 * 60 * 1000;
+    // When loginExpirationInDays is set to null, we'll use a really high
+    // number of days (LOGIN_UNEXPIRABLE_TOKEN_DAYS) to simulate an
+    // unexpiring token.
+    const loginExpirationInDays =
+      this._options.loginExpirationInDays === null
+        ? LOGIN_UNEXPIRING_TOKEN_DAYS
+        : this._options.loginExpirationInDays;
+    return (
+      this._options.loginExpiration ||
+      (loginExpirationInDays || DEFAULT_LOGIN_EXPIRATION_DAYS) * 86400000
+    );
   }
 
   _getPasswordResetTokenLifetimeMs() {
-   return (this._options.passwordResetTokenExpirationInDays ||
-            DEFAULT_PASSWORD_RESET_TOKEN_EXPIRATION_DAYS) * 24 * 60 * 60 * 1000;
+    return (
+      this._options.passwordResetTokenExpiration ||
+      (this._options.passwordResetTokenExpirationInDays ||
+        DEFAULT_PASSWORD_RESET_TOKEN_EXPIRATION_DAYS) * 86400000
+    );
   }
 
   _getPasswordEnrollTokenLifetimeMs() {
-    return (this._options.passwordEnrollTokenExpirationInDays ||
-        DEFAULT_PASSWORD_ENROLL_TOKEN_EXPIRATION_DAYS) * 24 * 60 * 60 * 1000;
+    return (
+      this._options.passwordEnrollTokenExpiration ||
+      (this._options.passwordEnrollTokenExpirationInDays ||
+        DEFAULT_PASSWORD_ENROLL_TOKEN_EXPIRATION_DAYS) * 86400000
+    );
   }
 
   _tokenExpiration(when) {
     // We pass when through the Date constructor for backwards compatibility;
     // `when` used to be a number.
-    return new Date((new Date(when)).getTime() + this._getTokenLifetimeMs());
+    return new Date(new Date(when).getTime() + this._getTokenLifetimeMs());
   }
 
   _tokenExpiresSoon(when) {
-    var minLifetimeMs = .1 * this._getTokenLifetimeMs();
-    var minLifetimeCapMs = MIN_TOKEN_LIFETIME_CAP_SECS * 1000;
-    if (minLifetimeMs > minLifetimeCapMs)
+    let minLifetimeMs = 0.1 * this._getTokenLifetimeMs();
+    const minLifetimeCapMs = MIN_TOKEN_LIFETIME_CAP_SECS * 1000;
+    if (minLifetimeMs > minLifetimeCapMs) {
       minLifetimeMs = minLifetimeCapMs;
-    return new Date() > (new Date(when) - minLifetimeMs);
+    }
+    return new Date() > new Date(when) - minLifetimeMs;
   }
-}
 
-var Ap = AccountsCommon.prototype;
+  // No-op on the server, overridden on the client.
+  _startupCallback(callback) {}
+}
 
 // Note that Accounts is defined separately in accounts_client.js and
 // accounts_server.js.
 
 /**
  * @summary Get the current user id, or `null` if no user is logged in. A reactive data source.
- * @locus Anywhere but publish functions
+ * @locus Anywhere
  * @importFromPackage meteor
  */
-Meteor.userId = function () {
-  return Accounts.userId();
-};
+Meteor.userId = () => Accounts.userId();
 
 /**
- * @summary Get the current user record, or `null` if no user is logged in. A reactive data source.
- * @locus Anywhere but publish functions
+ * @summary Get the current user record, or `null` if no user is logged in. On the client this can also be `undefined` while a user id is set but the user document is not yet in Minimongo. A reactive data source.
+ * @locus Anywhere
  * @importFromPackage meteor
+ * @param {Object} [options]
+ * @param {MongoFieldSpecifier} options.fields Dictionary of fields to return or exclude.
  */
-Meteor.user = function () {
-  return Accounts.user();
-};
+Meteor.user = options => Accounts.user(options);
+
+/**
+ * @summary Get the current user record, or `null` if no user is logged in. May also be `undefined` when a user id is set but the user document cannot be found yet. A reactive data source.
+ * @locus Anywhere
+ * @importFromPackage meteor
+ * @param {Object} [options]
+ * @param {MongoFieldSpecifier} options.fields Dictionary of fields to return or exclude.
+ */
+Meteor.userAsync = options => Accounts.userAsync(options);
 
 // how long (in days) until a login token expires
-var DEFAULT_LOGIN_EXPIRATION_DAYS = 90;
+const DEFAULT_LOGIN_EXPIRATION_DAYS = 90;
 // how long (in days) until reset password token expires
-var DEFAULT_PASSWORD_RESET_TOKEN_EXPIRATION_DAYS = 3;
+const DEFAULT_PASSWORD_RESET_TOKEN_EXPIRATION_DAYS = 3;
 // how long (in days) until enrol password token expires
-var DEFAULT_PASSWORD_ENROLL_TOKEN_EXPIRATION_DAYS = 30;
+const DEFAULT_PASSWORD_ENROLL_TOKEN_EXPIRATION_DAYS = 30;
 // Clients don't try to auto-login with a token that is going to expire within
 // .1 * DEFAULT_LOGIN_EXPIRATION_DAYS, capped at MIN_TOKEN_LIFETIME_CAP_SECS.
 // Tries to avoid abrupt disconnects from expiring tokens.
-var MIN_TOKEN_LIFETIME_CAP_SECS = 3600; // one hour
+const MIN_TOKEN_LIFETIME_CAP_SECS = 3600; // one hour
 // how often (in milliseconds) we check for expired tokens
-EXPIRE_TOKENS_INTERVAL_MS = 600 * 1000; // 10 minutes
-// how long we wait before logging out clients when Meteor.logoutOtherClients is
-// called
-CONNECTION_CLOSE_DELAY_MS = 10 * 1000;
-
-// loginServiceConfiguration and ConfigError are maintained for backwards compatibility
-Meteor.startup(function () {
-  var ServiceConfiguration =
-    Package['service-configuration'].ServiceConfiguration;
-  Ap.loginServiceConfiguration = ServiceConfiguration.configurations;
-  Ap.ConfigError = ServiceConfiguration.ConfigError;
-});
-
-// Thrown when the user cancels the login process (eg, closes an oauth
-// popup, declines retina scan, etc)
-var lceName = 'Accounts.LoginCancelledError';
-Ap.LoginCancelledError = Meteor.makeErrorType(
-  lceName,
-  function (description) {
-    this.message = description;
-  }
-);
-Ap.LoginCancelledError.prototype.name = lceName;
-
-// This is used to transmit specific subclass errors over the wire. We should
-// come up with a more generic way to do this (eg, with some sort of symbolic
-// error code rather than a number).
-Ap.LoginCancelledError.numericError = 0x8acdc2f;
+export const EXPIRE_TOKENS_INTERVAL_MS = 600 * 1000; // 10 minutes
+// A large number of expiration days (approximately 100 years worth) that is
+// used when creating unexpiring tokens.
+const LOGIN_UNEXPIRING_TOKEN_DAYS = 365 * 100;

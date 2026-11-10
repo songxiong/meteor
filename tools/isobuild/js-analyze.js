@@ -1,13 +1,24 @@
-import { parse } from 'meteor-babel';
+import { parse } from '@meteorjs/babel';
 import { analyze as analyzeScope } from 'escope';
-import LRU from "lru-cache";
+import LRUCache from "lru-cache";
+import { Profile } from '../tool-env/profile';
+import Visitor from "@meteorjs/reify/lib/visitor.js";
+import { findPossibleIndexes } from "@meteorjs/reify/lib/utils.js";
+import acorn from 'acorn';
 
 const hasOwn = Object.prototype.hasOwnProperty;
+const objToStr = Object.prototype.toString
 
-var AST_CACHE = new LRU({
+function isRegExp(value) {
+  return value && objToStr.call(value) === "[object RegExp]";
+}
+
+var AST_CACHE = new LRUCache({
   max: Math.pow(2, 12),
   length(ast) {
-    return ast.loc.end.line;
+    // Estimate cached lines based on average length per character
+    const avgCharsPerLine = 40;
+    return Math.ceil(ast.end / avgCharsPerLine);
   }
 });
 
@@ -18,9 +29,35 @@ function tryToParse(source, hash) {
   }
 
   let ast;
-
   try {
-    ast = parse(source);
+    Profile.time('jsAnalyze.parse', () => {
+      try {
+        ast = acorn.parse(source, {
+          ecmaVersion: 'latest',
+          sourceType: 'script',
+          allowAwaitOutsideFunction: true,
+          allowImportExportEverywhere: true,
+          allowReturnOutsideFunction: true,
+          allowHashBang: true,
+          checkPrivateFields: false,
+        });
+      } catch (error) {
+        ast = parse(source, {
+          strictMode: false,
+          sourceType: 'module',
+          allowImportExportEverywhere: true,
+          allowReturnOutsideFunction: true,
+          allowUndeclaredExports: true,
+          plugins: [
+            // Only plugins for stage 3 features are enabled
+            // Enabling some plugins significantly affects parser performance
+            'importAttributes',
+            'explicitResourceManagement',
+            'decorators'
+          ]
+        });
+      }
+    });
   } catch (e) {
     if (typeof e.loc === 'object') {
       e.$ParseError = true;
@@ -35,12 +72,10 @@ function tryToParse(source, hash) {
   return ast;
 }
 
-var dependencyKeywordPattern = /\b(require|import|export)\b/g;
-
 /**
  * The `findImportedModuleIdentifiers` function takes a string of module
  * source code and returns a map from imported module identifiers to AST
- * nodes. The keys of this map are used in ./import-scanner.js to traverse
+ * nodes. The keys of this map are used in ./import-scanner.ts to traverse
  * the module dependency graph. The AST nodes are generally ignored.
  *
  * The implementation uses a regular expression to scan quickly for
@@ -52,81 +87,56 @@ var dependencyKeywordPattern = /\b(require|import|export)\b/g;
  * function call, or an `import` or `export` statement).
  */
 export function findImportedModuleIdentifiers(source, hash) {
-  const identifiers = {};
-  const possibleIndexes = [];
-  let match;
+  const possibleIndexes = findPossibleIndexes(source, [
+    "require",
+    "import",
+    "export",
+    "dynamicImport",
+    "link",
+  ]);
 
-  dependencyKeywordPattern.lastIndex = 0;
-  while ((match = dependencyKeywordPattern.exec(source))) {
-    possibleIndexes.push(match.index);
-  }
-
-  if (!possibleIndexes.length) {
+  if (possibleIndexes.length === 0) {
     return {};
   }
 
   const ast = tryToParse(source, hash);
+  Profile.time('findImportedModuleIdentifiersVisitor', () => {
+    importedIdentifierVisitor.visit(ast, source, possibleIndexes);
+  });
 
-  function walk(node, left, right, requireIsBound) {
-    if (left >= right) {
-      // The window of possible indexes is empty, so we can ignore
-      // the entire subtree rooted at this node.
-    } else if (Array.isArray(node)) {
-      for (var i = 0, len = node.length; i < len; ++i) {
-        walk(node[i], left, right, requireIsBound);
-      }
-    } else if (isNode(node)) {
-      const start = node.start;
-      const end = node.end;
+  return importedIdentifierVisitor.identifiers;
+}
 
-      // Narrow the left-right window to exclude possible indexes
-      // that fall outside of the current node.
-      while (left < right && possibleIndexes[left] < start) ++left;
-      while (left < right && end < possibleIndexes[right - 1]) --right;
+const importedIdentifierVisitor = new (class extends Visitor {
+  reset(rootPath, code, possibleIndexes) {
+    this.requireIsBound = false;
+    this.identifiers = Object.create(null);
 
-      if (left < right) {
-        if (! requireIsBound &&
-            isFunctionWithParameter(node, "require")) {
-          requireIsBound = true;
-        }
-
-        let id = getRequiredModuleId(node);
-        if (typeof id === "string") {
-          return addIdentifier(id, "require", requireIsBound);
-        }
-
-        id = getImportedModuleId(node);
-        if (typeof id === "string") {
-          return addIdentifier(id, "import", requireIsBound);
-        }
-
-        // Continue traversing the children of this node.
-        for (const key of Object.keys(node)) {
-          switch (key) {
-          case "type":
-          case "loc":
-          case "start":
-          case "end":
-            // Ignore common keys that are never nodes.
-            continue;
-          }
-
-          walk(node[key], left, right, requireIsBound);
-        }
-      }
-    }
+    // Defining this.possibleIndexes causes the Visitor to ignore any
+    // subtrees of the AST that do not contain any indexes of identifiers
+    // that we care about. Note that findPossibleIndexes uses a RegExp to
+    // scan for the given identifiers, so there may be false positives,
+    // but that's fine because it just means scanning more of the AST.
+    this.possibleIndexes = possibleIndexes;
   }
 
-  function addIdentifier(id, type, requireIsBound) {
-    const entry = hasOwn.call(identifiers, id)
-      ? identifiers[id]
-      : identifiers[id] = { possiblySpurious: true };
+  addIdentifier(id, type, dynamic) {
+    const entry = hasOwn.call(this.identifiers, id)
+      ? this.identifiers[id]
+      : this.identifiers[id] = {
+          possiblySpurious: true,
+          dynamic: !! dynamic
+        };
+
+    if (! dynamic) {
+      entry.dynamic = false;
+    }
 
     if (type === "require") {
       // If the identifier comes from a require call, but require is not a
       // free variable, then this dependency might be spurious.
       entry.possiblySpurious =
-        entry.possiblySpurious && requireIsBound;
+        entry.possiblySpurious && this.requireIsBound;
     } else {
       // The import keyword can't be shadowed, so any dependencies
       // registered by import statements should be trusted absolutely.
@@ -134,45 +144,109 @@ export function findImportedModuleIdentifiers(source, hash) {
     }
   }
 
-  walk(ast, 0, possibleIndexes.length, false);
-
-  return identifiers;
-}
-
-function isNode(value) {
-  return value
-    && typeof value === "object"
-    && typeof value.type === "string"
-    && typeof value.start === "number"
-    && typeof value.end === "number";
-}
-
-function isIdWithName(node, name) {
-  return node &&
-    node.type === "Identifier" &&
-    node.name === name;
-}
-
-function isFunctionWithParameter(node, name) {
-  if (node.type === "FunctionExpression" ||
-      node.type === "FunctionDeclaration" ||
-      node.type === "ArrowFunctionExpression") {
-    return node.params.some(param => isIdWithName(param, name));
+  visitFunctionExpression(path) {
+    return this._functionParamRequireHelper(path);
   }
-}
 
-function getRequiredModuleId(node) {
-  if (node.type === "CallExpression" &&
-      isIdWithName(node.callee, "require")) {
+  visitFunctionDeclaration(path) {
+    return this._functionParamRequireHelper(path);
+  }
+
+  visitArrowFunctionExpression(path) {
+    return this._functionParamRequireHelper(path);
+  }
+
+  _functionParamRequireHelper(path) {
+    const node = path.getValue();
+    if (node.params.some(param => isIdWithName(param, "require"))) {
+      const { requireIsBound } = this;
+      this.requireIsBound = true;
+      this.visitChildren(path);
+      this.requireIsBound = requireIsBound;
+    } else {
+      this.visitChildren(path);
+    }
+  }
+
+  visitCallExpression(path) {
+    const node = path.getValue();
     const args = node.arguments;
     const argc = args.length;
-    if (argc > 0) {
-      const arg = args[0];
-      if (isStringLiteral(arg)) {
-        return arg.value;
+    const firstArg = args[0];
+
+    this.visitChildren(path);
+
+    if (! isStringLiteral(firstArg)) {
+      return;
+    }
+
+    if (isIdWithName(node.callee, "require")) {
+      this.addIdentifier(firstArg.value, "require");
+
+    } else if (node.callee.type === "Import" ||
+               isIdWithName(node.callee, "import")) {
+      this.addIdentifier(firstArg.value, "import", true);
+
+    } else if (node.callee.type === "MemberExpression" &&
+               // The Reify compiler sometimes renames references to the
+               // CommonJS module object for hygienic purposes, but it
+               // always does so by appending additional numbers.
+               isIdWithName(node.callee.object, /^module\d*$/)) {
+      const propertyName =
+        isPropertyWithName(node.callee.property, "link") ||
+        isPropertyWithName(node.callee.property, "dynamicImport");
+
+      if (propertyName) {
+        this.addIdentifier(
+          firstArg.value,
+          "import",
+          propertyName === "dynamicImport"
+        );
       }
     }
   }
+
+  visitImportDeclaration(path) {
+    return this._importExportSourceHelper(path);
+  }
+
+  visitExportAllDeclaration(path) {
+    return this._importExportSourceHelper(path);
+  }
+
+  visitExportNamedDeclaration(path) {
+    return this._importExportSourceHelper(path);
+  }
+
+  _importExportSourceHelper(path) {
+    const node = path.getValue();
+    // The .source of an ImportDeclaration or Export{Named,All}Declaration
+    // is always a string-valued Literal node, if not null.
+    if (isStringLiteral(node.source)) {
+      this.addIdentifier(
+        node.source.value,
+        "import",
+        false
+      );
+    }
+  }
+});
+
+function isIdWithName(node, name) {
+  if (! node ||
+      node.type !== "Identifier") {
+    return false;
+  }
+
+  if (typeof name === "string") {
+    return node.name === name;
+  }
+
+  if (isRegExp(name)) {
+    return name.test(node.name);
+  }
+
+  return false;
 }
 
 function isStringLiteral(node) {
@@ -182,29 +256,11 @@ function isStringLiteral(node) {
      typeof node.value === "string"));
 }
 
-function getImportedModuleId(node) {
-  if (node.type === "CallExpression" &&
-      node.callee.type === "MemberExpression" &&
-      isIdWithName(node.callee.object, "module") &&
-      isIdWithName(node.callee.property, "import")) {
-    const args = node.arguments;
-    const argc = args.length;
-    if (argc > 0) {
-      const arg = args[0];
-      if (isStringLiteral(arg)) {
-        return arg.value;
-      }
-    }
-  }
-
-  if (node.type === "ImportDeclaration" ||
-      node.type === "ExportAllDeclaration" ||
-      node.type === "ExportNamedDeclaration") {
-    // The .source of an ImportDeclaration or Export{Named,All}Declaration
-    // is always a string-valued Literal node, if not null.
-    if (isNode(node.source)) {
-      return node.source.value;
-    }
+function isPropertyWithName(node, name) {
+  if (isIdWithName(node, name) ||
+      (isStringLiteral(node) &&
+       node.value === name)) {
+    return name;
   }
 }
 
@@ -218,12 +274,12 @@ function getImportedModuleId(node) {
 //
 // It only cares about assignments to variables; an assignment to a field on an
 // object (`Foo.Bar = true`) neither causes `Foo` nor `Foo.Bar` to be returned.
-const globalsCache = new LRU({
+const globalsCache = new LRUCache({
   max: Math.pow(2, 12),
   length(globals) {
     let sum = 0;
     Object.keys(globals).forEach(name => sum += name.length);
-    return sum;
+    return sum === 0 ? 1 : sum;
   }
 });
 
@@ -249,7 +305,7 @@ export function findAssignedGlobals(source, hash) {
   // But it can't pull references outward, so for our purposes it is safe to
   // ignore.
   const scopeManager = analyzeScope(ast, {
-    ecmaVersion: 6,
+    ecmaVersion: 9,
     sourceType: "module",
     ignoreEval: true,
     // Ensures we don't treat top-level var declarations as globals.
@@ -273,7 +329,7 @@ export function findAssignedGlobals(source, hash) {
   programScope.implicit.left.forEach(entry => {
     if (entry.identifier &&
         entry.identifier.type === "Identifier" &&
-        // Only consider identifers that are assigned a value.
+        // Only consider identifiers that are assigned a value.
         entry.writeExpr) {
       assignedGlobals[entry.identifier.name] = true;
     }

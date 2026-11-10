@@ -1,24 +1,26 @@
 Package.describe({
   summary: "Send email messages",
-  version: "1.1.18-rc.0"
+  version: "3.2.1",
 });
 
 Npm.depends({
-  // Pinned at older version. 0.1.16+ uses mimelib, not mimelib-noiconv which is
-  // much bigger. We need a better solution.
-  mailcomposer: "0.1.15",
-  simplesmtp: "0.3.34",
-  "stream-buffers": "0.2.5"});
+  nodemailer: '8.0.3',
+  'stream-buffers': '3.0.3',
+  '@types/nodemailer': '7.0.9',
+  'nodemailer-openpgp': '2.2.1',
+});
 
 Package.onUse(function (api) {
-  api.use('underscore', 'server');
-  api.export(['Email', 'EmailInternals'], 'server');
-  api.export('EmailTest', 'server', {testOnly: true});
-  api.addFiles('email.js', 'server');
+  api.use(["ecmascript", "logging", "callback-hook"], "server");
+  api.addAssets("email.d.ts", "server");
+  api.types("email.native.d.ts");
+  api.mainModule("email.js", "server");
+  api.export(["Email", "EmailInternals"], "server");
+  api.export("EmailTest", "server", { testOnly: true });
 });
 
 Package.onTest(function (api) {
-  api.use('email', 'server');
-  api.use('tinytest');
-  api.addFiles('email_tests.js', 'server');
+  api.use("email", "server");
+  api.use(["tinytest", "ecmascript"]);
+  api.addFiles("email_tests.js", "server");
 });

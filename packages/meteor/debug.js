@@ -1,3 +1,19 @@
+if (Meteor.isServer) {
+  if (typeof __meteor_runtime_config__ === 'object') {
+    __meteor_runtime_config__.debug =
+      !!process.env.NODE_INSPECTOR_IPC ||
+      !!process.env.VSCODE_INSPECTOR_OPTIONS ||
+      process.execArgv.some(function(_arg) {
+        return /^--(inspect|debug)(-brk)?(=\d+)?$/i.test(_arg);
+      });
+  }
+}
+
+Meteor.isDebug = Meteor.isClient
+  ? typeof window === 'object' && !!window.__meteor_runtime_config__.debug
+  : typeof __meteor_runtime_config__ === 'object' &&
+  !!__meteor_runtime_config__.debug;
+
 var suppress = 0;
 
 // replacement for console.log. This is a temporary API. We should
@@ -46,9 +62,6 @@ Meteor._debug = function (/* arguments */) {
         // IE9
         var log = Function.prototype.bind.call(console.log, console);
         log.apply(console, arguments);
-      } else {
-        // IE8
-        Function.prototype.call.call(console.log, console, Array.prototype.slice.call(arguments));
       }
     }
   }
@@ -64,4 +77,3 @@ Meteor._suppress_log = function (count) {
 Meteor._suppressed_log_expected = function () {
   return suppress !== 0;
 };
-

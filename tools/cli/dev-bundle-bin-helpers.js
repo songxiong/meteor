@@ -1,17 +1,19 @@
-var fs = require("fs");
-var path = require("path");
-var files = require("../fs/mini-files.js");
-var isWindows = process.platform === "win32";
-var extensions = isWindows ? [".cmd", ".exe"] : [""];
-var hasOwn = Object.prototype.hasOwnProperty;
+const fs = require("fs");
+const path = require("path");
+const { convertToOSPath } = require("./convert-to-os-path.js");
+const { getDevBundleDir } = require('./dev-bundle');
 
-function getDevBundle() {
-  return require("./dev-bundle.js");
+const isWindows = process.platform === "win32";
+const extensions = isWindows ? [".cmd", ".exe"] : [""];
+const hasOwn = Object.prototype.hasOwnProperty;
+
+module.exports = {
+  getCommand,
+  getEnv,
 }
-exports.getDevBundle = getDevBundle;
 
-exports.getCommand = function (name, devBundleDir) {
-  var result = null;
+function getCommand (name, devBundleDir) {
+  let result = null;
 
   // Strip leading and/or trailing whitespace.
   name = name.replace(/^\s+|\s+$/g, "");
@@ -21,7 +23,7 @@ exports.getCommand = function (name, devBundleDir) {
   }
 
   extensions.some(function (ext) {
-    var cmd = path.join(devBundleDir, "bin", name + ext);
+    const cmd = path.join(devBundleDir, "bin", name + ext);
     try {
       if (fs.statSync(cmd).isFile()) {
         result = cmd;
@@ -37,7 +39,8 @@ exports.getCommand = function (name, devBundleDir) {
 
 function isValidCommand(name, devBundleDir) {
   if (name === "node" ||
-      name === "npm") {
+      name === "npm" ||
+      name === "npx") {
     return true;
   }
 
@@ -46,7 +49,7 @@ function isValidCommand(name, devBundleDir) {
     return false;
   }
 
-  var meteorCommandsJsonPath =
+  const meteorCommandsJsonPath =
     path.join(devBundleDir, "bin", ".meteor-commands.json");
 
   try {
@@ -60,50 +63,63 @@ function isValidCommand(name, devBundleDir) {
   return ! hasOwn.call(meteorCommands, name);
 }
 
-exports.getEnv = function (options) {
-  var devBundle = options && options.devBundle;
-  var devBundlePromise = typeof devBundle === "string"
-    ? Promise.resolve(files.convertToOSPath(devBundle))
-    : getDevBundle();
+async function getEnv(options) {
+  const devBundle = options && options.devBundle;
 
-  return devBundlePromise.then(function (devBundleDir) {
-    var paths = [
-      // When npm looks for node, it must find dev_bundle/bin/node.
-      path.join(devBundleDir, "bin"),
-      // Also make available any scripts installed by packages in
-      // dev_bundle/lib/node_modules, such as node-gyp.
-      path.join(devBundleDir, "lib", "node_modules", ".bin")
-    ];
+  /**
+   * @type string
+   */
+  const devBundleDir = typeof devBundle === "string"
+    ? await convertToOSPath(devBundle)
+    : await getDevBundleDir();
 
-    var env = Object.create(process.env);
+  const paths = [
+    // When npm looks for node, it must find dev_bundle/bin/node.
+    path.join(devBundleDir, "bin"),
 
-    // Make sure we don't try to use the global ~/.npm cache accidentally.
-    if (! env.NPM_CONFIG_CACHE) {
-      env.NPM_CONFIG_CACHE = path.join(devBundleDir, ".npm");
-    }
+    // When npm looks for meteor, it should find dev_bundle/../meteor.
+    path.dirname(devBundleDir),
 
-    // This allows node-gyp to find Node headers and libraries in
-    // dev_bundle/.node-gyp.
-    env.USERPROFILE = devBundleDir;
+    // Also make available any scripts installed by packages in
+    // dev_bundle/lib/node_modules, such as node-gyp.
+    path.join(devBundleDir, "lib", "node_modules", ".bin")
+  ];
 
-    var PATH = env.PATH || env.Path;
-    if (PATH) {
-      paths.push(PATH);
-    }
+  const env = Object.create(process.env);
+  env.NO_UPDATE_NOTIFIER = true;
 
-    env.PATH = paths.join(path.delimiter);
+  if (!env.NPM_CONFIG_PREFIX) {
+    env.NPM_CONFIG_PREFIX = devBundleDir;
+  }
 
-    if (process.platform === "win32") {
-      return addWindowsVariables(devBundleDir, env);
-    }
+  // Historically we forwarded METEOR_ALLOW_SUPERUSER to
+  // NPM_CONFIG_UNSAFE_PERM so npm wouldn't drop privileges when running
+  // install scripts as root. npm 7 removed the automatic privilege drop
+  // (so the flag became a no-op) and npm 8+ now treats it as an unknown
+  // env config and prints `npm warn Unknown env config "unsafe-perm"`,
+  // which leaks into stdout/stderr and breaks self-tests that assert on
+  // exact output (e.g. `typescript template works` doing
+  // `await run.expectEnd()` after `npx tsc`). dev_bundle currently ships
+  // npm 11, so we just don't set it.
 
-    return env;
-  });
-};
+  const PATH = env.PATH || env.Path;
+
+  if (PATH) {
+    paths.push(PATH);
+  }
+
+  env.PATH = paths.join(path.delimiter);
+
+  if (process.platform === "win32") {
+    return addWindowsVariables(devBundleDir, env);
+  }
+
+  return env;
+}
 
 // Caching env.GYP_MSVS_VERSION allows us to avoid invoking Python every
 // time Meteor runs an npm command. TODO Store this on disk?
-var cachedMSVSVersion;
+let cachedMSVSVersion;
 
 function addWindowsVariables(devBundleDir, env) {
   // On Windows we provide a reliable version of python.exe for use by
@@ -127,11 +143,11 @@ function addWindowsVariables(devBundleDir, env) {
   // If $GYP_MSVS_VERSION was not provided, use the gyp Python library to
   // infer it, or default to 2015 if that doesn't work.
   return new Promise(function (resolve) {
-    var nodeGypPylibDir = path.join(
+    const nodeGypPylibDir = path.join(
       devBundleDir, "lib", "node_modules", "node-gyp", "gyp", "pylib"
     );
 
-    var child = require("child_process").spawn(env.PYTHON, ["-c", [
+    const child = require("child_process").spawn(env.PYTHON, ["-c", [
       "from gyp.MSVSVersion import SelectVisualStudioVersion",
       "try:",
       "  print SelectVisualStudioVersion(allow_fallback=False).short_name",
@@ -142,7 +158,7 @@ function addWindowsVariables(devBundleDir, env) {
       stdio: "pipe"
     });
 
-    var chunks = [];
+    const chunks = [];
     child.stdout.on("data", function (chunk) {
       chunks.push(chunk);
     });

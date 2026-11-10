@@ -14,7 +14,7 @@ Plugin.registerMinifier({
 
 function CustomMinifier(type) {
   this.type = type;
-};
+}
 
 CustomMinifier.prototype.processFilesForBundle = function (files, options) {
   var self = this;
@@ -29,6 +29,7 @@ CustomMinifier.prototype.processFilesForBundle = function (files, options) {
         data: contents
       });
     } else {
+      contents = contents.replace(/lazy-resource/g, 'minified_lazy');
       file.addStylesheet({
         data: contents
       });
@@ -37,5 +38,3 @@ CustomMinifier.prototype.processFilesForBundle = function (files, options) {
     Plugin.nudge();
   });
 };
-
-

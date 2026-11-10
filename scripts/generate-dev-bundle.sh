@@ -16,26 +16,90 @@ echo BUILDING DEV BUNDLE "$BUNDLE_VERSION" IN "$DIR"
 
 cd "$DIR"
 
-S3_HOST="s3.amazonaws.com/com.meteor.jenkins"
+extractNodeFromTarGz() {
+    LOCAL_TGZ="${CHECKOUT_DIR}/node_${PLATFORM}_v${NODE_VERSION}.tar.gz"
+    if [ -f "$LOCAL_TGZ" ]
+    then
+        echo "Skipping download and installing Node from $LOCAL_TGZ" >&2
+        tar zxf "$LOCAL_TGZ"
+        return 0
+    fi
+    return 1
+}
 
-# Update these values after building the dev-bundle-node Jenkins project.
-# Also make sure to update NODE_VERSION in generate-dev-bundle.ps1.
-NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TGZ}"
-echo "Downloading Node from ${NODE_URL}"
-curl "${NODE_URL}" | tar zx --strip-components 1
+downloadNodeFromS3() {
+    test -n "${NODE_BUILD_NUMBER}" || return 1
+    S3_HOST="s3.amazonaws.com/com.meteor.jenkins"
+    S3_TGZ="node_${UNAME}_${ARCH}_v${NODE_VERSION}.tar.gz"
+    NODE_URL="https://${S3_HOST}/dev-bundle-node-${NODE_BUILD_NUMBER}/${S3_TGZ}"
+    echo "Downloading Node from ${NODE_URL}" >&2
+    curl "${NODE_URL}" | tar zx --strip 1
+}
 
-# Download Mongo from mongodb.com
-MONGO_NAME="mongodb-${OS}-${ARCH}-${MONGO_VERSION}"
+
+downloadOfficialNode() {
+    NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TGZ}"
+    echo "Downloading Node from ${NODE_URL}" >&2
+    curl "${NODE_URL}" | tar zx --strip-components 1
+}
+
+downloadReleaseCandidateNode() {
+    NODE_URL="https://nodejs.org/download/rc/v${NODE_VERSION}/${NODE_TGZ}"
+    echo "Downloading Node from ${NODE_URL}" >&2
+    curl "${NODE_URL}" | tar zx --strip-components 1
+}
+
+# Try each strategy in the following order:
+extractNodeFromTarGz || downloadNodeFromS3 || downloadOfficialNode || downloadReleaseCandidateNode
+
+# Download MongoDB from mongodb.com. On Linux we use official builds chosen for
+# the lowest practical glibc baseline: x86_64 uses the rhel93 build (glibc 2.34,
+# keeping RHEL 9 / Amazon Linux 2023 and similar distros working), and aarch64
+# uses ubuntu2204 (the oldest official aarch64 build MongoDB publishes). If a
+# 32-bit Linux is used, download a 32-bit legacy version instead.
+MONGO_VERSION=$MONGO_VERSION_64BIT
+
+if [ $ARCH = "i686" ] && [ $OS = "linux" ]; then
+    MONGO_VERSION=$MONGO_VERSION_32BIT
+fi
+
+case $OS in
+    macos) MONGO_BASE_URL="https://fastdl.mongodb.org/osx" ;;
+    linux) MONGO_BASE_URL="https://fastdl.mongodb.org/linux" ;;
+esac
+
+if [ $OS = "macos" ] && [ "$(uname -m)" = "arm64" ] ; then
+  MONGO_NAME="mongodb-macos-arm64-${MONGO_VERSION}"
+elif [ $OS = "linux" ] && [ "$ARCH" = "x86_64" ] ; then
+  MONGO_NAME="mongodb-linux-x86_64-rhel93-${MONGO_VERSION}"
+elif [ $OS = "linux" ] && [ "$ARCH" != "i686" ] ; then
+  MONGO_NAME="mongodb-linux-${ARCH}-ubuntu2204-${MONGO_VERSION}"
+else
+  MONGO_NAME="mongodb-${OS}-${ARCH}-${MONGO_VERSION}"
+fi
+
 MONGO_TGZ="${MONGO_NAME}.tgz"
-MONGO_URL="http://fastdl.mongodb.org/${OS}/${MONGO_TGZ}"
+MONGO_URL="${MONGO_BASE_URL}/${MONGO_TGZ}"
 echo "Downloading Mongo from ${MONGO_URL}"
-curl "${MONGO_URL}" | tar zx
+
+# The directory inside the archive does not reliably match the archive name:
+# macOS tarballs say "aarch64" where the URL says "arm64", and as of MongoDB 8
+# they also carry a doubled dash ("mongodb-macos-aarch64--8.0.29"). Strip that
+# top-level directory while unpacking so its name never has to be guessed at.
+rm -rf mongo-download
+mkdir mongo-download
+curl -L "${MONGO_URL}" | tar zx -C mongo-download --strip-components 1
+
+if [ ! -x "mongo-download/bin/mongod" ] || [ ! -x "mongo-download/bin/mongos" ] ; then
+    echo "${MONGO_TGZ} did not contain both mongod and mongos"
+    exit 1
+fi
 
 # Put Mongo binaries in the right spot (mongodb/bin)
-mkdir -p mongodb/bin
-mv "${MONGO_NAME}/bin/mongod" mongodb/bin
-mv "${MONGO_NAME}/bin/mongo" mongodb/bin
-rm -rf "${MONGO_NAME}"
+mkdir -p "mongodb/bin"
+mv "mongo-download/bin/mongod" "mongodb/bin"
+mv "mongo-download/bin/mongos" "mongodb/bin"
+rm -rf mongo-download
 
 # export path so we use the downloaded node and npm
 export PATH="$DIR/bin:$PATH"
@@ -43,10 +107,23 @@ export PATH="$DIR/bin:$PATH"
 cd "$DIR/lib"
 # Overwrite the bundled version with the latest version of npm.
 npm install "npm@$NPM_VERSION"
-
+# Starting from npm v9.5.1 we can't set the python (and many others) config
+# https://github.com/npm/cli/issues/6126
+# for now we'll not set it anymore and see if it works
+# if it doesn't, we can set python3 in other ways
+#npm config set python `which python3`
 which node
 which npm
 npm version
+
+# Make node-gyp use Node headers and libraries from $DIR/include/node.
+export HOME="$DIR"
+export USERPROFILE="$DIR"
+export npm_config_nodedir="$DIR"
+
+INCLUDE_PATH="${DIR}/include/node"
+echo "Contents of ${INCLUDE_PATH}:"
+ls -al "$INCLUDE_PATH"
 
 # When adding new node modules (or any software) to the dev bundle,
 # remember to update LICENSE.txt! Also note that we include all the
@@ -61,6 +138,9 @@ npm version
 mkdir "${DIR}/build/npm-server-install"
 cd "${DIR}/build/npm-server-install"
 node "${CHECKOUT_DIR}/scripts/dev-bundle-server-package.js" > package.json
+# XXX For no apparent reason this npm install will fail with an EISDIR
+# error if we do not help it by creating the .npm/_locks directory.
+mkdir -p "${DIR}/.npm/_locks"
 npm install
 npm shrinkwrap
 
@@ -71,19 +151,6 @@ cp -R node_modules/* "${DIR}/server-lib/node_modules/"
 mkdir -p "${DIR}/etc"
 mv package.json npm-shrinkwrap.json "${DIR}/etc/"
 
-# Fibers ships with compiled versions of its C code for a dozen platforms. This
-# bloats our dev bundle. Remove all the ones other than our
-# architecture. (Expression based on build.js in fibers source.)
-shrink_fibers () {
-    FIBERS_ARCH=$(node -p -e 'process.platform + "-" + process.arch + "-v8-" + /[0-9]+\.[0-9]+/.exec(process.versions.v8)[0]')
-    mv $FIBERS_ARCH ..
-    rm -rf *
-    mv ../$FIBERS_ARCH .
-}
-
-cd "$DIR/server-lib/node_modules/fibers/bin"
-shrink_fibers
-
 # Now, install the npm modules which are the dependencies of the command-line
 # tool.
 mkdir "${DIR}/build/npm-tool-install"
@@ -91,23 +158,20 @@ cd "${DIR}/build/npm-tool-install"
 node "${CHECKOUT_DIR}/scripts/dev-bundle-tool-package.js" >package.json
 npm install
 cp -R node_modules/* "${DIR}/lib/node_modules/"
+
+#Also copy package.json and package-lock.json to lib folder so that npm
+# keep everything installed correctly
+cp package.json "${DIR}/lib/"
+cp package-lock.json "${DIR}/lib/"
 # Also include node_modules/.bin, so that `meteor npm` can make use of
 # commands like node-gyp and node-pre-gyp.
 cp -R node_modules/.bin "${DIR}/lib/node_modules/"
 
-# Make node-gyp install Node headers and libraries in $DIR/.node-gyp/.
-# https://github.com/nodejs/node-gyp/blob/4ee31329e0/lib/node-gyp.js#L52
-export HOME="$DIR"
-export USERPROFILE="$DIR"
-node "${DIR}/lib/node_modules/node-gyp/bin/node-gyp.js" install
-INCLUDE_PATH="${DIR}/.node-gyp/${NODE_VERSION}/include/node"
-echo "Contents of ${INCLUDE_PATH}:"
-ls -al "$INCLUDE_PATH"
-
 cd "${DIR}/lib"
 
-# Clean up some bulky stuff.
 cd node_modules
+
+## Clean up some bulky stuff.
 
 # Used to delete bulky subtrees. It's an error (unlike with rm -rf) if they
 # don't exist, because that might mean it moved somewhere else and we should
@@ -120,29 +184,18 @@ delete () {
     rm -rf "$1"
 }
 
-delete npm/test
-delete npm/node_modules/node-gyp
-pushd npm/node_modules
-ln -s ../../node-gyp ./
-popd
-
 delete sqlite3/deps
-delete sqlite3/node_modules/nan
-delete sqlite3/node_modules/node-pre-gyp
 delete wordwrap/test
 delete moment/min
 
 # Remove esprima tests to reduce the size of the dev bundle
 find . -path '*/esprima-fb/test' | xargs rm -rf
 
-cd "$DIR/lib/node_modules/fibers/bin"
-shrink_fibers
-
 # Sanity check to see if we're not breaking anything by replacing npm
 INSTALLED_NPM_VERSION=$(cat "$DIR/lib/node_modules/npm/package.json" |
 xargs -0 node -e "console.log(JSON.parse(process.argv[1]).version)")
 if [ "$INSTALLED_NPM_VERSION" != "$NPM_VERSION" ]; then
-  echo "Unexpected NPM version in lib/node_modules: $INSTALLED_NPM_VERSION"
+  echo "Error: Unexpected NPM version in lib/node_modules: $INSTALLED_NPM_VERSION"
   echo "Update this check if you know what you're doing."
   exit 1
 fi
@@ -151,7 +204,7 @@ echo BUNDLING
 
 cd "$DIR"
 echo "${BUNDLE_VERSION}" > .bundle_version.txt
-rm -rf build CHANGELOG.md ChangeLog LICENSE README.md
+rm -rf build CHANGELOG.md ChangeLog LICENSE README.md .npm
 
 tar czf "${CHECKOUT_DIR}/dev_bundle_${PLATFORM}_${BUNDLE_VERSION}.tar.gz" .
 

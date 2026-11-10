@@ -1,121 +1,133 @@
-# Meteor
+<div align="center">
+  <a href="https://www.meteor.com" target="_blank">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://dmtgy0px4zdqn.cloudfront.net/images/meteor-logo.webp">
+      <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/0467afb6-4f36-4cad-9d78-237150d5d881">
+      <img alt="Meteor logo" src="https://github.com/user-attachments/assets/0467afb6-4f36-4cad-9d78-237150d5d881" width="300">
+    </picture>
+  </a>
+</div>
 
-[![TravisCI Status](https://travis-ci.org/meteor/meteor.svg?branch=devel)](https://travis-ci.org/meteor/meteor)
-[![CircleCI Status](https://circleci.com/gh/meteor/meteor/tree/devel.svg?style=shield&circle-token=c2d3c041506bd493ef3795ffa4448684cfce97b8)](https://circleci.com/gh/meteor/meteor/tree/devel)
+<div align="center">
 
-Meteor is an ultra-simple environment for building modern web
-applications.
+[![built with Meteor](https://img.shields.io/badge/Meteor-3.5.4-green?logo=meteor&logoColor=white)](https://meteor.com)
+[![node-current](https://img.shields.io/badge/node-%3E%3D22-green?logo=nodedotjs&logoColor=white)](https://nodejs.org/en/download)
+[![Discord](https://img.shields.io/discord/1247973371040239676)](https://discord.com/invite/hZkTCaVjmT)
+[![Twitter Follow](https://img.shields.io/twitter/follow/meteorjs?style=social)](https://x.com/meteorjs)
 
-With Meteor you write apps:
+</div>
 
-* in pure JavaScript
-* that send data over the wire, rather than HTML
-* using your choice of popular open-source libraries
+<hr>
 
-Try the getting started [tutorial](https://www.meteor.com/try).
+Meteor is an **ultra-simple** environment for building **modern** web applications.
 
-Next, read the [guide](http://guide.meteor.com) or the reference documentation at http://docs.meteor.com/.
+<hr>
 
-## Quick Start
+- [Official Website](https://www.meteor.com)
+- [Installation](https://docs.meteor.com/about/install.html)
+- [Documentation](https://docs.meteor.com/#/full/)
 
-On Windows, simply go to https://www.meteor.com/install and use the Windows installer.
+<hr>
 
-On Linux/macOS, use this line:
+### 📚 **Create your applications using modern JavaScript**
 
-```bash
-curl https://install.meteor.com/ | sh
+Benefit from the latest technology updates to rapidly prototype and develop your applications.
+
+<hr>
+
+### ✨ **Integrate technologies you already use**
+
+Use popular frameworks and tools right out-of-the-box. Focus on building features instead of configuring disparate components yourself.
+
+<hr>
+
+### 💻 **Build apps for any device**
+
+Use the same code whether you’re developing for web, iOS, Android, or desktop for a seamless update experience for your users.
+
+<hr>
+
+# 🔥 Getting Started
+
+How about trying a tutorial to get started with your favorite technology?
+
+| [<img alt="React logo" align="left" width="25" src="https://upload.wikimedia.org/wikipedia/commons/a/a7/React-icon.svg"> React](https://docs.meteor.com/tutorials/react/) |
+| - |
+| [<img alt="Blaze logo" align="left" width="25" src="https://progsoft.net/images/blaze-css-icon-3e80acb3996047afd09f1150f53fcd78e98c1e1b.png"> Blaze](https://docs.meteor.com/tutorials/blaze/) |
+| [<img alt="Vue logo" align="left" width="25" src="https://vuejs.org/images/logo.png"> Vue](https://docs.meteor.com/tutorials/vue/meteorjs3-vue3.html) |
+| [<img alt="Svelte logo" align="left" width="25" src="https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/Svelte_Logo.svg/1280px-Svelte_Logo.svg.png?_=20191219133350">  Svelte](https://docs.meteor.com/tutorials/svelte/) |
+| [<img alt="Solid logo" align="left" width="25" src="https://www.solidjs.com/img/logo/without-wordmark/logo.svg"> Solid](https://docs.meteor.com/tutorials/solid/) |
+
+# 🚀 Quick Start
+
+On your platform, use this line:
+
+```shell
+> npx meteor
 ```
 
-Create a project:
+🚀 To create a project:
 
-```bash
-meteor create try-meteor
+```shell
+> meteor create
 ```
 
-Run it:
+☄️ Run it:
 
-```bash
-cd try-meteor
+```shell
+cd my-app
 meteor
 ```
 
-## Slow Start (for developers)
+# 💖 Sponsors
 
-If you want to run on the bleeding edge, or [help contribute to Meteor](Contributing.md), you
-can run Meteor directly from a Git checkout using these steps:
+Meteor is made possible by our amazing sponsors. Support the project and get your logo here by visiting our [Sponsorship page](https://www.meteor.com/sponsorship).
 
-0. **Clone from GitHub**
+### 🌟 Supernova Sponsors
 
-    ```sh
-    $ git clone --recursive https://github.com/meteor/meteor.git
-    $ cd meteor
-    ```
+<table>
+  <tr>
+    <td align="center" valign="middle" width="50%">
+      <a href="https://galaxycloud.app/" target="_blank">
+        <img alt="Galaxy" src="v3-docs/assets/galaxy-logo.png" height="60">
+      </a>
+    </td>
+    <td align="center" valign="middle" width="50%">
+      <a href="https://inputlogic.com/" target="_blank">
+        <img alt="InputLogic" src="v3-docs/assets/inputlogic-logo.jpg" height="60">
+      </a>
+    </td>
+  </tr>
+</table>
 
-    > ##### Important note about Git submodules!
-    >
-    > This repository uses Git submodules.  If you clone without the `--recursive` flag,
-    > re-fetch with `git pull` or experience "`Depending on unknown package`" errors,
-    > run the following in the repository root to sync things up again:
-    >
-    >     $ git submodule update --init --recursive
+### 🌌 Nebula Sponsors
 
-0. **_(Optional)_ Compile dependencies**
+<table>
+  <tr>
+    <td align="center" valign="middle" width="50%">
+      <a href="https://www.coderabbit.ai/" target="_blank">
+        <img alt="CodeRabbit" src="v3-docs/assets/coderabbit-logo.svg" height="45">
+      </a>
+    </td>
+  </tr>
+</table>
 
-    > This optional step requires a C and C++ compiler, autotools, and scons.
-    > If this step is skipped, Meteor will simply download pre-built binaries.
+<hr>
 
-    To build everything from scratch (`node`, `npm`, `mongodb`, etc.) run the following:
+# 🧱 Developer Resources
 
-    ```sh
-    $ ./scripts/generate-dev-bundle.sh # OPTIONAL!
-    ```
+**Building an application with Meteor?**
 
-0. **Run a Meteor command to install dependencies**
+* Build with AI coding assistants using [Meteor Agent Skills](https://docs.meteor.com/ai/agent-skills)
+* Deploy on [Galaxy](https://galaxycloud.app)
+* Find packages on [Atmosphere](https://atmospherejs.com/)
+* Discuss on [Forums](https://forums.meteor.com/)
+* Join the [Meteor Discord](https://discord.gg/hZkTCaVjmT)
 
-    > If you did not compile dependencies above, this will also download the binaries.
 
+Interested in helping or contributing to Meteor?  These resources will help:
 
-    ```sh
-    $ ./meteor --help
-    ```
-
-0. **Ready to Go!**
-
-    Your local Meteor checkout is now ready to use!  You can use this `./meteor`
-    anywhere you would normally call the system `meteor`.  For example,:
-
-    ```sh
-    $ cd my-app/
-    $ /path/to/meteor-checkout/meteor run
-    ```
-
-    > _Note:_ When running from a `git` checkout, you cannot pin apps to specific
-    > Meteor releases or change the release using `--release`.
-
-## Uninstalling Meteor
-
-Aside from a short launcher shell script, Meteor installs itself inside your
-home directory. To uninstall Meteor, run:
-
-```bash
-rm -rf ~/.meteor/
-sudo rm /usr/local/bin/meteor
-```
-
-On Windows, just run the uninstaller from your Control Panel.
-
-## Developer Resources
-
-Building an application with Meteor?
-
-* Announcement list: sign up at http://www.meteor.com/
-* Having problems? Ask for help at: http://stackoverflow.com/questions/tagged/meteor
-* Discussion forums: https://forums.meteor.com/
-
-Interested in contributing to Meteor?
-
-* Issue tracker: https://github.com/meteor/meteor/issues
-* Contribution guidelines: https://github.com/meteor/meteor/tree/devel/Contributing.md
-
-We are hiring!  Visit https://www.meteor.com/jobs to
-learn more about working full-time on the Meteor project.
+* [Core development guide](DEVELOPMENT.md)
+* [Contribution guidelines](CONTRIBUTING.md)
+* [Feature requests](https://github.com/meteor/meteor/discussions/)
+* [Issue tracker](https://github.com/meteor/meteor/issues)

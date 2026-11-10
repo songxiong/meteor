@@ -1,3 +1,5 @@
+const isEqual = require('lodash.isequal');
+
 var PV = PackageVersion;
 var CS = ConstraintSolver;
 
@@ -13,6 +15,7 @@ CS.PackagesResolver = function (catalog, options) {
 
   self._options = {
     nudge: options && options.nudge,
+    yield: options && options.yield,
     Profile: options && options.Profile,
     // For resultCache, pass in an empty object `{}`, and PackagesResolver
     // will put data on it.  Pass in the same object again to allow reusing
@@ -42,49 +45,68 @@ CS.PackagesResolver = function (catalog, options) {
 //  - supportedIsobuildFeaturePackages - map from package name to list of
 //    version strings of isobuild feature packages that are available in the
 //    catalog
-CS.PackagesResolver.prototype.resolve = function (dependencies, constraints,
+CS.PackagesResolver.prototype.resolve = async function (dependencies, constraints,
                                                   options) {
   var self = this;
   options = options || {};
   var Profile = (self._options.Profile || CS.DummyProfile);
 
-  var input;
-  Profile.time("new CS.Input", function () {
-    input = new CS.Input(dependencies, constraints, self.catalogCache,
-                         _.pick(options,
-                                'upgrade',
-                                'anticipatedPrereleases',
-                                'previousSolution',
-                                'allowIncompatibleUpdate',
-                                'upgradeIndirectDepPatchVersions'));
+  var input = await Profile.time("new CS.Input", function () {
+    const { upgrade,
+    anticipatedPrereleases,
+    previousSolution,
+    allowIncompatibleUpdate,
+    upgradeIndirectDepPatchVersions } = options;
+    return new CS.Input(dependencies, constraints, self.catalogCache,
+      { upgrade,
+        anticipatedPrereleases,
+        previousSolution,
+        allowIncompatibleUpdate,
+        upgradeIndirectDepPatchVersions });
   });
 
-  var resultCache = self._options.resultCache;
-  if (resultCache &&
-      resultCache.lastInput &&
-      _.isEqual(resultCache.lastInput,
-                input.toJSONable(true))) {
+  // The constraint solver avoids re-solving everything from scratch on
+  // rebuilds if the current input of top-level constraints matches the
+  // previously solved input (also just top-level constraints). This is
+  // slightly unsound, because non-top-level dependency constraints might
+  // have changed, but it's important for performance, and relatively
+  // harmless in practice (if there's a version conflict, you'll find out
+  // about it the next time you do a full restart of the development
+  // server). The unsoundness can cause problems for tests, however, so it
+  // may be a good idea to set this environment variable to "true" to
+  // disable the caching entirely.
+  const disableCaching = !! JSON.parse(
+    process.env.METEOR_DISABLE_CONSTRAINT_SOLVER_CACHING || "false"
+  );
+
+  let resultCache = self._options.resultCache;
+  if (disableCaching) {
+    resultCache = null;
+  } else if (resultCache &&
+             resultCache.lastInput &&
+             isEqual(resultCache.lastInput,
+                       input.toJSONable(true))) {
     return resultCache.lastOutput;
   }
 
   if (options.supportedIsobuildFeaturePackages) {
-    _.each(options.supportedIsobuildFeaturePackages, function (versions, pkg) {
-      _.each(versions, function (version) {
+    Object.entries(options.supportedIsobuildFeaturePackages).forEach(function ([pkg, versions]) {
+      versions.forEach(function (version) {
         input.catalogCache.addPackageVersion(pkg, version, []);
       });
     });
   }
 
-  Profile.time(
+  await Profile.time(
     "Input#loadOnlyPreviousSolution",
     function () {
-      input.loadOnlyPreviousSolution(self.catalogLoader);
+      return input.loadOnlyPreviousSolution(self.catalogLoader);
     });
 
   if (options.previousSolution && options.missingPreviousVersionIsError) {
     // see comment where missingPreviousVersionIsError is passed in
-    Profile.time("check for previous versions in catalog", function () {
-      _.each(options.previousSolution, function (version, pkg) {
+    await Profile.time("check for previous versions in catalog", function () {
+      Object.entries(options.previousSolution).forEach(function ([pkg, version]) {
         if (! input.catalogCache.hasPackageVersion(pkg, version)) {
           CS.throwConstraintSolverError(
             "Package version not in catalog: " + pkg + " " + version);
@@ -95,6 +117,7 @@ CS.PackagesResolver.prototype.resolve = function (dependencies, constraints,
 
   var resolveOptions = {
     nudge: self._options.nudge,
+    yield: self._options.yield,
     Profile: self._options.Profile
   };
 
@@ -106,7 +129,7 @@ CS.PackagesResolver.prototype.resolve = function (dependencies, constraints,
     // packages, because that would always result in just using the current
     // version, hence disabling upgrades.
     try {
-      output = CS.PackagesResolver._resolveWithInput(input, resolveOptions);
+      output = await CS.PackagesResolver._resolveWithInput(input, resolveOptions);
     } catch (e) {
       if (e.constraintSolverError) {
         output = null;
@@ -118,14 +141,14 @@ CS.PackagesResolver.prototype.resolve = function (dependencies, constraints,
 
   if (! output) {
     // do a solve with all package versions available in the catalog.
-    Profile.time(
+    await Profile.time(
       "Input#loadFromCatalog",
       function () {
-        input.loadFromCatalog(self.catalogLoader);
+        return input.loadFromCatalog(self.catalogLoader);
       });
 
     // if we fail to find a solution this time, this will throw.
-    output = CS.PackagesResolver._resolveWithInput(input, resolveOptions);
+    output = await CS.PackagesResolver._resolveWithInput(input, resolveOptions);
   }
 
   if (resultCache) {
@@ -143,7 +166,7 @@ CS.PackagesResolver.prototype.resolve = function (dependencies, constraints,
 // - allAnswers (for testing, calculate all possible answers and put an extra
 //   property named "allAnswers" on the result)
 // - Profile (the profiler interface in `tools/profile.js`)
-CS.PackagesResolver._resolveWithInput = function (input, options) {
+CS.PackagesResolver._resolveWithInput = async function (input, options) {
   options = options || {};
 
   if (Meteor.isServer &&
@@ -152,22 +175,24 @@ CS.PackagesResolver._resolveWithInput = function (input, options) {
     console.log(JSON.stringify(input.toJSONable(), null, 2));
   }
 
-  var solver;
-  (options.Profile || CS.DummyProfile).time("new CS.Solver", function () {
-    solver = new CS.Solver(input, {
+  var solver = await (options.Profile || CS.DummyProfile).time("new CS.Solver", async function () {
+    const _solver = new CS.Solver(input, {
       nudge: options.nudge,
+      yield: options.yield,
       Profile: options.Profile
     });
+    await _solver.init();
+
+    return _solver;
   });
 
   // Disable runtime type checks (they slow things down a bunch)
-  return Logic.disablingAssertions(function () {
-    var result = solver.getAnswer({
-      allAnswers: options.allAnswers
-    });
+  return await Logic.disablingAssertions(function () {
     // if we're here, no conflicts were found (or an error would have
     // been thrown)
-    return result;
+    return solver.getAnswer({
+      allAnswers: options.allAnswers
+    });
   });
 };
 
@@ -177,15 +202,35 @@ CS.PackagesResolver._resolveWithInput = function (input, options) {
 //   with an `alternatives` property lifted from one.
 // - version: version String
 CS.isConstraintSatisfied = function (pkg, vConstraint, version) {
-  return _.some(vConstraint.alternatives, function (simpleConstraint) {
+  return vConstraint.alternatives.some(function (simpleConstraint) {
     var type = simpleConstraint.type;
 
     if (type === "any-reasonable") {
       return true;
-    } else if (type === "exactly") {
+    }
+
+    // If any top-level constraints use the @x.y.z! override syntax, all
+    // other constraints on the same package will be marked with the
+    // weakMinimum property, which means they constrain nothing other than
+    // the minimum version of the package. Look for weakMinimum in the
+    // CS.Solver#analyze method for related logic.
+    if (vConstraint.weakMinimum) {
+      return ! PV.lessThan(
+        PV.parse(version),
+        PV.parse(simpleConstraint.versionString)
+      );
+    }
+
+    if (type === "exactly") {
       var cVersion = simpleConstraint.versionString;
       return (cVersion === version);
-    } else if (type === 'compatible-with') {
+    }
+
+    if (type === 'compatible-with') {
+      if (typeof simpleConstraint.test === "function") {
+        return simpleConstraint.test(version);
+      }
+
       var cv = PV.parse(simpleConstraint.versionString);
       var v = PV.parse(version);
 
@@ -202,9 +247,9 @@ CS.isConstraintSatisfied = function (pkg, vConstraint, version) {
       }
 
       return true;
-    } else {
-      throw Error("Unknown constraint type: " + type);
     }
+
+    throw Error("Unknown constraint type: " + type);
   });
 };
 
